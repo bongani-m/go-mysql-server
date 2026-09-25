@@ -1100,15 +1100,13 @@ var systemVars = map[string]sql.SystemVariable{
 		Type:              types.NewSystemIntType("innodb_buffer_pool_size", 5242880, math.MaxInt64, false),
 		Default:           int64(134217728),
 	},
-	// Row locking is currently not supported. This variable is provided for 3p tools, and we always return the
-	// Lowest value allowed by MySQL, which is 1. If you attempt to set this value to anything other than 1, errors ensue.
 	"innodb_lock_wait_timeout": &sql.MysqlSystemVariable{
 		Name:              "innodb_lock_wait_timeout",
 		Scope:             sql.GetMysqlScope(sql.SystemVariableScope_Both),
 		Dynamic:           true,
 		SetVarHintApplies: false,
-		Type:              types.NewSystemIntType("innodb_lock_wait_timeout", 1, 1, false),
-		Default:           int64(1),
+		Type:              types.NewSystemIntType("innodb_lock_wait_timeout", 1, 1073741824, false),
+		Default:           int64(50),
 	},
 	"innodb_stats_auto_recalc": &sql.MysqlSystemVariable{
 		Name:              "innodb_stats_auto_recalc",

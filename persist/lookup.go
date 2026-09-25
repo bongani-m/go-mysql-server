@@ -7,6 +7,8 @@ import (
 	"io"
 	"sort"
 
+	"github.com/dgraph-io/badger/v4"
+
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
@@ -150,15 +152,10 @@ func spanForRange(ctx context.Context, fields []indexField, rang sql.MySQLRange)
 	var prefix []byte
 	matched := 0
 	sawNull := false
+	loose := false
 	for i, expr := range rang {
 		if i >= len(fields) {
 			break
-		}
-		// A non-binary collation does not order as raw bytes. Scanning and
-		// filtering keeps comparisons on the column type, which is what
-		// FULLTEXT word lookups and case-insensitive keys need.
-		if expr.Type() != sql.RangeType_All && expr.Type() != sql.RangeType_Empty && !byteOrderType(fields[i].typ) {
-			return keySpan{}, false, false, false, nil
 		}
 		lo, hi, isEmpty, edgesOK := rangeExprEdges(expr)
 		if !edgesOK {
@@ -179,12 +176,17 @@ func spanForRange(ctx context.Context, fields []indexField, rang sql.MySQLRange)
 			} else {
 				value = lo.value
 			}
-			part, err := encodeField(ctx, fields[i], value)
+			part, err := seekPart(ctx, fields[i], value)
 			if err != nil {
 				return keySpan{}, false, false, false, err
 			}
 			prefix = append(prefix, part...)
 			matched++
+			if !byteOrderType(fields[i].typ) {
+				// The stored key has a tie-breaker after the weight. A point
+				// get of one original string would miss an equal spelling.
+				loose = true
+			}
 			continue
 		}
 		if fields[i].desc {
@@ -200,8 +202,17 @@ func spanForRange(ctx context.Context, fields []indexField, rang sql.MySQLRange)
 		}
 		return keySpan{start: start, end: end}, false, false, true, nil
 	}
-	allEq := matched == len(fields) && matched == len(rang) && !sawNull
+	allEq := matched == len(fields) && matched == len(rang) && !sawNull && !loose
 	return keySpan{start: append([]byte(nil), prefix...), end: prefixEnd(prefix)}, allEq, false, true, nil
+}
+
+// seekPart is the key prefix a comparison should use. Non-binary strings seek
+// by collation weight and leave the tie-breaker out.
+func seekPart(ctx context.Context, field indexField, value interface{}) ([]byte, error) {
+	if !byteOrderType(field.typ) {
+		return collationPrefix(field.typ, value, field.desc)
+	}
+	return encodeField(ctx, field, value)
 }
 
 func edgeStart(ctx context.Context, field indexField, prefix []byte, e edge) ([]byte, error) {
@@ -216,7 +227,7 @@ func edgeStart(ctx context.Context, field indexField, prefix []byte, e edge) ([]
 	case edgeAfterNull:
 		return append(append([]byte(nil), prefix...), nonNullFloor(field.desc)...), nil
 	case edgeValue:
-		part, err := encodeField(ctx, field, e.value)
+		part, err := seekPart(ctx, field, e.value)
 		if err != nil {
 			return nil, err
 		}
@@ -247,7 +258,7 @@ func edgeEnd(ctx context.Context, field indexField, prefix []byte, e edge) ([]by
 		}
 		return append(append([]byte(nil), prefix...), nonNullFloor(false)...), nil
 	case edgeValue:
-		part, err := encodeField(ctx, field, e.value)
+		part, err := seekPart(ctx, field, e.value)
 		if err != nil {
 			return nil, err
 		}
@@ -339,7 +350,14 @@ func (it *indexIter) Next(ctx *sql.Context) (sql.Row, error) {
 			return nil, err
 		}
 		if sess, ok := sessionFrom(ctx); ok {
-			sess.noteLockedRead(ctx, it.ref, pk, raw)
+			skip, err := sess.observeRow(ctx, it.ref, pk, raw)
+			if err != nil {
+				it.err = err
+				return nil, err
+			}
+			if skip {
+				continue
+			}
 		}
 		return row, nil
 	}
@@ -424,7 +442,7 @@ func (it *indexIter) pullDisk() error {
 }
 
 func (s *Store) openIndexIter(ctx context.Context, t *Table, indexName string, fields []indexField, unique bool, edits []edit, span keySpan, reverse bool) (*indexIter, error) {
-	tx, discard := s.readTx()
+	tx, discard := s.readFor(ctx, wantsCurrentRead(ctx))
 	rows := rowsBucket(tx, t.dbName, t.name)
 	data := indexData(tx, t.dbName, t.name, indexName)
 	if rows == nil {
@@ -435,6 +453,11 @@ func (s *Store) openIndexIter(ctx context.Context, t *Table, indexName string, f
 	diskDone := data == nil
 	if data != nil {
 		iter = data.rawIter(reverse)
+		if sess := sessionOf(ctx); sess != nil && sess.snapshotTxn() == tx.txn {
+			if txn, ok := tx.txn.(*badger.Txn); ok {
+				sess.trackIterator(iter.it, txn)
+			}
+		}
 		if reverse {
 			if span.end != nil {
 				iter.Seek(span.end)
@@ -509,6 +532,9 @@ func (it *indexIter) Close(*sql.Context) error {
 	it.closed = true
 	if it.iter != nil {
 		it.iter.Close()
+		if sess := sessionOf(it.ctx); sess != nil {
+			sess.noteIteratorClosed(it.iter.it)
+		}
 	}
 	if it.discard != nil {
 		it.discard()

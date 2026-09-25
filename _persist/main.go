@@ -13,6 +13,7 @@ import (
 	"github.com/dolthub/vitess/go/vt/proto/query"
 
 	sqle "github.com/dolthub/go-mysql-server"
+	"github.com/dolthub/go-mysql-server/eventscheduler"
 	"github.com/dolthub/go-mysql-server/persist"
 	"github.com/dolthub/go-mysql-server/server"
 	"github.com/dolthub/go-mysql-server/sql"
@@ -87,6 +88,11 @@ func main() {
 	}
 
 	engine := sqle.NewDefault(store)
+	if err := engine.InitializeEventScheduler(func() (*sql.Context, error) {
+		return sql.NewContext(context.Background(), sql.WithSession(persist.NewSession(sql.NewBaseSession(), store))), nil
+	}, eventscheduler.SchedulerOn, 0); err != nil {
+		log.Fatalf("events: %v", err)
+	}
 	if store.Replicating() {
 		engine.Analyzer.Catalog.BinlogPrimaryController = store
 		engine.Analyzer.Catalog.BinlogReplicaController = store

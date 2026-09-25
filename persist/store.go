@@ -36,12 +36,14 @@ var (
 	keyDataBytes     = []byte("dataBytes")
 	bucketIndex      = []byte("index")
 	keySourceGTID    = []byte("sourceGtid")
+	keyRetrievedGTID = []byte("retrievedGtid")
 	keyReplicaSource = []byte("replicaSource")
 )
 
 // formatCurrent is sortable keys plus binary rows. A missing key is the
 // previous format: decimal key parts wrapped as bucket entries, and JSON rows.
-const formatCurrent uint16 = 1
+// formatCurrent is collation-ordered string keys. format 1 stored raw bytes.
+const formatCurrent uint16 = 2
 
 // Store is a go-mysql-server database provider backed by one Badger directory.
 type Store struct {
@@ -61,6 +63,8 @@ type Store struct {
 	privMu   sync.Mutex
 	privDB   *mysql_db.MySQLDb
 	privSkip int
+	lockOnce sync.Once
+	rowLock  *lockTable
 }
 
 var _ sql.DatabaseProvider = (*Store)(nil)
@@ -460,13 +464,13 @@ type storedRow struct {
 }
 
 func (s *Store) getRow(ctx context.Context, t *Table, key []byte) (sql.Row, bool, error) {
-	row, _, ok, err := s.getRowImage(ctx, t, key)
+	row, _, ok, err := s.getRowImage(ctx, t, key, wantsCurrentRead(ctx))
 	return row, ok, err
 }
 
-func (s *Store) getRowImage(ctx context.Context, t *Table, key []byte) (sql.Row, []byte, bool, error) {
+func (s *Store) getRowImage(ctx context.Context, t *Table, key []byte, current bool) (sql.Row, []byte, bool, error) {
 	var raw []byte
-	err := s.view(func(tx *kvTx) error {
+	err := s.rowView(ctx, current, func(tx *kvTx) error {
 		rows := rowsBucket(tx, t.dbName, t.name)
 		if rows == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -484,9 +488,9 @@ func (s *Store) getRowImage(ctx context.Context, t *Table, key []byte) (sql.Row,
 	return row, raw, true, nil
 }
 
-func (s *Store) indexGet(t *Table, indexName string, key []byte) ([]byte, error) {
+func (s *Store) indexGet(ctx context.Context, t *Table, indexName string, key []byte) ([]byte, error) {
 	var val []byte
-	err := s.view(func(tx *kvTx) error {
+	err := s.rowView(ctx, wantsCurrentRead(ctx), func(tx *kvTx) error {
 		data := indexData(tx, t.dbName, t.name, indexName)
 		if data == nil {
 			return nil

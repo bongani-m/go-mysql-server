@@ -6,6 +6,8 @@ import (
 	"io"
 	"sort"
 
+	"github.com/dgraph-io/badger/v4"
+
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
@@ -85,14 +87,22 @@ type mergeIter struct {
 }
 
 func (it *mergeIter) Next(ctx *sql.Context) (sql.Row, error) {
-	row, err := it.nextStored(ctx)
-	if err != nil {
-		return nil, err
+	for {
+		row, err := it.nextStored(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if sess, ok := sessionFrom(ctx); ok {
+			skip, err := sess.observeRow(ctx, it.ref, row.key, row.raw)
+			if err != nil {
+				return nil, err
+			}
+			if skip {
+				continue
+			}
+		}
+		return row.row, nil
 	}
-	if sess, ok := sessionFrom(ctx); ok {
-		sess.noteLockedRead(ctx, it.ref, row.key, row.raw)
-	}
-	return row.row, nil
 }
 
 func (it *mergeIter) nextStored(ctx context.Context) (storedRow, error) {
@@ -212,7 +222,12 @@ func (it *mergeIter) Close(*sql.Context) error {
 		return nil
 	}
 	it.closed = true
-	it.iter.Close()
+	if it.iter != nil {
+		it.iter.Close()
+		if sess := sessionOf(it.ctx); sess != nil {
+			sess.noteIteratorClosed(it.iter.it)
+		}
+	}
 	if it.discard != nil {
 		it.discard()
 	}
@@ -220,13 +235,18 @@ func (it *mergeIter) Close(*sql.Context) error {
 }
 
 func (s *Store) mergeRows(ctx context.Context, t *Table, edits []edit, span keySpan, reverse bool) (*mergeIter, error) {
-	tx, discard := s.readTx()
+	tx, discard := s.readFor(ctx, wantsCurrentRead(ctx))
 	rows := rowsBucket(tx, t.dbName, t.name)
 	if rows == nil {
 		discard()
 		return nil, sql.ErrTableNotFound.New(t.name)
 	}
 	iter := rows.rawIter(reverse)
+	if sess := sessionOf(ctx); sess != nil && sess.snapshotTxn() == tx.txn {
+		if txn, ok := tx.txn.(*badger.Txn); ok {
+			sess.trackIterator(iter.it, txn)
+		}
+	}
 	if reverse {
 		if span.end != nil {
 			iter.Seek(span.end)
@@ -259,4 +279,15 @@ func (s *Store) mergeRows(ctx context.Context, t *Table, edits []edit, span keyS
 func (s *Store) readTx() (*kvTx, func()) {
 	txn := s.badgerDB().NewTransaction(false)
 	return &kvTx{txn: txn}, func() { txn.Discard() }
+}
+
+// readFor returns the session snapshot for a consistent read. current, or a
+// session with no snapshot, opens a short-lived transaction.
+func (s *Store) readFor(ctx context.Context, current bool) (*kvTx, func()) {
+	if !current {
+		if txn := snapshotTxnFrom(ctx); txn != nil {
+			return &kvTx{txn: txn}, func() {}
+		}
+	}
+	return s.readTx()
 }

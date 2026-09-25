@@ -7,6 +7,8 @@ import (
 	"math"
 	"time"
 
+	"unicode/utf8"
+
 	"github.com/cockroachdb/apd/v3"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -18,6 +20,7 @@ import (
 // a longer one instead of by its length.
 func primaryKey(ctx context.Context, schema sql.Schema, ordinals []int, row sql.Row) ([]byte, error) {
 	var buf []byte
+	var tie []byte
 	for _, ord := range ordinals {
 		if ord < 0 || ord >= len(row) {
 			return nil, fmt.Errorf("persist: primary key ordinal %d is outside the row", ord)
@@ -31,8 +34,13 @@ func primaryKey(ctx context.Context, schema sql.Schema, ordinals []int, row sql.
 			return nil, err
 		}
 		buf = append(buf, part...)
+		// The original bytes follow every column weight. A tie between columns
+		// would stop a multi-column seek from being a prefix of the stored key.
+		if row[ord] != nil && !byteOrderType(typ) {
+			tie = append(tie, encodeTextKey([]byte(valueText(row[ord])))...)
+		}
 	}
-	return buf, nil
+	return append(buf, tie...), nil
 }
 
 type indexField struct {
@@ -80,7 +88,86 @@ func encodeField(ctx context.Context, field indexField, value interface{}) ([]by
 	if field.prefix > 0 {
 		value = prefixValue(value, field.prefix)
 	}
+	if !byteOrderType(field.typ) {
+		encoded, err := encodeCollationKey(field.typ, value)
+		if err != nil {
+			return nil, err
+		}
+		if field.desc {
+			for i := range encoded {
+				encoded[i] = ^encoded[i]
+			}
+		}
+		return encoded, nil
+	}
 	return encodeKeyPart(value, field.desc), nil
+}
+
+// encodeCollationKey orders a string by its collation weight. Strings the
+// collation treats as equal share a key, so a unique index rejects the second.
+// The original bytes follow the weight so two strings that are not equal still
+// have distinct keys when their weights collide. Equality seeks use the weight
+// prefix from collationPrefix.
+func encodeCollationKey(typ sql.Type, value interface{}) ([]byte, error) {
+	return collationPrefix(typ, value, false)
+}
+
+func valueText(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+// collationWeight is the big-endian rune weights. WriteWeightString writes
+// little-endian bytes, which do not sort in weight order.
+func collationWeight(typ sql.Type, text string) ([]byte, error) {
+	with, ok := typ.(sql.TypeWithCollation)
+	if !ok {
+		return []byte(text), nil
+	}
+	sorter := with.Collation().Sorter()
+	if sorter == nil {
+		return []byte(text), nil
+	}
+	buf := make([]byte, 0, len(text)*4)
+	var part [4]byte
+	for len(text) > 0 {
+		r, size := utf8.DecodeRuneInString(text)
+		if r == utf8.RuneError && size == 1 {
+			return nil, fmt.Errorf("persist: malformed string for collation key")
+		}
+		binary.BigEndian.PutUint32(part[:], uint32(sorter(r)))
+		buf = append(buf, part[:]...)
+		text = text[size:]
+	}
+	return buf, nil
+}
+
+// collationPrefix is the ordered weight of one string, without the tie-breaker.
+func collationPrefix(typ sql.Type, value interface{}, desc bool) ([]byte, error) {
+	if value == nil {
+		part := []byte{0x00}
+		if desc {
+			part[0] = ^part[0]
+		}
+		return part, nil
+	}
+	weight, err := collationWeight(typ, valueText(value))
+	if err != nil {
+		return nil, err
+	}
+	part := encodeTextKey(weight)
+	if desc {
+		for i := range part {
+			part[i] = ^part[i]
+		}
+	}
+	return part, nil
 }
 
 func encodeKeyPart(value interface{}, descending bool) []byte {
@@ -282,7 +369,7 @@ func encodeIndexColumns(ctx context.Context, fields []indexField, row sql.Row) (
 		if row[field.ordinal] == nil {
 			hasNull = true
 		}
-		part, err := encodeField(ctx, field, row[field.ordinal])
+		part, err := seekPart(ctx, field, row[field.ordinal])
 		if err != nil {
 			return nil, false, err
 		}

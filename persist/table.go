@@ -91,6 +91,28 @@ func (t *Table) Deleter(ctx *sql.Context) sql.RowDeleter { return t.mustWriteEdi
 // Replacer implements sql.ReplaceableTable.
 func (t *Table) Replacer(ctx *sql.Context) sql.RowReplacer { return t.mustWriteEditor(ctx) }
 
+var _ sql.Lockable = (*Table)(nil)
+
+// Lock implements sql.Lockable. LOCK TABLES takes the process-wide lock table
+// at table granularity and holds it until UNLOCK TABLES or disconnect.
+func (t *Table) Lock(ctx *sql.Context, write bool) error {
+	sess, ok := sessionFrom(ctx)
+	if !ok {
+		return nil
+	}
+	return sess.lockTable(ctx, t.ref(), write)
+}
+
+// Unlock implements sql.Lockable.
+func (t *Table) Unlock(ctx *sql.Context, _ uint32) error {
+	sess, ok := sessionFrom(ctx)
+	if !ok {
+		return nil
+	}
+	sess.unlockTables()
+	return nil
+}
+
 // Truncate implements sql.TruncateableTable. Like MySQL, truncate commits immediately.
 func (t *Table) Truncate(ctx *sql.Context) (int, error) {
 	if sess, ok := sessionFrom(ctx); ok {
@@ -244,6 +266,9 @@ func (e *editor) Close(ctx *sql.Context) error {
 	e.closed = true
 	if sess, ok := sessionFrom(ctx); ok {
 		sess.untrack(e)
+		if ctx == nil || !ctx.GetIgnoreAutoCommit() {
+			defer sess.releaseLocks()
+		}
 	}
 	edits := e.edits
 	e.edits = nil
@@ -260,7 +285,13 @@ func (e *editor) Close(ctx *sql.Context) error {
 	if ctx != nil {
 		statement = ctx.Query()
 	}
-	return e.table.store.apply(e.table, edits, statement, sourceGTID(ctx))
+	if err := e.table.store.apply(e.table, edits, statement, sourceGTID(ctx)); err != nil {
+		return err
+	}
+	if sess, ok := sessionFrom(ctx); ok {
+		sess.refreshSnapshot()
+	}
+	return nil
 }
 
 func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {
@@ -276,7 +307,10 @@ func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {
 		return err
 	}
 	if len(e.meta.pk) > 0 {
-		existing, taken, err := e.lookup(ctx, key)
+		if err := e.guard(ctx, key); err != nil {
+			return err
+		}
+		existing, taken, err := e.occupiedPK(ctx, row, nil)
 		if err != nil {
 			return err
 		}
@@ -305,7 +339,7 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 	if err := e.checkRow(ctx, newRow); err != nil {
 		return err
 	}
-	oldKey, _, expected, err := e.locate(ctx, oldRow)
+	oldKey, _, expected, err := e.locateLocked(ctx, oldRow)
 	if err != nil {
 		return err
 	}
@@ -319,7 +353,10 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 			return err
 		}
 		if !bytesEqual(oldKey, newKey) {
-			existing, taken, err := e.lookup(ctx, newKey)
+			if err := e.guard(ctx, newKey); err != nil {
+				return err
+			}
+			existing, taken, err := e.occupiedPK(ctx, newRow, oldRow)
 			if err != nil {
 				return err
 			}
@@ -346,7 +383,7 @@ func (e *editor) Delete(ctx *sql.Context, row sql.Row) error {
 	if err := e.writable(ctx); err != nil {
 		return err
 	}
-	key, _, expected, err := e.locate(ctx, row)
+	key, _, expected, err := e.locateLocked(ctx, row)
 	if err != nil {
 		return err
 	}
@@ -418,7 +455,7 @@ func (e *editor) uniqueHit(ctx *sql.Context, idx storedIndex, row, skip sql.Row)
 		}
 		return true, existing.row, nil
 	}
-	pk, err := e.table.store.indexGet(e.table, idx.Name, colKey)
+	pk, err := e.table.store.indexGet(ctx, e.table, idx.Name, colKey)
 	if err != nil || len(pk) == 0 {
 		return false, nil, err
 	}
@@ -473,6 +510,44 @@ func (e *editor) insertKey(ctx *sql.Context, row sql.Row) ([]byte, error) {
 	return primaryKey(ctx, e.meta.schema, e.meta.pk, row)
 }
 
+// locateLocked locks the row, then reads the latest committed image so the
+// edit applies to the current row rather than the transaction snapshot.
+func (e *editor) locateLocked(ctx *sql.Context, row sql.Row) ([]byte, sql.Row, []byte, error) {
+	if len(e.meta.pk) > 0 {
+		key, err := primaryKey(ctx, e.meta.schema, e.meta.pk, row)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if err := e.guard(ctx, key); err != nil {
+			return nil, nil, nil, err
+		}
+		found, expected, ok, err := e.table.lookupLatest(ctx, key, e)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !ok {
+			return nil, nil, nil, sql.ErrDeleteRowNotFound.New()
+		}
+		return key, found, expected, nil
+	}
+	key, found, expected, err := e.locate(ctx, row)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := e.guard(ctx, key); err != nil {
+		return nil, nil, nil, err
+	}
+	return key, found, expected, nil
+}
+
+func (e *editor) guard(ctx *sql.Context, key []byte) error {
+	sess, ok := sessionFrom(ctx)
+	if !ok {
+		return nil
+	}
+	return sess.lockExclusive(ctx, e.table.ref(), key)
+}
+
 func (e *editor) locate(ctx *sql.Context, row sql.Row) ([]byte, sql.Row, []byte, error) {
 	if len(e.meta.pk) > 0 {
 		key, err := primaryKey(ctx, e.meta.schema, e.meta.pk, row)
@@ -508,6 +583,77 @@ func (e *editor) lookup(ctx *sql.Context, key []byte) (sql.Row, bool, error) {
 	return e.table.lookupKey(ctx, key, e)
 }
 
+// occupiedPK reports a row whose primary key compares equal, including a
+// different spelling that shares a collation weight.
+func (e *editor) occupiedPK(ctx *sql.Context, row, skip sql.Row) (sql.Row, bool, error) {
+	if !pkUsesCollation(e.meta) {
+		key, err := primaryKey(ctx, e.meta.schema, e.meta.pk, row)
+		if err != nil {
+			return nil, false, err
+		}
+		return e.lookupLatest(ctx, key)
+	}
+	prefix, err := pkSeekPrefix(ctx, e.meta, row)
+	if err != nil {
+		return nil, false, err
+	}
+	iter, err := e.table.store.mergeRows(ctx, e.table, e.pendingEdits(ctx), keySpan{start: prefix, end: prefixEnd(prefix)}, false)
+	if err != nil {
+		return nil, false, err
+	}
+	defer iter.Close(ctx)
+	for {
+		next, err := iter.Next(ctx)
+		if err == io.EOF {
+			return nil, false, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if skip != nil {
+			same, err := rowsEqual(ctx, e.meta.schema, next, skip)
+			if err != nil {
+				return nil, false, err
+			}
+			if same {
+				continue
+			}
+		}
+		return next, true, nil
+	}
+}
+
+func pkUsesCollation(meta tableMeta) bool {
+	for _, ord := range meta.pk {
+		if ord >= 0 && ord < len(meta.schema) && !byteOrderType(meta.schema[ord].Type) {
+			return true
+		}
+	}
+	return false
+}
+
+func pkSeekPrefix(ctx *sql.Context, meta tableMeta, row sql.Row) ([]byte, error) {
+	var buf []byte
+	for _, ord := range meta.pk {
+		field := indexField{ordinal: ord, typ: meta.schema[ord].Type}
+		var value interface{}
+		if ord < len(row) {
+			value = row[ord]
+		}
+		part, err := seekPart(ctx, field, value)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, part...)
+	}
+	return buf, nil
+}
+
+func (e *editor) lookupLatest(ctx *sql.Context, key []byte) (sql.Row, bool, error) {
+	row, _, ok, err := e.table.lookupLatest(ctx, key, e)
+	return row, ok, err
+}
+
 func (t *Table) lookupKey(ctx *sql.Context, key []byte, self *editor) (sql.Row, bool, error) {
 	row, _, ok, err := t.lookupImage(ctx, key, self)
 	return row, ok, err
@@ -531,7 +677,27 @@ func (t *Table) lookupImage(ctx *sql.Context, key []byte, self *editor) (sql.Row
 			return row, nil, ok, nil
 		}
 	}
-	return t.store.getRowImage(ctx, t, key)
+	return t.store.getRowImage(ctx, t, key, wantsCurrentRead(ctx))
+}
+
+// lookupLatest is lookupImage against the latest commit, ignoring the snapshot.
+func (t *Table) lookupLatest(ctx *sql.Context, key []byte, self *editor) (sql.Row, []byte, bool, error) {
+	if self != nil {
+		if row, ok, decided := lookupEdits(self.edits, key); decided {
+			return row, nil, ok, nil
+		}
+	}
+	if sess, ok := sessionFrom(ctx); ok {
+		if self != nil {
+			if row, ok, decided := sess.lookupOpen(self, key); decided {
+				return row, nil, ok, nil
+			}
+		}
+		if row, ok, decided := lookupEdits(sess.edits(t.ref()), key); decided {
+			return row, nil, ok, nil
+		}
+	}
+	return t.store.getRowImage(ctx, t, key, true)
 }
 
 func (e *editor) matchingRows(ctx *sql.Context) ([]storedRow, error) {

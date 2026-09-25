@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
 var _ sql.RewritableTable = (*Table)(nil)
@@ -31,18 +30,6 @@ func (t *Table) RewriteInserter(
 	if len(oldSchema.PkOrdinals) > 0 && len(newSchema.PkOrdinals) == 0 {
 		if err := sql.ValidatePrimaryKeyDrop(ctx, t, oldSchema); err != nil {
 			return nil, err
-		}
-	}
-	if len(oldSchema.PkOrdinals) != len(newSchema.PkOrdinals) {
-		for _, idxCol := range idxCols {
-			ord := columnOrdinal(newSchema.Schema, idxCol.Name)
-			if ord < 0 {
-				return nil, sql.ErrColumnNotFound.New(idxCol.Name)
-			}
-			col := newSchema.Schema[ord]
-			if col.PrimaryKey && idxCol.Length > 0 && types.IsText(col.Type) {
-				return nil, sql.ErrUnsupportedIndexPrefix.New(col.Name)
-			}
 		}
 	}
 	// A primary key column is never nullable, but MODIFY COLUMN does not restate

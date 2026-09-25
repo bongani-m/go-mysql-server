@@ -185,7 +185,7 @@ func TestDescendingIndexRange(t *testing.T) {
 		}},
 	}))
 	idx := indexByName(t, ctx, table, "n_desc")
-	require.Equal(t, sql.IndexOrderNone, idx.Order(ctx))
+	require.Equal(t, sql.IndexOrderDesc, idx.Order(ctx))
 	require.True(t, idx.Reversible(ctx))
 
 	less := indexLookup(t, ctx, table, idx, sql.MySQLRangeCollection{
@@ -542,6 +542,29 @@ func rawRowKeys(t *testing.T, store *Store, dbName, tableName string) [][]byte {
 		})
 	}))
 	return keys
+}
+
+func TestCollationPrimaryKeyLookup(t *testing.T) {
+	ctx := sql.NewContext(context.Background())
+	store := openAt(t, filepath.Join(t.TempDir(), "gms.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	text, err := types.CreateString(query.Type_VARCHAR, 84, sql.Collation_utf8mb4_general_ci)
+	require.NoError(t, err)
+	db := createTable(t, ctx, store, "words", sql.NewPrimaryKeySchema(sql.Schema{
+		{Name: "word", Type: text, Nullable: false, Source: "words", PrimaryKey: true},
+		{Name: "n", Type: types.Int64, Nullable: false, Source: "words"},
+	}))
+	table := mustNamedTable(t, ctx, db, "words")
+	require.NoError(t, insertRows(ctx, table, sql.NewRow("aaaa", int64(1)), sql.NewRow("ghi", int64(2))))
+	idx := indexByName(t, ctx, table, "PRIMARY")
+	got := indexLookup(t, ctx, table, idx, sql.MySQLRangeCollection{
+		{sql.ClosedRangeColumnExpr("aaaa", "aaaa", text)},
+	}, false)
+	require.Equal(t, []sql.Row{{"aaaa", int64(1)}}, got)
+	folded := indexLookup(t, ctx, table, idx, sql.MySQLRangeCollection{
+		{sql.ClosedRangeColumnExpr("AAAA", "AAAA", text)},
+	}, false)
+	require.Equal(t, []sql.Row{{"aaaa", int64(1)}}, folded)
 }
 
 func mustPrimaryKey(t *testing.T, ctx *sql.Context, table *Table, row sql.Row) []byte {

@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -45,11 +46,15 @@ func sourceGTID(ctx *sql.Context) string {
 
 // replicaSource is the upstream MySQL this cluster follows. Password is local.
 type replicaSource struct {
-	Host     string `json:"host"`
-	User     string `json:"user"`
-	Port     uint16 `json:"port"`
-	Running  bool   `json:"running"`
-	Password string `json:"-"`
+	Host         string   `json:"host"`
+	User         string   `json:"user"`
+	Port         uint16   `json:"port"`
+	Running      bool     `json:"running"`
+	DoTables     []string `json:"do_tables,omitempty"`
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
+	WildDo       []string `json:"wild_do,omitempty"`
+	WildIgnore   []string `json:"wild_ignore,omitempty"`
+	Password     string   `json:"-"`
 }
 
 // binlogStream is one upstream dump. Close unblocks ReadEvent.
@@ -83,6 +88,8 @@ type replicaState struct {
 	lastIOAt        *time.Time
 	lastSQLAt       *time.Time
 	sourceUUID      string
+	lastSourceUnix  uint32
+	sqlIdle         bool
 }
 
 func (s *Store) replica() *replicaState {
@@ -392,9 +399,17 @@ func (s *Store) saveReplicaSource(src replicaSource) error {
 }
 
 func (s *Store) loadSourceGTID() (mysql.Mysql56GTIDSet, error) {
+	return s.loadGTIDKey(keySourceGTID)
+}
+
+func (s *Store) loadRetrievedGTID() (mysql.Mysql56GTIDSet, error) {
+	return s.loadGTIDKey(keyRetrievedGTID)
+}
+
+func (s *Store) loadGTIDKey(key []byte) (mysql.Mysql56GTIDSet, error) {
 	var raw []byte
 	err := s.view(func(tx *kvTx) error {
-		raw = append([]byte(nil), tx.root().Get(keySourceGTID)...)
+		raw = append([]byte(nil), tx.root().Get(key)...)
 		return nil
 	})
 	if err != nil || len(raw) == 0 {
@@ -406,9 +421,47 @@ func (s *Store) loadSourceGTID() (mysql.Mysql56GTIDSet, error) {
 	}
 	parsed, ok := set.(mysql.Mysql56GTIDSet)
 	if !ok {
-		return nil, fmt.Errorf("persist: source gtid set %T", set)
+		return nil, fmt.Errorf("persist: gtid set %T", set)
 	}
 	return parsed, nil
+}
+
+// noteRetrievedGTID records a GTID the IO thread has read, before the SQL thread applies it.
+func (s *Store) noteRetrievedGTID(gtid mysql.GTID) error {
+	set, err := s.loadRetrievedGTID()
+	if err != nil {
+		return err
+	}
+	if len(set) == 0 {
+		set, err = s.loadSourceGTID()
+		if err != nil {
+			return err
+		}
+	}
+	next, ok := set.AddGTID(gtid).(mysql.Mysql56GTIDSet)
+	if !ok {
+		return fmt.Errorf("persist: cannot record retrieved gtid %v", gtid)
+	}
+	return s.commitGTID("", "", func(tx *kvTx) error {
+		return tx.root().Put(keyRetrievedGTID, []byte(next.String()))
+	})
+}
+
+func (s *Store) noteSourceTime(unix uint32) {
+	if unix == 0 {
+		return
+	}
+	st := s.replica()
+	st.mu.Lock()
+	st.lastSourceUnix = unix
+	st.mu.Unlock()
+}
+
+func (s *Store) setReplicaSQLIdle(idle bool) {
+	st := s.replica()
+	st.mu.Lock()
+	st.sqlIdle = idle
+	st.mu.Unlock()
 }
 
 func (s *Store) passwordPath() string {
@@ -526,8 +579,29 @@ func (s *Store) SetReplicationSourceOptions(_ *sql.Context, options []binlogrepl
 }
 
 // SetReplicationFilterOptions implements binlogreplication.BinlogReplicaController.
-func (s *Store) SetReplicationFilterOptions(*sql.Context, []binlogreplication.ReplicationOption) error {
-	return fmt.Errorf("persist: replication filters are not supported")
+func (s *Store) SetReplicationFilterOptions(_ *sql.Context, options []binlogreplication.ReplicationOption) error {
+	src, err := s.loadReplicaSource()
+	if err != nil {
+		return err
+	}
+	for _, option := range options {
+		switch strings.ToUpper(option.Name) {
+		case "REPLICATE_DO_TABLE":
+			src.DoTables, err = optionTables(option)
+		case "REPLICATE_IGNORE_TABLE":
+			src.IgnoreTables, err = optionTables(option)
+		case "REPLICATE_WILD_DO_TABLE":
+			src.WildDo, err = optionStringList(option)
+		case "REPLICATE_WILD_IGNORE_TABLE":
+			src.WildIgnore, err = optionStringList(option)
+		default:
+			err = fmt.Errorf("persist: unsupported replication filter: %s", option.Name)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return s.saveReplicaSource(src)
 }
 
 // StartReplica implements binlogreplication.BinlogReplicaController.
@@ -608,7 +682,10 @@ func (s *Store) ResetReplica(_ *sql.Context, resetAll bool) error {
 		_ = os.Remove(path)
 	}
 	return s.commitGTID("", "", func(tx *kvTx) error {
-		return tx.root().Delete(keyReplicaSource)
+		if err := tx.root().Delete(keyReplicaSource); err != nil {
+			return err
+		}
+		return tx.root().Delete(keyRetrievedGTID)
 	})
 }
 
@@ -632,7 +709,20 @@ func (s *Store) GetReplicaStatus(*sql.Context) (*binlogreplication.ReplicaStatus
 		ConnectRetry:          5,
 		AutoPosition:          true,
 	}
+	sqlRunning := st.sqlState == binlogreplication.ReplicaSqlRunning
+	idle := st.sqlIdle
+	lastUnix := st.lastSourceUnix
 	st.mu.Unlock()
+	if sqlRunning {
+		var lag int64
+		if !idle && lastUnix > 0 {
+			lag = time.Now().Unix() - int64(lastUnix)
+			if lag < 0 {
+				lag = 0
+			}
+		}
+		status.SecondsBehindSource = &lag
+	}
 	if src.Host == "" && (up == nil || up.Host == "") {
 		return nil, nil
 	}
@@ -641,15 +731,23 @@ func (s *Store) GetReplicaStatus(*sql.Context) (*binlogreplication.ReplicaStatus
 		src.Port = up.Port
 		src.User = up.User
 	}
-	set, err := s.loadSourceGTID()
+	executed, err := s.loadSourceGTID()
+	if err != nil {
+		return nil, err
+	}
+	retrieved, err := s.loadRetrievedGTID()
 	if err != nil {
 		return nil, err
 	}
 	status.SourceHost = src.Host
 	status.SourceUser = src.User
 	status.SourcePort = uint(src.Port)
-	status.ExecutedGtidSet = set.String()
-	status.RetrievedGtidSet = set.String()
+	status.ExecutedGtidSet = executed.String()
+	status.RetrievedGtidSet = retrieved.String()
+	status.ReplicateDoTables = append([]string(nil), src.DoTables...)
+	status.ReplicateIgnoreTables = append([]string(nil), src.IgnoreTables...)
+	status.ReplicateWildDoTables = append([]string(nil), src.WildDo...)
+	status.ReplicateWildIgnoreTables = append([]string(nil), src.WildIgnore...)
 	if status.ReplicaIoRunning == "" {
 		status.ReplicaIoRunning = binlogreplication.ReplicaIoNotRunning
 	}
@@ -688,6 +786,85 @@ func optionInt(option binlogreplication.ReplicationOption) (int, error) {
 	default:
 		return 0, fmt.Errorf("persist: %s expects an integer", option.Name)
 	}
+}
+
+func optionTables(option binlogreplication.ReplicationOption) ([]string, error) {
+	tables, ok := option.Value.([]sql.UnresolvedTable)
+	if !ok {
+		return nil, fmt.Errorf("persist: %s expects a table list", option.Name)
+	}
+	out := make([]string, len(tables))
+	for i, table := range tables {
+		db := ""
+		if table.Database() != nil {
+			db = table.Database().Name()
+		}
+		out[i] = db + "." + table.Name()
+	}
+	return out, nil
+}
+
+func optionStringList(option binlogreplication.ReplicationOption) ([]string, error) {
+	values, ok := option.Value.([]string)
+	if !ok {
+		return nil, fmt.Errorf("persist: %s expects a string list", option.Name)
+	}
+	if err := binlogreplication.ValidateWildcardTablePatterns(values); err != nil {
+		return nil, err
+	}
+	return append([]string(nil), values...), nil
+}
+
+func (src replicaSource) allowsTable(db, table string) bool {
+	name := db + "." + table
+	if len(src.DoTables) > 0 || len(src.WildDo) > 0 {
+		if !listHasFold(src.DoTables, name) && !wildHas(src.WildDo, name) {
+			return false
+		}
+	}
+	if listHasFold(src.IgnoreTables, name) || wildHas(src.WildIgnore, name) {
+		return false
+	}
+	return true
+}
+
+func listHasFold(list []string, name string) bool {
+	for _, item := range list {
+		if strings.EqualFold(item, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func wildHas(patterns []string, name string) bool {
+	for _, pattern := range patterns {
+		if likeMatch(pattern, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func likeMatch(pattern, value string) bool {
+	var b strings.Builder
+	b.WriteString("(?i)^")
+	for _, r := range pattern {
+		switch r {
+		case '%':
+			b.WriteString(".*")
+		case '_':
+			b.WriteByte('.')
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteByte('$')
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return false
+	}
+	return re.MatchString(value)
 }
 
 type replicaTxn struct {
@@ -755,99 +932,139 @@ func (t *replicaTxn) finish(s *Store) error {
 	return s.commitGTID("", t.gtidText, func(tx *kvTx) error { return nil })
 }
 
+// ReplayBinlog applies an existing binlog file through the replica row applier.
+// Point-in-time restore installs a Raft snapshot first, then calls this for the
+// events that follow that snapshot. GTIDs already executed are skipped.
+func (s *Store) ReplayBinlog(path string) error {
+	events, format, err := readBinlogFile(path)
+	if err != nil {
+		return err
+	}
+	applier := &binlogApply{format: format, tables: map[uint64]*mysql.TableMap{}}
+	for _, ev := range events {
+		if err := applier.event(s, ev); err != nil {
+			return err
+		}
+	}
+	if applier.txn != nil {
+		return applier.txn.finish(s)
+	}
+	return nil
+}
+
+type binlogApply struct {
+	format mysql.BinlogFormat
+	tables map[uint64]*mysql.TableMap
+	txn    *replicaTxn
+}
+
 func (s *Store) consumeUpstream(ctx context.Context, stream binlogStream) error {
-	var format mysql.BinlogFormat
-	tables := map[uint64]*mysql.TableMap{}
-	var txn *replicaTxn
+	applier := &binlogApply{tables: map[uint64]*mysql.TableMap{}}
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		s.setReplicaSQLIdle(true)
 		ev, err := stream.ReadEvent()
+		s.setReplicaSQLIdle(false)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			return err
 		}
-		if ev == nil || !ev.IsValid() {
-			continue
-		}
-		if ev.IsFormatDescription() {
-			format, err = ev.Format()
-			if err != nil {
-				return err
-			}
-			continue
-		}
-		if format.ChecksumAlgorithm != 0 {
-			ev, _, err = ev.StripChecksum(format)
-			if err != nil {
-				return err
-			}
-		}
-		if ev.IsPreviousGTIDs() || ev.IsRotate() {
-			continue
-		}
-		if ev.IsGTID() {
-			if txn != nil {
-				if err := txn.finish(s); err != nil {
-					return err
-				}
-			}
-			gtid, _, err := ev.GTID(format)
-			if err != nil {
-				return err
-			}
-			txn, err = s.beginReplicaTxn(gtid)
-			if err != nil {
-				return err
-			}
-			continue
-		}
-		if txn == nil || txn.skip {
-			continue
-		}
-		switch {
-		case ev.IsQuery():
-			q, err := ev.Query(format)
-			if err != nil {
-				return err
-			}
-			if q.Database != "" && txn.sess != nil {
-				txn.sess.SetCurrentDatabase(q.Database)
-			}
-			if err := txn.query(s, q.SQL); err != nil {
-				return err
-			}
-		case ev.IsTableMap():
-			tm, err := ev.TableMap(format)
-			if err != nil {
-				return err
-			}
-			tables[ev.TableID(format)] = tm
-		case ev.IsWriteRows(), ev.IsUpdateRows(), ev.IsDeleteRows():
-			tm := tables[ev.TableID(format)]
-			if tm == nil {
-				return fmt.Errorf("persist: missing table map for binlog rows")
-			}
-			parsed, err := ev.Rows(format, tm)
-			if err != nil {
-				return err
-			}
-			if err := txn.applyRows(s, tm, ev, parsed); err != nil {
-				return err
-			}
-		case ev.IsXID():
-			if err := txn.finish(s); err != nil {
-				return err
-			}
-			txn = nil
+		if err := applier.event(s, ev); err != nil {
+			return err
 		}
 	}
 }
 
+func (a *binlogApply) event(s *Store, ev mysql.BinlogEvent) error {
+	if ev == nil || !ev.IsValid() {
+		return nil
+	}
+	if ev.IsFormatDescription() {
+		format, err := ev.Format()
+		if err != nil {
+			return err
+		}
+		a.format = format
+		return nil
+	}
+	if a.format.ChecksumAlgorithm != 0 {
+		stripped, _, err := ev.StripChecksum(a.format)
+		if err != nil {
+			return err
+		}
+		ev = stripped
+	}
+	s.noteSourceTime(ev.Timestamp())
+	if ev.IsPreviousGTIDs() || ev.IsRotate() {
+		return nil
+	}
+	if ev.IsGTID() {
+		if a.txn != nil {
+			if err := a.txn.finish(s); err != nil {
+				return err
+			}
+		}
+		gtid, _, err := ev.GTID(a.format)
+		if err != nil {
+			return err
+		}
+		if err := s.noteRetrievedGTID(gtid); err != nil {
+			return err
+		}
+		a.txn, err = s.beginReplicaTxn(gtid)
+		return err
+	}
+	if a.txn == nil || a.txn.skip {
+		return nil
+	}
+	switch {
+	case ev.IsQuery():
+		q, err := ev.Query(a.format)
+		if err != nil {
+			return err
+		}
+		if q.Database != "" && a.txn.sess != nil {
+			a.txn.sess.SetCurrentDatabase(q.Database)
+		}
+		return a.txn.query(s, q.SQL)
+	case ev.IsTableMap():
+		tm, err := ev.TableMap(a.format)
+		if err != nil {
+			return err
+		}
+		a.tables[ev.TableID(a.format)] = tm
+		return nil
+	case ev.IsWriteRows(), ev.IsUpdateRows(), ev.IsDeleteRows():
+		tm := a.tables[ev.TableID(a.format)]
+		if tm == nil {
+			return fmt.Errorf("persist: missing table map for binlog rows")
+		}
+		parsed, err := ev.Rows(a.format, tm)
+		if err != nil {
+			return err
+		}
+		return a.txn.applyRows(s, tm, ev, parsed)
+	case ev.IsXID():
+		if err := a.txn.finish(s); err != nil {
+			return err
+		}
+		a.txn = nil
+	}
+	return nil
+}
+
 func (t *replicaTxn) applyRows(s *Store, tm *mysql.TableMap, ev mysql.BinlogEvent, parsed mysql.Rows) error {
+	src, err := s.loadReplicaSource()
+	if err != nil {
+		return err
+	}
+	if !src.allowsTable(tm.Database, tm.Name) {
+		return nil
+	}
 	db, err := s.Database(t.ctx, tm.Database)
 	if err != nil {
 		return err

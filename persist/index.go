@@ -42,6 +42,7 @@ type storedFulltext struct {
 // expression the in-memory tables use, so results stay correct without a
 // separate index b-tree.
 type Index struct {
+	store      *Store
 	db         string
 	table      string
 	name       string
@@ -68,7 +69,19 @@ func (idx *Index) Comment() string                            { return idx.comme
 func (idx *Index) IndexType() string                          { return "BTREE" }
 func (idx *Index) IsGenerated() bool                          { return false }
 func (idx *Index) CanSupport(*sql.Context, ...sql.Range) bool { return true }
-func (idx *Index) CanSupportOrderBy(sql.Expression) bool      { return false }
+
+// Cardinality is the distinct count from the last ANALYZE TABLE.
+func (idx *Index) Cardinality(ctx *sql.Context) int64 {
+	if idx.store == nil {
+		return 0
+	}
+	stat, ok := idx.store.GetStats(ctx, sql.NewStatQualifier(idx.db, "", idx.table, idx.name), idx.columns)
+	if !ok || stat == nil {
+		return 0
+	}
+	return int64(stat.DistinctCount())
+}
+func (idx *Index) CanSupportOrderBy(sql.Expression) bool { return false }
 
 // Order is ascending for a btree index with no DESC column. A descending
 // column is reported by ColumnOrders, and Order stays unordered so a caller
@@ -77,10 +90,20 @@ func (idx *Index) Order(*sql.Context) sql.IndexOrder {
 	if idx.full || idx.spatial || idx.vector {
 		return sql.IndexOrderNone
 	}
+	desc := false
+	asc := false
 	for _, down := range idx.descending {
 		if down {
-			return sql.IndexOrderNone
+			desc = true
+		} else {
+			asc = true
 		}
+	}
+	if desc && !asc {
+		return sql.IndexOrderDesc
+	}
+	if desc {
+		return sql.IndexOrderNone
 	}
 	return sql.IndexOrderAsc
 }
@@ -214,6 +237,7 @@ func expressionTypes(exprs []string, colTypes []sql.Type) []sql.ColumnExpression
 
 func (t *Table) indexFromStored(stored storedIndex) *Index {
 	return &Index{
+		store:      t.store,
 		db:         t.dbName,
 		table:      t.name,
 		name:       stored.Name,
@@ -248,6 +272,7 @@ func (t *Table) primaryIndex() *Index {
 		columns[i] = t.meta.schema[ord].Name
 	}
 	return &Index{
+		store:   t.store,
 		db:      t.dbName,
 		table:   t.name,
 		name:    "PRIMARY",
@@ -563,7 +588,13 @@ func (t *indexedTable) openLookup(ctx *sql.Context, idx *Index, fields []indexFi
 			return sql.RowsToRowIter(), nil
 		}
 		if sess, ok := sessionFrom(ctx); ok {
-			sess.noteLockedRead(ctx, t.ref(), span.start, raw)
+			skip, err := sess.observeRow(ctx, t.ref(), span.start, raw)
+			if err != nil {
+				return nil, err
+			}
+			if skip {
+				return sql.RowsToRowIter(), nil
+			}
 		}
 		return &rowIter{rows: []sql.Row{row}}, nil
 	}
@@ -600,7 +631,7 @@ func (t *indexedTable) secondaryPoint(ctx *sql.Context, idx *Index, fields []ind
 		}
 		rows = append(rows, entry.row)
 	}
-	pk, err := t.store.indexGet(t.Table, idx.name, colKey)
+	pk, err := t.store.indexGet(ctx, t.Table, idx.name, colKey)
 	if err != nil {
 		return nil, err
 	}
@@ -612,7 +643,13 @@ func (t *indexedTable) secondaryPoint(ctx *sql.Context, idx *Index, fields []ind
 			}
 			if ok {
 				if sess, ok := sessionFrom(ctx); ok {
-					sess.noteLockedRead(ctx, t.ref(), pk, raw)
+					skip, err := sess.observeRow(ctx, t.ref(), pk, raw)
+					if err != nil {
+						return nil, err
+					}
+					if skip {
+						return &rowIter{rows: rows}, nil
+					}
 				}
 				rows = append(rows, row)
 			}

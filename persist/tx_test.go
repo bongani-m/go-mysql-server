@@ -2,6 +2,7 @@ package persist
 
 import (
 	"context"
+	"io"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -26,18 +27,16 @@ func TestLostUpdate(t *testing.T) {
 	winner := personRow(1, "Jane", "winner@b.c")
 	loser := personRow(1, "Jane", "loser@b.c")
 	require.NoError(t, updateRow(ctxA, table, orig, winner))
-	require.NoError(t, updateRow(ctxB, table, orig, loser))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- updateRow(ctxB, table, orig, loser)
+	}()
+	store.locksFor().awaitWaiting(sessB)
 	require.NoError(t, sessA.CommitTransaction(ctxA, ctxA.GetTransaction()))
-
-	err := sessB.CommitTransaction(ctxB, ctxB.GetTransaction())
-	require.Error(t, err)
-	require.True(t, sql.ErrLockDeadlock.Is(err))
-	require.Equal(t, "winner@b.c", readRows(t, base, table)[0][2])
-
-	third := personRow(1, "Jane", "third@b.c")
-	require.NoError(t, updateRow(ctxB, table, winner, third))
+	require.NoError(t, <-done)
 	require.NoError(t, sessB.CommitTransaction(ctxB, ctxB.GetTransaction()))
-	require.Equal(t, "third@b.c", readRows(t, base, table)[0][2])
+	require.Equal(t, "loser@b.c", readRows(t, base, table)[0][2])
 }
 
 func TestSameTransactionRewritesRow(t *testing.T) {
@@ -153,11 +152,158 @@ func TestLockingReadConflict(t *testing.T) {
 	require.Len(t, readRows(t, ctx, table), 1)
 	sess.SetLockingRead(false)
 
+	sessB, ctxB := beginSession(t, store)
+	done := make(chan error, 1)
+	go func() {
+		done <- updateRow(ctxB, table, orig, personRow(1, "Jane", "other@b.c"))
+	}()
+	store.locksFor().awaitWaiting(sessB)
+	require.NoError(t, sess.CommitTransaction(ctx, ctx.GetTransaction()))
+	require.NoError(t, <-done)
+	require.NoError(t, sessB.CommitTransaction(ctxB, ctxB.GetTransaction()))
+	require.Equal(t, "other@b.c", readRows(t, base, table)[0][2])
+}
+
+func TestRepeatableReadSnapshot(t *testing.T) {
+	store := openAt(t, filepath.Join(t.TempDir(), "gms.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	base := sql.NewContext(context.Background())
+	table := mustTable(t, base, createPeopleTable(t, base, store))
+	orig := personRow(1, "Jane", "jane@b.c")
+	require.NoError(t, insertRows(base, table, orig))
+
+	sess, ctx := beginSession(t, store)
+	require.Equal(t, "jane@b.c", readRows(t, ctx, table)[0][2])
 	require.NoError(t, updateRow(base, table, orig, personRow(1, "Jane", "other@b.c")))
-	err := sess.CommitTransaction(ctx, ctx.GetTransaction())
+	require.Equal(t, "jane@b.c", readRows(t, ctx, table)[0][2])
+	require.NoError(t, sess.CommitTransaction(ctx, ctx.GetTransaction()))
+	require.Equal(t, "other@b.c", readRows(t, base, table)[0][2])
+}
+
+func TestReadCommittedSeesLatest(t *testing.T) {
+	store := openAt(t, filepath.Join(t.TempDir(), "gms.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	base := sql.NewContext(context.Background())
+	table := mustTable(t, base, createPeopleTable(t, base, store))
+	orig := personRow(1, "Jane", "jane@b.c")
+	require.NoError(t, insertRows(base, table, orig))
+
+	sess := NewSession(sql.NewBaseSession(), store)
+	ctx := sql.NewContext(context.Background(), sql.WithSession(sess))
+	require.NoError(t, sess.SetSessionVariable(ctx, "transaction_isolation", "READ-COMMITTED"))
+	tx, err := sess.StartTransaction(ctx, sql.ReadWrite)
+	require.NoError(t, err)
+	ctx.SetTransaction(tx)
+	ctx.SetIgnoreAutoCommit(true)
+
+	require.Equal(t, "jane@b.c", readRows(t, ctx, table)[0][2])
+	require.NoError(t, updateRow(base, table, orig, personRow(1, "Jane", "other@b.c")))
+	require.Equal(t, "other@b.c", readRows(t, ctx, table)[0][2])
+	require.NoError(t, sess.CommitTransaction(ctx, tx))
+}
+
+func TestLockNowait(t *testing.T) {
+	store := openAt(t, filepath.Join(t.TempDir(), "gms.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	base := sql.NewContext(context.Background())
+	table := mustTable(t, base, createPeopleTable(t, base, store))
+	orig := personRow(1, "Jane", "jane@b.c")
+	require.NoError(t, insertRows(base, table, orig))
+
+	sessA, ctxA := beginSession(t, store)
+	require.NoError(t, updateRow(ctxA, table, orig, personRow(1, "Jane", "held@b.c")))
+
+	sessB, ctxB := beginSession(t, store)
+	sessB.SetLockingRead(true)
+	sessB.SetLockingReadMode(true, false)
+	_, err := readRowsErr(ctxB, table)
+	require.Error(t, err)
+	require.True(t, sql.ErrLockNowait.Is(err))
+	require.NoError(t, sessA.Rollback(ctxA, ctxA.GetTransaction()))
+	require.NoError(t, sessB.Rollback(ctxB, ctxB.GetTransaction()))
+}
+
+func TestSkipLocked(t *testing.T) {
+	store := openAt(t, filepath.Join(t.TempDir(), "gms.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	base := sql.NewContext(context.Background())
+	table := mustTable(t, base, createPeopleTable(t, base, store))
+	first := personRow(1, "Jane", "jane@b.c")
+	second := personRow(2, "John", "john@b.c")
+	require.NoError(t, insertRows(base, table, first, second))
+
+	sessA, ctxA := beginSession(t, store)
+	require.NoError(t, updateRow(ctxA, table, first, personRow(1, "Jane", "held@b.c")))
+
+	sessB, ctxB := beginSession(t, store)
+	sessB.SetLockingRead(true)
+	sessB.SetLockingReadMode(false, true)
+	rows := readRows(t, ctxB, table)
+	require.Len(t, rows, 1)
+	require.Equal(t, int64(2), rows[0][0])
+	require.NoError(t, sessA.Rollback(ctxA, ctxA.GetTransaction()))
+	require.NoError(t, sessB.Rollback(ctxB, ctxB.GetTransaction()))
+}
+
+func TestRowLockDeadlock(t *testing.T) {
+	store := openAt(t, filepath.Join(t.TempDir(), "gms.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	base := sql.NewContext(context.Background())
+	table := mustTable(t, base, createPeopleTable(t, base, store))
+	row1 := personRow(1, "Jane", "jane@b.c")
+	row2 := personRow(2, "John", "john@b.c")
+	require.NoError(t, insertRows(base, table, row1, row2))
+
+	sessA, ctxA := beginSession(t, store)
+	sessB, ctxB := beginSession(t, store)
+	require.NoError(t, updateRow(ctxA, table, row1, personRow(1, "Jane", "a@b.c")))
+	require.NoError(t, updateRow(ctxB, table, row2, personRow(2, "John", "b@b.c")))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- updateRow(ctxA, table, row2, personRow(2, "John", "a2@b.c"))
+	}()
+	store.locksFor().awaitWaiting(sessA)
+	err := updateRow(ctxB, table, row1, personRow(1, "Jane", "b2@b.c"))
 	require.Error(t, err)
 	require.True(t, sql.ErrLockDeadlock.Is(err))
-	require.Equal(t, "other@b.c", readRows(t, base, table)[0][2])
+	require.NoError(t, sessB.Rollback(ctxB, ctxB.GetTransaction()))
+	require.NoError(t, <-done)
+	require.NoError(t, sessA.CommitTransaction(ctxA, ctxA.GetTransaction()))
+}
+
+func readRowsErr(ctx *sql.Context, table sql.Table) ([]sql.Row, error) {
+	partitions, err := table.Partitions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer partitions.Close(ctx)
+	var rows []sql.Row
+	for {
+		partition, err := partitions.Next(ctx)
+		if err != nil {
+			break
+		}
+		iter, err := table.PartitionRows(ctx, partition)
+		if err != nil {
+			return nil, err
+		}
+		for {
+			row, err := iter.Next(ctx)
+			if err != nil {
+				_ = iter.Close(ctx)
+				if err == io.EOF {
+					break
+				}
+				return rows, err
+			}
+			rows = append(rows, row)
+		}
+		if err := iter.Close(ctx); err != nil {
+			return rows, err
+		}
+	}
+	return rows, nil
 }
 
 func beginSession(t *testing.T, store *Store) (*Session, *sql.Context) {

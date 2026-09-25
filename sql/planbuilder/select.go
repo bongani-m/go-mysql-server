@@ -16,6 +16,7 @@ package planbuilder
 
 import (
 	"fmt"
+	"strings"
 
 	ast "github.com/dolthub/vitess/go/vt/sqlparser"
 
@@ -187,6 +188,11 @@ func (b *Builder) setLockingRead(on bool) {
 		return
 	}
 	locking.SetLockingRead(on)
+	if !on {
+		if mode, ok := b.ctx.Session.(sql.LockingReadModeSession); ok {
+			mode.SetLockingReadMode(false, false)
+		}
+	}
 }
 
 // buildLimitVal resolves a literal numeric type or a numeric
@@ -305,12 +311,17 @@ func (b *Builder) renameSource(scope *scope, table string, cols []string) {
 }
 
 // buildForUpdateOf builds the `FOR UPDATE OF` clause, ensuring that all tables listed are
-// present in the clause. Sessions that implement LockingReadSession record the rows this
-// statement reads and reject the commit if those rows change. The read does not wait.
+// present in the clause. Sessions that implement LockingReadSession lock the rows this
+// statement reads until the transaction ends.
 func (b *Builder) buildForUpdateOf(lock *ast.Lock, fromScope *scope) {
 	b.setLockingRead(lock != nil)
 	if lock == nil {
 		return
+	}
+	if mode, ok := b.ctx.Session.(sql.LockingReadModeSession); ok {
+		nowait := strings.Contains(lock.Type, "nowait")
+		skip := strings.Contains(lock.Type, "skip locked")
+		mode.SetLockingReadMode(nowait, skip)
 	}
 
 	for _, tableName := range lock.Tables {

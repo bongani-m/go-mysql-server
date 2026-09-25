@@ -74,6 +74,6 @@ func requireUser(t *testing.T, db *mysql_db.MySQLDb, want string) {
 	}
 	require.NotNil(t, user)
 	require.Equal(t, want, user.User)
-	require.Equal(t, "mysql_native_password", user.Plugin)
+	require.Equal(t, "caching_sha2_password", user.Plugin)
 	require.NotEmpty(t, user.AuthString)
 }

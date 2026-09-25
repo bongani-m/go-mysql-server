@@ -2,6 +2,7 @@ package persist
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -49,6 +50,17 @@ func (s *Store) view(fn func(tx *kvTx) error) error {
 	})
 }
 
+// rowView runs fn against the session snapshot when this is a consistent read.
+// current forces the latest commit, which locking reads and writers use.
+func (s *Store) rowView(ctx context.Context, current bool, fn func(tx *kvTx) error) error {
+	if !current {
+		if txn := snapshotTxnFrom(ctx); txn != nil {
+			return fn(&kvTx{txn: txn})
+		}
+	}
+	return s.view(fn)
+}
+
 // update runs fn in a read-write transaction. Writers are serialized: Badger
 // does not retry a conflicting commit, and this store read-modify-writes
 // sequences and JSON blobs the way a single bbolt writer did.
@@ -63,7 +75,13 @@ func (s *Store) updateQuery(ctx *sql.Context, fn func(tx *kvTx) error) error {
 	if ctx != nil {
 		statement = ctx.Query()
 	}
-	return s.commitGTID(statement, sourceGTID(ctx), fn)
+	err := s.commitGTID(statement, sourceGTID(ctx), fn)
+	if err == nil {
+		if sess, ok := sessionFrom(ctx); ok {
+			sess.refreshSnapshot()
+		}
+	}
+	return err
 }
 
 // kvTxn is the Badger transaction surface this store uses. A recording

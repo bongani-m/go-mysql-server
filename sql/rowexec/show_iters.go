@@ -227,6 +227,17 @@ type showIndexesIter struct {
 	idxs  *indexesToShow
 }
 
+// indexCardinality is the distinct count recorded by ANALYZE, when the index provides it.
+func indexCardinality(ctx *sql.Context, index sql.Index) int64 {
+	counter, ok := index.(interface {
+		Cardinality(*sql.Context) int64
+	})
+	if !ok {
+		return 0
+	}
+	return counter.Cardinality(ctx)
+}
+
 func (i *showIndexesIter) Next(ctx *sql.Context) (sql.Row, error) {
 	show, err := i.idxs.next()
 	if err != nil {
@@ -272,21 +283,21 @@ func (i *showIndexesIter) Next(ctx *sql.Context) (sql.Row, error) {
 	}
 
 	return sql.NewRow(
-		show.index.Table(),     // "Table" string
-		nonUnique,              // "Non_unique" int32, Values [0, 1]
-		show.index.ID(),        // "Key_name" string
-		show.exPosition+1,      // "Seq_in_index" int32
-		columnName,             // "Column_name" string
-		collation,              // "Collation" string, Values [A, D, NULL]
-		int64(0),               // "Cardinality" int64 (not calculated)
-		nil,                    // "Sub_part" int64
-		nil,                    // "Packed" string
-		nullable,               // "Null" string, Values [YES, '']
-		show.index.IndexType(), // "Index_type" string
-		show.index.Comment(),   // "Comment" string
-		"",                     // "Index_comment" string
-		visible,                // "Visible" string, Values [YES, NO]
-		expression,             // "Expression" string
+		show.index.Table(),                // "Table" string
+		nonUnique,                         // "Non_unique" int32, Values [0, 1]
+		show.index.ID(),                   // "Key_name" string
+		show.exPosition+1,                 // "Seq_in_index" int32
+		columnName,                        // "Column_name" string
+		collation,                         // "Collation" string, Values [A, D, NULL]
+		indexCardinality(ctx, show.index), // "Cardinality" int64
+		nil,                               // "Sub_part" int64
+		nil,                               // "Packed" string
+		nullable,                          // "Null" string, Values [YES, '']
+		show.index.IndexType(),            // "Index_type" string
+		show.index.Comment(),              // "Comment" string
+		"",                                // "Index_comment" string
+		visible,                           // "Visible" string, Values [YES, NO]
+		expression,                        // "Expression" string
 	), nil
 }
 

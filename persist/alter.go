@@ -157,9 +157,6 @@ func (t *Table) CreatePrimaryKey(ctx *sql.Context, columns []sql.IndexColumn) er
 		if ord < 0 {
 			return sql.ErrKeyColumnDoesNotExist.New(col.Name)
 		}
-		if types.IsText(schema[ord].Type) && col.Length > 0 {
-			return sql.ErrUnsupportedIndexPrefix.New(schema[ord].Name)
-		}
 		schema[ord].PrimaryKey = true
 		schema[ord].Nullable = false
 		pk[i] = ord
