@@ -2,7 +2,7 @@
 
 A MySQL server backed by one Badger directory. Rows are still there after the process exits.
 
-Run these commands from `go-mysql-server`. The example web app in `_example_webapp` connects to this server unchanged.
+Run these commands from `go-mysql-server`. The example web app in `_example_webapp` uses this server for writes. Set `MYSQL_READ_ADDRS` there to read from the other compose nodes.
 
 ## One process
 
@@ -54,6 +54,15 @@ mysql --host=127.0.0.1 --port=3307 --user=root mydb --execute="SELECT name, emai
 ```
 
 Raft stays on the compose network. Each node keeps `/data` in its own volume.
+
+The example API sends writes to `n1` and reads to `n2` and `n3`:
+
+```bash
+cd _example_webapp
+MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 go run .
+```
+
+Leave `MYSQL_READ_ADDRS` unset to use only `localhost:3306`.
 
 ## Environment
 

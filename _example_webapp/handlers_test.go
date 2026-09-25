@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -180,6 +181,39 @@ func TestBadInput(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("missing status %d", rec.Code)
 	}
+}
+
+func TestReadReplicasRoundRobin(t *testing.T) {
+	primary := unusedDB(t)
+	first := unusedDB(t)
+	second := unusedDB(t)
+	store := NewMySQLStore(primary, first, second).(*mysqlStore)
+	if store.reader() != first || store.reader() != second || store.reader() != first {
+		t.Fatal("reads did not alternate across replicas")
+	}
+	if NewMySQLStore(primary).(*mysqlStore).reader() != primary {
+		t.Fatal("reads should use the primary when no replicas are configured")
+	}
+}
+
+func TestSplitReadAddrs(t *testing.T) {
+	if splitAddrs("") != nil {
+		t.Fatal("empty list")
+	}
+	got := splitAddrs(" 127.0.0.1:3307, ,127.0.0.1:3308 ")
+	if len(got) != 2 || got[0] != "127.0.0.1:3307" || got[1] != "127.0.0.1:3308" {
+		t.Fatalf("addrs %#v", got)
+	}
+}
+
+func unusedDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("mysql", "root@tcp(127.0.0.1:1)/mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
 }
 
 func TestLikePatternEscapesWildcards(t *testing.T) {

@@ -1,0 +1,40 @@
+# Writes go to the Raft leader (compose service n1). Reads round-robin across
+# n2 and n3. Those nodes can lag the leader.
+#
+#   MYSQL_HOST=127.0.0.1 MYSQL_PORT=3306
+#   MYSQL_REPLICA_N2_PORT=3307 MYSQL_REPLICA_N3_PORT=3308
+#
+default: &default
+  adapter: mysql2
+  encoding: utf8mb4
+  max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+  username: <%= ENV.fetch("MYSQL_USER", "root") %>
+  password: <%= ENV["MYSQL_PASSWORD"] %>
+  host: <%= ENV.fetch("MYSQL_HOST", "127.0.0.1") %>
+  database: <%= ENV.fetch("MYSQL_DB", "mydb") %>
+  # The cluster already created mydb.mytable. Do not create, drop, or migrate it.
+  database_tasks: false
+
+cluster: &cluster
+  primary:
+    <<: *default
+    port: <%= ENV.fetch("MYSQL_PORT", 3306) %>
+  replica_n2:
+    <<: *default
+    host: <%= ENV.fetch("MYSQL_REPLICA_N2_HOST", ENV.fetch("MYSQL_HOST", "127.0.0.1")) %>
+    port: <%= ENV.fetch("MYSQL_REPLICA_N2_PORT", 3307) %>
+    replica: true
+  replica_n3:
+    <<: *default
+    host: <%= ENV.fetch("MYSQL_REPLICA_N3_HOST", ENV.fetch("MYSQL_HOST", "127.0.0.1")) %>
+    port: <%= ENV.fetch("MYSQL_REPLICA_N3_PORT", 3308) %>
+    replica: true
+
+development:
+  <<: *cluster
+
+test:
+  <<: *cluster
+
+production:
+  <<: *cluster

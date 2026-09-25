@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -68,24 +69,37 @@ type Store interface {
 }
 
 type mysqlStore struct {
-	db *sql.DB
+	write *sql.DB
+	reads []*sql.DB
+	next  atomic.Uint64
 }
 
-// NewMySQLStore talks to the example MySQL server.
-func NewMySQLStore(db *sql.DB) Store {
-	return &mysqlStore{db: db}
+// NewMySQLStore talks to the example MySQL server. Writes use primary. When
+// replicas is non-empty, List and Get round-robin across those servers.
+func NewMySQLStore(primary *sql.DB, replicas ...*sql.DB) Store {
+	return &mysqlStore{write: primary, reads: replicas}
+}
+
+// reader is the server for one read. With no replicas that is the primary.
+func (s *mysqlStore) reader() *sql.DB {
+	if len(s.reads) == 0 {
+		return s.write
+	}
+	i := s.next.Add(1) - 1
+	return s.reads[i%uint64(len(s.reads))]
 }
 
 func (s *mysqlStore) List(ctx context.Context, f Filter, page, size int) (ListResult, error) {
+	db := s.reader()
 	where, args := f.where()
 	var total int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+peopleTable+where, args...).Scan(&total); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+peopleTable+where, args...).Scan(&total); err != nil {
 		return ListResult{}, err
 	}
 
 	offset := (page - 1) * size
 	listArgs := append(append([]any{}, args...), size, offset)
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := db.QueryContext(ctx,
 		"SELECT id, name, email, phone_numbers, created_at FROM "+peopleTable+where+" ORDER BY name, email LIMIT ? OFFSET ?",
 		listArgs...,
 	)
@@ -109,7 +123,7 @@ func (s *mysqlStore) List(ctx context.Context, f Filter, page, size int) (ListRe
 }
 
 func (s *mysqlStore) Get(ctx context.Context, id int64) (Person, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.reader().QueryRowContext(ctx,
 		"SELECT id, name, email, phone_numbers, created_at FROM "+peopleTable+" WHERE id = ?",
 		id,
 	)
@@ -125,7 +139,7 @@ func (s *mysqlStore) Insert(ctx context.Context, p Person) (Person, error) {
 	if err != nil {
 		return Person{}, err
 	}
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.write.ExecContext(ctx,
 		"INSERT INTO "+peopleTable+" (name, email, phone_numbers, created_at) VALUES (?, ?, ?, ?)",
 		p.Name, p.Email, phones, p.CreatedAt.UTC(),
 	)
@@ -145,7 +159,7 @@ func (s *mysqlStore) Update(ctx context.Context, p Person) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.write.ExecContext(ctx,
 		"UPDATE "+peopleTable+" SET name = ?, email = ?, phone_numbers = ?, created_at = ? WHERE id = ?",
 		p.Name, p.Email, phones, p.CreatedAt.UTC(), p.ID,
 	)
@@ -163,7 +177,7 @@ func (s *mysqlStore) Update(ctx context.Context, p Person) error {
 }
 
 func (s *mysqlStore) Delete(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.write.ExecContext(ctx,
 		"DELETE FROM "+peopleTable+" WHERE id = ?",
 		id,
 	)
