@@ -4,6 +4,7 @@
 !/log/.keep
 !/tmp/.keep
 !/tmp/pids/
+/tmp/pids/*
 !/tmp/pids/.keep
 /storage/*
 /config/master.key
