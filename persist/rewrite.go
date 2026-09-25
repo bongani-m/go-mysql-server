@@ -99,20 +99,37 @@ func (r *rewriter) Close(ctx *sql.Context) error {
 	if err := r.table.writeSchema(ctx, r.schema.Schema, r.schema.PkOrdinals, r.rows); err != nil {
 		return err
 	}
-	return r.table.reconcileIndexes(r.oldColumn, r.newColumn)
+	if err := r.table.reconcileIndexes(ctx, r.oldColumn, r.newColumn); err != nil {
+		return err
+	}
+	return r.table.rebuildFulltext(ctx)
 }
 
 // reconcileIndexes brings the stored index definitions back in line with the
 // schema the rewrite just installed: a renamed column is renamed inside the
 // definitions, and an index over a column that no longer exists is dropped.
-func (t *Table) reconcileIndexes(oldColumn, newColumn *sql.Column) error {
+// A dropped FULLTEXT index takes its pseudo-index tables with it.
+func (t *Table) reconcileIndexes(ctx *sql.Context, oldColumn, newColumn *sql.Column) error {
 	indexes, err := t.readIndexes()
 	if err != nil || len(indexes) == 0 {
 		return err
 	}
 	changed := false
 	kept := make([]storedIndex, 0, len(indexes))
+	var dropped []storedIndex
 	for _, idx := range indexes {
+		if sql.IndexConstraint(idx.Constraint) == sql.IndexConstraint_Fulltext {
+			next, drop, idxChanged := trimFulltextColumns(idx, t.meta.schema, oldColumn, newColumn)
+			if idxChanged {
+				changed = true
+			}
+			if drop {
+				dropped = append(dropped, idx)
+				continue
+			}
+			kept = append(kept, next)
+			continue
+		}
 		drop := false
 		for i, name := range idx.Columns {
 			if oldColumn != nil && newColumn != nil && strings.EqualFold(name, oldColumn.Name) {
@@ -137,5 +154,53 @@ func (t *Table) reconcileIndexes(oldColumn, newColumn *sql.Column) error {
 	if !changed {
 		return nil
 	}
-	return t.writeIndexes(kept)
+	if err := t.writeIndexes(kept); err != nil {
+		return err
+	}
+	return t.dropFulltextTables(ctx, dropped, kept)
+}
+
+// trimFulltextColumns drops index columns that the rewrite removed and renames
+// the rest. The index itself is dropped only when every column is gone, which
+// matches DropColumnFromTables.
+func trimFulltextColumns(idx storedIndex, schema sql.Schema, oldColumn, newColumn *sql.Column) (storedIndex, bool, bool) {
+	cols := make([]string, 0, len(idx.Columns))
+	var lengths []uint16
+	var descending []bool
+	changed := false
+	for i, name := range idx.Columns {
+		if oldColumn != nil && newColumn != nil && strings.EqualFold(name, oldColumn.Name) {
+			name = newColumn.Name
+		}
+		ord := columnOrdinal(schema, name)
+		if ord < 0 {
+			changed = true
+			continue
+		}
+		canonical := schema[ord].Name
+		if name != idx.Columns[i] || canonical != idx.Columns[i] {
+			changed = true
+		}
+		cols = append(cols, canonical)
+		if i < len(idx.Lengths) {
+			lengths = append(lengths, idx.Lengths[i])
+		}
+		if i < len(idx.Descending) {
+			descending = append(descending, idx.Descending[i])
+		}
+	}
+	if len(cols) == 0 {
+		return idx, true, true
+	}
+	if len(cols) != len(idx.Columns) {
+		changed = true
+	}
+	idx.Columns = cols
+	if len(idx.Lengths) > 0 {
+		idx.Lengths = lengths
+	}
+	if len(idx.Descending) > 0 {
+		idx.Descending = descending
+	}
+	return idx, false, changed
 }

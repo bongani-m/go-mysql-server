@@ -124,6 +124,10 @@ func TestEngineIndexes(t *testing.T) {
 	enginetest.TestIndexes(t, newPersistHarness())
 }
 
+func TestEngineFulltextIndexes(t *testing.T) {
+	enginetest.TestFulltextIndexes(t, newPersistHarness())
+}
+
 func TestEngineTriggers(t *testing.T) {
 	enginetest.TestTriggers(t, newPersistHarness())
 }

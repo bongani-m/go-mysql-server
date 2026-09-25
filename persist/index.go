@@ -14,12 +14,26 @@ import (
 )
 
 type storedIndex struct {
-	Name       string   `json:"name"`
-	Columns    []string `json:"columns"`
-	Lengths    []uint16 `json:"lengths,omitempty"`
-	Descending []bool   `json:"descending,omitempty"`
-	Constraint byte     `json:"constraint"`
-	Comment    string   `json:"comment,omitempty"`
+	Name       string          `json:"name"`
+	Columns    []string        `json:"columns"`
+	Lengths    []uint16        `json:"lengths,omitempty"`
+	Descending []bool          `json:"descending,omitempty"`
+	Constraint byte            `json:"constraint"`
+	Comment    string          `json:"comment,omitempty"`
+	Fulltext   *storedFulltext `json:"fulltext,omitempty"`
+}
+
+// storedFulltext names the pseudo-index tables for one FULLTEXT index and the
+// parent key those tables use to point back at a row.
+type storedFulltext struct {
+	Config       string `json:"config"`
+	Position     string `json:"position"`
+	DocCount     string `json:"docCount"`
+	GlobalCount  string `json:"globalCount"`
+	RowCount     string `json:"rowCount"`
+	KeyName      string `json:"keyName,omitempty"`
+	KeyType      byte   `json:"keyType"`
+	KeyPositions []int  `json:"keyPositions,omitempty"`
 }
 
 // Index is one secondary index. Lookups filter a full scan with the same range
@@ -38,6 +52,7 @@ type Index struct {
 	full       bool
 	vector     bool
 	comment    string
+	ft         *storedFulltext
 }
 
 func (idx *Index) ID() string                                 { return idx.name }
@@ -196,7 +211,17 @@ func (t *Table) indexFromStored(stored storedIndex) *Index {
 		full:       sql.IndexConstraint(stored.Constraint) == sql.IndexConstraint_Fulltext,
 		vector:     sql.IndexConstraint(stored.Constraint) == sql.IndexConstraint_Vector,
 		comment:    stored.Comment,
+		ft:         copyStoredFulltext(stored.Fulltext),
 	}
+}
+
+func copyStoredFulltext(ft *storedFulltext) *storedFulltext {
+	if ft == nil {
+		return nil
+	}
+	copied := *ft
+	copied.KeyPositions = append([]int(nil), ft.KeyPositions...)
+	return &copied
 }
 
 func (t *Table) primaryIndex() *Index {
@@ -247,6 +272,15 @@ func (t *Table) PreciseMatch() bool { return true }
 
 // CreateIndex implements sql.IndexAlterableTable.
 func (t *Table) CreateIndex(ctx *sql.Context, indexDef sql.IndexDef) error {
+	if indexDef.Constraint == sql.IndexConstraint_Fulltext {
+		return fmt.Errorf("persist: FULLTEXT indexes are created through CreateFulltextIndex")
+	}
+	return t.appendStoredIndex(ctx, indexDef, nil)
+}
+
+// appendStoredIndex writes one secondary index. ft is set only for a FULLTEXT
+// index, which also carries the pseudo-table names and key columns.
+func (t *Table) appendStoredIndex(ctx *sql.Context, indexDef sql.IndexDef, ft *storedFulltext) error {
 	if indexDef.Name == "" {
 		return fmt.Errorf("persist: index name is empty")
 	}
@@ -263,6 +297,16 @@ func (t *Table) CreateIndex(ctx *sql.Context, indexDef sql.IndexDef) error {
 	for _, idx := range indexes {
 		if strings.EqualFold(idx.Name, indexDef.Name) {
 			return sql.ErrDuplicateKey.New(indexDef.Name)
+		}
+	}
+	if ft != nil {
+		for _, idx := range indexes {
+			if idx.Fulltext == nil {
+				continue
+			}
+			if idx.Fulltext.Config != ft.Config {
+				return fmt.Errorf("Full-Text config table name has been changed from `%s` to `%s`", idx.Fulltext.Config, ft.Config)
+			}
 		}
 	}
 	stored := storedIndex{
@@ -296,6 +340,9 @@ func (t *Table) CreateIndex(ctx *sql.Context, indexDef sql.IndexDef) error {
 	}
 	if anyDescending {
 		stored.Descending = descending
+	}
+	if ft != nil {
+		stored.Fulltext = copyStoredFulltext(ft)
 	}
 	indexes = append(indexes, stored)
 	return t.writeIndexes(indexes)
@@ -390,7 +437,10 @@ type indexedTable struct {
 	// editor is set when the lookup comes from an open editor. Its buffered edits
 	// have to be visible here, because a self-referential foreign key checks its
 	// parent row through this path while the statement that wrote that row is
-	// still running.
+	// still running. Sibling editors are included so a second writer on the same
+	// table, such as INSERT ... ON DUPLICATE KEY UPDATE, can see those rows too.
+	// A lookup that did not come from an editor stays on the committed view, so
+	// an UPDATE join does not match a row it already changed.
 	editor *editor
 }
 
@@ -400,11 +450,14 @@ func (t *indexedTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup
 }
 
 func (t *indexedTable) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.RowIter, error) {
-	var buffered []edit
+	var extra []edit
 	if t.editor != nil {
-		buffered = t.editor.edits
+		extra = append(extra, t.editor.edits...)
+		if sess, ok := sessionFrom(ctx); ok {
+			extra = append(extra, sess.openEditsExcept(t.ref(), t.editor)...)
+		}
 	}
-	rows, err := t.Table.visibleRows(ctx, buffered...)
+	rows, err := t.Table.visibleRows(ctx, extra...)
 	if err != nil {
 		return nil, err
 	}
@@ -811,7 +864,7 @@ func (t *Table) UpdateForeignKey(ctx *sql.Context, fkName string, fk sql.Foreign
 
 // GetForeignKeyEditor implements sql.ForeignKeyTable.
 func (t *Table) GetForeignKeyEditor(ctx *sql.Context) sql.ForeignKeyEditor {
-	return t.newEditor()
+	return t.mustWriteEditor(ctx).(sql.ForeignKeyEditor)
 }
 
 func (t *Table) database() *Database {

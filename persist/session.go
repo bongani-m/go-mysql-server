@@ -16,6 +16,10 @@ type Session struct {
 	store   *Store
 	mu      sync.Mutex
 	pending map[tableRef][]edit
+	// open editors have not closed yet. A statement can write one table through
+	// more than one editor (INSERT ... ON DUPLICATE KEY UPDATE), and each has
+	// to see the others' buffered rows.
+	open map[tableRef][]*editor
 }
 
 var _ sql.Session = (*Session)(nil)
@@ -119,6 +123,71 @@ func (s *Session) edits(ref tableRef) []edit {
 	out := make([]edit, len(src))
 	copy(out, src)
 	return out
+}
+
+func (s *Session) track(e *editor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.open == nil {
+		s.open = make(map[tableRef][]*editor)
+	}
+	ref := e.table.ref()
+	s.open[ref] = append(s.open[ref], e)
+}
+
+func (s *Session) untrack(e *editor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ref := e.table.ref()
+	eds := s.open[ref]
+	for i, ed := range eds {
+		if ed != e {
+			continue
+		}
+		s.open[ref] = append(eds[:i], eds[i+1:]...)
+		return
+	}
+}
+
+func (s *Session) openEditsExcept(ref tableRef, self *editor) []edit {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []edit
+	for _, ed := range s.open[ref] {
+		if ed == self {
+			continue
+		}
+		out = append(out, ed.edits...)
+	}
+	return out
+}
+
+func (s *Session) openEdits(ref tableRef) []edit {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []edit
+	for _, ed := range s.open[ref] {
+		out = append(out, ed.edits...)
+	}
+	return out
+}
+
+// lookupOpen reports the newest view of key in every open editor except self.
+func (s *Session) lookupOpen(self *editor, key []byte) (sql.Row, bool, bool) {
+	s.mu.Lock()
+	eds := append([]*editor(nil), s.open[self.table.ref()]...)
+	s.mu.Unlock()
+	var row sql.Row
+	var ok, decided bool
+	for _, ed := range eds {
+		if ed == self {
+			continue
+		}
+		if next, found, hit := lookupEdits(ed.edits, key); hit {
+			row, ok, decided = next, found, true
+		}
+	}
+	return row, ok, decided
 }
 
 func (s *Session) clear(ref tableRef) {

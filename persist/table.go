@@ -83,16 +83,16 @@ func (t *Table) PartitionRows(ctx *sql.Context, _ sql.Partition) (sql.RowIter, e
 }
 
 // Inserter implements sql.InsertableTable.
-func (t *Table) Inserter(*sql.Context) sql.RowInserter { return t.newEditor() }
+func (t *Table) Inserter(ctx *sql.Context) sql.RowInserter { return t.mustWriteEditor(ctx) }
 
 // Updater implements sql.UpdatableTable.
-func (t *Table) Updater(*sql.Context) sql.RowUpdater { return t.newEditor() }
+func (t *Table) Updater(ctx *sql.Context) sql.RowUpdater { return t.mustWriteEditor(ctx) }
 
 // Deleter implements sql.DeletableTable.
-func (t *Table) Deleter(*sql.Context) sql.RowDeleter { return t.newEditor() }
+func (t *Table) Deleter(ctx *sql.Context) sql.RowDeleter { return t.mustWriteEditor(ctx) }
 
 // Replacer implements sql.ReplaceableTable.
-func (t *Table) Replacer(*sql.Context) sql.RowReplacer { return t.newEditor() }
+func (t *Table) Replacer(ctx *sql.Context) sql.RowReplacer { return t.mustWriteEditor(ctx) }
 
 // Truncate implements sql.TruncateableTable. Like MySQL, truncate commits immediately.
 func (t *Table) Truncate(ctx *sql.Context) (int, error) {
@@ -119,6 +119,15 @@ func (t *Table) refreshMeta() error {
 
 func (t *Table) newEditor() *editor {
 	return &editor{table: t, meta: t.meta}
+}
+
+// bind registers the editor so other open editors on this table can see its
+// buffered rows before Close.
+func (e *editor) bind(ctx *sql.Context) *editor {
+	if sess, ok := sessionFrom(ctx); ok {
+		sess.track(e)
+	}
+	return e
 }
 
 // visibleRows returns the committed rows overlaid with the session's
@@ -208,6 +217,9 @@ func (e *editor) Close(ctx *sql.Context) error {
 		return nil
 	}
 	e.closed = true
+	if sess, ok := sessionFrom(ctx); ok {
+		sess.untrack(e)
+	}
 	edits := e.edits
 	e.edits = nil
 	if e.discarded || len(edits) == 0 {
@@ -417,6 +429,9 @@ func (e *editor) lookup(ctx *sql.Context, key []byte) (sql.Row, bool, error) {
 		return row, ok, nil
 	}
 	if sess, ok := sessionFrom(ctx); ok {
+		if row, ok, decided := sess.lookupOpen(e, key); decided {
+			return row, ok, nil
+		}
 		if row, ok, decided := lookupEdits(sess.edits(e.table.ref()), key); decided {
 			return row, ok, nil
 		}
@@ -431,9 +446,12 @@ func (e *editor) matchingRows(ctx *sql.Context) ([]storedRow, error) {
 	}
 	var pending []edit
 	if sess, ok := sessionFrom(ctx); ok {
-		pending = sess.edits(e.table.ref())
+		// openEdits includes this editor, so its own buffer is already here.
+		pending = append(sess.edits(e.table.ref()), sess.openEdits(e.table.ref())...)
+	} else {
+		pending = e.edits
 	}
-	return mergeStored(base, append(append([]edit{}, pending...), e.edits...)), nil
+	return mergeStored(base, pending), nil
 }
 
 func lookupEdits(edits []edit, key []byte) (sql.Row, bool, bool) {
