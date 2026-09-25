@@ -12,6 +12,7 @@ _persist/_persist
 # Local persist example database
 /data/
 _persist/data/
+_persist/certs/
 
 # Local environment
 .env

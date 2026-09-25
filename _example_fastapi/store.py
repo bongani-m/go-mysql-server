@@ -95,12 +95,13 @@ def normalize_phones(phones: list[str] | None) -> list[str]:
 class MySQLStore:
     """Writes use primary. List and get round-robin across replicas when set."""
 
-    def __init__(self, primary: str, replicas: list[str], user: str, password: str, database: str):
+    def __init__(self, primary: str, replicas: list[str], user: str, password: str, database: str, ssl_ca: str | None = None):
         self._primary = primary
         self._replicas = replicas
         self._user = user
         self._password = password
         self._database = database
+        self._ssl = {"ca": ssl_ca} if ssl_ca else None
         self._next = 0
         self._lock = threading.Lock()
         self.ping(primary)
@@ -190,6 +191,7 @@ class MySQLStore:
             autocommit=True,
             cursorclass=DictCursor,
             connect_timeout=5,
+            ssl=self._ssl,
         )
 
 

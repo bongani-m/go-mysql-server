@@ -12,6 +12,10 @@ default: &default
   password: <%= ENV["MYSQL_PASSWORD"] %>
   host: <%= ENV.fetch("MYSQL_HOST", "127.0.0.1") %>
   database: <%= ENV.fetch("MYSQL_DB", "mydb") %>
+  <% if ENV["MYSQL_TLS_CA"].to_s != "" %>
+  sslca: <%= ENV["MYSQL_TLS_CA"] %>
+  ssl_mode: required
+  <% end %>
   # The cluster already created mydb.mytable. Do not create, drop, or migrate it.
   database_tasks: false
 

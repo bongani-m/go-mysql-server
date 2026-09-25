@@ -11,6 +11,7 @@ import (
 	"github.com/dgraph-io/badger/v4"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/mysql_db"
 )
 
 var (
@@ -54,6 +55,12 @@ type Store struct {
 	raftDir    string
 	repl       *replicaState
 	replOnce   sync.Once
+	// privMu guards privDB and privSkip. Persist sets privSkip before it waits
+	// for Raft, so the apply path can see that this process already updated
+	// the in-memory accounts and must not take the MySQLDb editor lock.
+	privMu   sync.Mutex
+	privDB   *mysql_db.MySQLDb
+	privSkip int
 }
 
 var _ sql.DatabaseProvider = (*Store)(nil)

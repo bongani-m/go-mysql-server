@@ -17,6 +17,8 @@ Then:
 ```bash
 cd _example_rails
 bundle install
+MYSQL_PASSWORD=dev-only-change-me \
+MYSQL_TLS_CA=../_persist/certs/server.crt \
 bin/rails server
 ```
 
@@ -30,6 +32,7 @@ Open http://localhost:3000.
 | `MYSQL_REPLICA_N3_PORT` | `3308` |
 | `MYSQL_USER` | `root` |
 | `MYSQL_PASSWORD` | empty |
+| `MYSQL_TLS_CA` | empty (plaintext). PEM file for the server certificate when TLS is required. |
 | `MYSQL_DB` | `mydb` |
 
 The table already exists. This app does not create or migrate it.

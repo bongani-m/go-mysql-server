@@ -23,9 +23,14 @@ func (f *storeFSM) Apply(log *raft.Log) interface{} {
 	if err != nil {
 		return err
 	}
+	// Decide before noteApplied drops this batch from the leader's in-flight list.
+	local := f.store.privilegeProposed(batch.ID)
 	err = f.store.applyOps(batch.Ops)
 	f.store.noteApplied(batch.ID)
 	if err != nil {
+		return err
+	}
+	if err := f.store.reloadPrivileges(batch, local); err != nil {
 		return err
 	}
 	if err := f.store.appendBinlog(log.Index, batch); err != nil {
@@ -57,7 +62,12 @@ func (f *storeFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 func (f *storeFSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
-	return f.store.installBackup(rc)
+	if err := f.store.installBackup(rc); err != nil {
+		return err
+	}
+	// The backup replaced the directory. Memory still has the old accounts
+	// unless this process has not attached a privilege database yet.
+	return f.store.reloadPrivilegesFromDisk()
 }
 
 type storeSnapshot struct {

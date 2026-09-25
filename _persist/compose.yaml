@@ -33,10 +33,14 @@ services:
       GMS_RAFT_DIR: /data/raft
       GMS_DATA: /data/gms
       GMS_MYSQL_HOST: 0.0.0.0
+      GMS_BOOTSTRAP_PASSWORD: ${GMS_BOOTSTRAP_PASSWORD:-dev-only-change-me}
+      GMS_TLS_CERT: /certs/server.crt
+      GMS_TLS_KEY: /certs/server.key
     ports:
       - "3306:3306"
     volumes:
       - n1:/data
+      - ./certs:/certs:ro
 
   n2:
     build: *build
@@ -52,10 +56,14 @@ services:
       GMS_RAFT_DIR: /data/raft
       GMS_DATA: /data/gms
       GMS_MYSQL_HOST: 0.0.0.0
+      GMS_BOOTSTRAP_PASSWORD: ${GMS_BOOTSTRAP_PASSWORD:-dev-only-change-me}
+      GMS_TLS_CERT: /certs/server.crt
+      GMS_TLS_KEY: /certs/server.key
     ports:
       - "3307:3306"
     volumes:
       - n2:/data
+      - ./certs:/certs:ro
 
   n3:
     build: *build
@@ -71,10 +79,14 @@ services:
       GMS_RAFT_DIR: /data/raft
       GMS_DATA: /data/gms
       GMS_MYSQL_HOST: 0.0.0.0
+      GMS_BOOTSTRAP_PASSWORD: ${GMS_BOOTSTRAP_PASSWORD:-dev-only-change-me}
+      GMS_TLS_CERT: /certs/server.crt
+      GMS_TLS_KEY: /certs/server.key
     ports:
       - "3308:3306"
     volumes:
       - n3:/data
+      - ./certs:/certs:ro
 
 volumes:
   n1:

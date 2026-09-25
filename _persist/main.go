@@ -22,8 +22,8 @@ import (
 // Persistent MySQL server for the example people table. Rows live in a Badger
 // directory and are still there after this process exits.
 //
-//	go run ./_persist
-//	mysql --host=127.0.0.1 --port=3306 --user=root mydb --execute="SELECT name, email FROM mytable;"
+//	GMS_BOOTSTRAP_PASSWORD=secret go run ./_persist
+//	mysql --host=127.0.0.1 --port=3306 --user=root --password=secret mydb --execute="SELECT name, email FROM mytable;"
 //
 // The HTTP API in _example_webapp connects to this server unchanged.
 // Set GMS_DATA to choose the directory. The default is data/gms.
@@ -42,8 +42,8 @@ import (
 //
 // Then, from the host:
 //
-//	mysql --host=127.0.0.1 --port=3306 --user=root mydb --execute="SELECT name, email FROM mytable;"
-//	mysql --host=127.0.0.1 --port=3307 --user=root mydb --execute="SELECT name, email FROM mytable;"
+//	mysql --host=127.0.0.1 --port=3306 --user=root --password=secret mydb --execute="SELECT name, email FROM mytable;"
+//	mysql --host=127.0.0.1 --port=3307 --user=root --password=secret mydb --execute="SELECT name, email FROM mytable;"
 //
 // GMS_MYSQL_HOST defaults to localhost. Set it to 0.0.0.0 to accept connections
 // from other containers and from published host ports. GMS_MYSQL_PORT overrides
@@ -100,12 +100,21 @@ func main() {
 		})
 	}
 	gate.bind(engine, store.Replicating(), store.IsLeader())
+	if err := enableAuth(ctx, store, engine, accountFromEnv()); err != nil {
+		log.Fatalf("auth: %v", err)
+	}
 	if err := enableUpstream(store); err != nil {
 		log.Fatalf("upstream replica: %v", err)
 	}
+	tlsConfig, err := loadServerTLS(os.Getenv("GMS_TLS_CERT"), os.Getenv("GMS_TLS_KEY"))
+	if err != nil {
+		log.Fatalf("tls: %v", err)
+	}
 	config := server.Config{
-		Protocol: "tcp",
-		Address:  fmt.Sprintf("%s:%d", address, port),
+		Protocol:               "tcp",
+		Address:                fmt.Sprintf("%s:%d", address, port),
+		TLSConfig:              tlsConfig,
+		RequireSecureTransport: tlsConfig != nil,
 	}
 	s, err := server.NewServer(config, engine, sql.NewContext, persist.NewSessionBuilder(store), nil)
 	if err != nil {

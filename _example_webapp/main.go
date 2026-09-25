@@ -23,15 +23,19 @@
 // Writes use MYSQL_HOST and MYSQL_PORT (default localhost:3306). To read from
 // the other nodes in _persist/compose.yaml:
 //
-//	MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 go run .
+//	MYSQL_PASSWORD=secret MYSQL_TLS_CA=../_persist/certs/server.crt \
+//	  MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 go run .
 //
 // Those nodes can lag the leader. Leave MYSQL_READ_ADDRS unset to read and
-// write the same server.
+// write the same server. Leave MYSQL_TLS_CA unset to connect without TLS.
 package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -43,6 +47,11 @@ import (
 )
 
 func main() {
+	if ca := os.Getenv("MYSQL_TLS_CA"); ca != "" {
+		if err := registerMySQLTLS(ca); err != nil {
+			log.Fatal(err)
+		}
+	}
 	primaryAddr := net.JoinHostPort(env("MYSQL_HOST", "localhost"), env("MYSQL_PORT", "3306"))
 	primary, err := openMySQL(primaryAddr)
 	if err != nil {
@@ -100,7 +109,26 @@ func mysqlDSN(addr string) string {
 		Loc:                  time.UTC,
 		AllowNativePasswords: true,
 	}
+	if os.Getenv("MYSQL_TLS_CA") != "" {
+		cfg.TLSConfig = "gms"
+	}
 	return cfg.FormatDSN()
+}
+
+// registerMySQLTLS trusts the server certificate signed by the PEM file at caPath.
+func registerMySQLTLS(caPath string) error {
+	pem, err := os.ReadFile(caPath)
+	if err != nil {
+		return fmt.Errorf("MYSQL_TLS_CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return fmt.Errorf("MYSQL_TLS_CA: no certificates in %s", caPath)
+	}
+	return mysql.RegisterTLSConfig("gms", &tls.Config{
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
+	})
 }
 
 // splitAddrs parses a comma-separated host:port list. Empty input is no replicas.
