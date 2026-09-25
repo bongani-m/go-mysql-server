@@ -74,8 +74,10 @@ type mergeIter struct {
 	oi       int
 	span     keySpan
 	reverse  bool
+	ref      tableRef
 	diskKey  []byte
 	diskRow  sql.Row
+	diskRaw  []byte
 	diskOn   bool
 	diskDone bool
 	closed   bool
@@ -86,6 +88,9 @@ func (it *mergeIter) Next(ctx *sql.Context) (sql.Row, error) {
 	row, err := it.nextStored(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if sess, ok := sessionFrom(ctx); ok {
+		sess.noteLockedRead(ctx, it.ref, row.key, row.raw)
 	}
 	return row.row, nil
 }
@@ -118,7 +123,7 @@ func (it *mergeIter) nextStored(ctx context.Context) (storedRow, error) {
 			}
 			return storedRow{key: entry.key, row: entry.row}, nil
 		}
-		row := storedRow{key: it.diskKey, row: it.diskRow}
+		row := storedRow{key: it.diskKey, row: it.diskRow, raw: it.diskRaw}
 		it.diskOn = false
 		return row, nil
 	}
@@ -193,6 +198,7 @@ func (it *mergeIter) pullDisk(ctx context.Context) error {
 		}
 		it.diskKey = key
 		it.diskRow = row
+		it.diskRaw = val
 		it.diskOn = true
 		it.iter.Next()
 		return nil
@@ -246,6 +252,7 @@ func (s *Store) mergeRows(ctx context.Context, t *Table, edits []edit, span keyS
 		oi:      oi,
 		span:    span,
 		reverse: reverse,
+		ref:     t.ref(),
 	}, nil
 }
 

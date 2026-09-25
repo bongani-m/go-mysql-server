@@ -178,6 +178,17 @@ func (b *Builder) buildOffset(inScope *scope, limit *ast.Limit) sql.Expression {
 	return nil
 }
 
+func (b *Builder) setLockingRead(on bool) {
+	if b.ctx == nil || b.ctx.Session == nil {
+		return
+	}
+	locking, ok := b.ctx.Session.(sql.LockingReadSession)
+	if !ok {
+		return
+	}
+	locking.SetLockingRead(on)
+}
+
 // buildLimitVal resolves a literal numeric type or a numeric
 // procedure parameter
 func (b *Builder) buildLimitVal(inScope *scope, e ast.Expr) sql.Expression {
@@ -294,10 +305,10 @@ func (b *Builder) renameSource(scope *scope, table string, cols []string) {
 }
 
 // buildForUpdateOf builds the `FOR UPDATE OF` clause, ensuring that all tables listed are
-// present in the clause. `FOR UPDATE` in general is a no-op, so `FOR UPDATE OF` is
-// also a no-op: https://www.dolthub.com/blog/2023-10-23-hold-my-beer/
-// TODO: implement actual row-level locking for `FOR UPDATE` clauses in general.
+// present in the clause. Sessions that implement LockingReadSession record the rows this
+// statement reads and reject the commit if those rows change. The read does not wait.
 func (b *Builder) buildForUpdateOf(lock *ast.Lock, fromScope *scope) {
+	b.setLockingRead(lock != nil)
 	if lock == nil {
 		return
 	}

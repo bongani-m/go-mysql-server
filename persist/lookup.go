@@ -278,6 +278,7 @@ func nonNullFloor(desc bool) []byte {
 // indexIter seeks an index bucket and fetches the primary-key rows.
 type indexIter struct {
 	ctx      context.Context
+	ref      tableRef
 	schema   sql.Schema
 	rows     *kvBucket
 	iter     *rawIter
@@ -336,6 +337,9 @@ func (it *indexIter) Next(ctx *sql.Context) (sql.Row, error) {
 		if err != nil {
 			it.err = err
 			return nil, err
+		}
+		if sess, ok := sessionFrom(ctx); ok {
+			sess.noteLockedRead(ctx, it.ref, pk, raw)
 		}
 		return row, nil
 	}
@@ -472,6 +476,7 @@ func (s *Store) openIndexIter(ctx context.Context, t *Table, indexName string, f
 	}
 	return &indexIter{
 		ctx:      ctx,
+		ref:      t.ref(),
 		schema:   t.meta.schema,
 		rows:     rows,
 		iter:     iter,

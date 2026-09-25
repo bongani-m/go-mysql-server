@@ -442,9 +442,16 @@ func (s *Store) readTable(dbName, tableName string) (tableMeta, string, uint16, 
 type storedRow struct {
 	key []byte
 	row sql.Row
+	// raw is the on-disk image. It is nil when the row comes from the session buffer.
+	raw []byte
 }
 
 func (s *Store) getRow(ctx context.Context, t *Table, key []byte) (sql.Row, bool, error) {
+	row, _, ok, err := s.getRowImage(ctx, t, key)
+	return row, ok, err
+}
+
+func (s *Store) getRowImage(ctx context.Context, t *Table, key []byte) (sql.Row, []byte, bool, error) {
 	var raw []byte
 	err := s.view(func(tx *kvTx) error {
 		rows := rowsBucket(tx, t.dbName, t.name)
@@ -455,10 +462,13 @@ func (s *Store) getRow(ctx context.Context, t *Table, key []byte) (sql.Row, bool
 		return nil
 	})
 	if err != nil || len(raw) == 0 {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	row, err := decodeRow(ctx, t.meta.schema, raw)
-	return row, err == nil, err
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return row, raw, true, nil
 }
 
 func (s *Store) indexGet(t *Table, indexName string, key []byte) ([]byte, error) {
@@ -478,14 +488,17 @@ func (s *Store) indexGet(t *Table, indexName string, key []byte) ([]byte, error)
 }
 
 func (s *Store) apply(t *Table, edits []edit, statement string) error {
-	return s.applyAll(map[tableRef][]edit{t.ref(): edits}, statement)
+	return s.applyAll(map[tableRef][]edit{t.ref(): edits}, nil, statement)
 }
 
-func (s *Store) applyAll(pending map[tableRef][]edit, statement string) error {
-	if len(pending) == 0 {
+func (s *Store) applyAll(pending map[tableRef][]edit, reads []rowImage, statement string) error {
+	if len(pending) == 0 && len(reads) == 0 {
 		return nil
 	}
 	return s.commit(statement, func(tx *kvTx) error {
+		if err := checkReads(tx, reads); err != nil {
+			return err
+		}
 		for ref, edits := range pending {
 			if err := applyEdits(tx, ref, edits); err != nil {
 				return err
@@ -493,6 +506,30 @@ func (s *Store) applyAll(pending map[tableRef][]edit, statement string) error {
 		}
 		return nil
 	})
+}
+
+func checkReads(tx *kvTx, reads []rowImage) error {
+	for _, rd := range reads {
+		rows := rowsBucket(tx, rd.ref.db, rd.ref.name)
+		var current []byte
+		if rows != nil {
+			current = rows.GetRaw(rd.key)
+		}
+		if !bytesEqual(current, rd.raw) {
+			return sql.ErrLockDeadlock.New("row changed")
+		}
+	}
+	return nil
+}
+
+func changedImage(rows *kvBucket, key, expected []byte) error {
+	if expected == nil {
+		return nil
+	}
+	if bytesEqual(rows.GetRaw(key), expected) {
+		return nil
+	}
+	return sql.ErrLockDeadlock.New("row changed")
 }
 
 func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
@@ -525,6 +562,9 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 	for _, ed := range edits {
 		switch ed.op {
 		case opDelete:
+			if err := changedImage(rows, ed.key, ed.expected); err != nil {
+				return err
+			}
 			old := rows.GetRaw(ed.key)
 			if len(old) == 0 {
 				continue
@@ -571,6 +611,9 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 			count++
 			nbytes += uint64(len(ed.raw))
 		case opUpdate:
+			if err := changedImage(rows, ed.oldKey, ed.expected); err != nil {
+				return err
+			}
 			old := rows.GetRaw(ed.oldKey)
 			var oldRow sql.Row
 			if len(old) > 0 {
@@ -775,6 +818,13 @@ func rowsBucket(tx *kvTx, dbName, tableName string) *kvBucket {
 		return nil
 	}
 	return table.Bucket(bucketRows)
+}
+
+func copyBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }
 
 func bytesEqual(a, b []byte) bool {

@@ -555,12 +555,15 @@ func (t *indexedTable) lookupFields(idx *Index) ([]indexField, error) {
 
 func (t *indexedTable) openLookup(ctx *sql.Context, idx *Index, fields []indexField, span keySpan, exact bool) (sql.RowIter, error) {
 	if exact && idx.name == "PRIMARY" {
-		row, ok, err := t.lookupKey(ctx, span.start, t.editor)
+		row, raw, ok, err := t.lookupImage(ctx, span.start, t.editor)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
 			return sql.RowsToRowIter(), nil
+		}
+		if sess, ok := sessionFrom(ctx); ok {
+			sess.noteLockedRead(ctx, t.ref(), span.start, raw)
 		}
 		return &rowIter{rows: []sql.Row{row}}, nil
 	}
@@ -603,11 +606,14 @@ func (t *indexedTable) secondaryPoint(ctx *sql.Context, idx *Index, fields []ind
 	}
 	if len(pk) > 0 {
 		if _, ok := seen[string(pk)]; !ok {
-			row, ok, err := t.lookupKey(ctx, pk, t.editor)
+			row, raw, ok, err := t.lookupImage(ctx, pk, t.editor)
 			if err != nil {
 				return nil, err
 			}
 			if ok {
+				if sess, ok := sessionFrom(ctx); ok {
+					sess.noteLockedRead(ctx, t.ref(), pk, raw)
+				}
 				rows = append(rows, row)
 			}
 		}
@@ -733,38 +739,35 @@ func (it *filterIter) Close(ctx *sql.Context) error {
 }
 
 // GetNextAutoIncrementValue implements sql.AutoIncrementTable.
+// A nil insertVal claims the current counter and advances it before returning,
+// so the next caller cannot receive the same value. An explicit value greater
+// than the counter raises the counter to that value and does not step past it.
 // Values outside the column type are ignored so a rejected insert does not
 // move the sequence. The engine reports that rejection itself.
 func (t *Table) GetNextAutoIncrementValue(ctx *sql.Context, insertVal interface{}) (uint64, error) {
+	if insertVal == nil {
+		return t.store.allocAutoIncrement(ctx, t)
+	}
+	col := autoIncrementColumn(t.meta.schema)
+	if col == nil {
+		return t.store.autoIncrement(t)
+	}
+	if _, inRange, convErr := col.Type.Convert(ctx, insertVal); convErr != nil || inRange != sql.InRange {
+		return t.store.autoIncrement(t)
+	}
 	current, err := t.store.autoIncrement(t)
 	if err != nil {
 		return 0, err
 	}
-	if insertVal == nil {
-		return current, nil
+	cmp, err := col.Type.Compare(ctx, insertVal, current)
+	if err != nil || cmp <= 0 {
+		return current, err
 	}
-	col := autoIncrementColumn(t.meta.schema)
-	if col == nil {
-		return current, nil
-	}
-	if _, inRange, convErr := col.Type.Convert(ctx, insertVal); convErr != nil || inRange != sql.InRange {
-		return current, nil
-	}
-	cmp, err := types.Uint64.Compare(ctx, insertVal, current)
+	converted, _, err := types.Uint64.Convert(ctx, insertVal)
 	if err != nil {
 		return current, nil
 	}
-	if cmp > 0 {
-		converted, _, err := types.Uint64.Convert(ctx, insertVal)
-		if err != nil {
-			return current, nil
-		}
-		current = converted.(uint64)
-		if err := t.store.setAutoIncrement(t, current); err != nil {
-			return 0, err
-		}
-	}
-	return current, nil
+	return t.store.raiseAutoIncrement(t, converted.(uint64))
 }
 
 // PeekNextAutoIncrementValue implements sql.AutoIncrementGetter.
@@ -836,10 +839,64 @@ func (s *Store) setAutoIncrement(t *Table, val uint64) error {
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
 		}
-		var raw [8]byte
-		binary.BigEndian.PutUint64(raw[:], val)
-		return bucket.Put(keyAutoInc, raw[:])
+		return putAutoIncrement(bucket, val)
 	})
+}
+
+// allocAutoIncrement claims the current counter and stores the next value.
+func (s *Store) allocAutoIncrement(ctx *sql.Context, t *Table) (uint64, error) {
+	var issued uint64
+	err := s.update(func(tx *kvTx) error {
+		bucket, current, err := autoIncrementIn(tx, t)
+		if err != nil {
+			return err
+		}
+		issued = current
+		next := current
+		bumpAutoIncrement(ctx, autoIncrementColumn(t.meta.schema), &next)
+		if next == current {
+			return nil
+		}
+		return putAutoIncrement(bucket, next)
+	})
+	return issued, err
+}
+
+// raiseAutoIncrement stores explicit when it is greater than the counter.
+// The stored value is the explicit value itself. Insert then steps past it.
+func (s *Store) raiseAutoIncrement(t *Table, explicit uint64) (uint64, error) {
+	var issued uint64
+	err := s.update(func(tx *kvTx) error {
+		bucket, current, err := autoIncrementIn(tx, t)
+		if err != nil {
+			return err
+		}
+		issued = current
+		if explicit <= current {
+			return nil
+		}
+		issued = explicit
+		return putAutoIncrement(bucket, explicit)
+	})
+	return issued, err
+}
+
+func autoIncrementIn(tx *kvTx, t *Table) (*kvBucket, uint64, error) {
+	bucket := tableBucket(tx, t.dbName, t.name)
+	if bucket == nil {
+		return nil, 0, sql.ErrTableNotFound.New(t.name)
+	}
+	current := uint64(1)
+	if raw := bucket.Get(keyAutoInc); len(raw) == 8 {
+		current = binary.BigEndian.Uint64(raw)
+	}
+	return bucket, current, nil
+}
+
+func putAutoIncrement(bucket *kvBucket, val uint64) error {
+	var raw [8]byte
+	binary.BigEndian.PutUint64(raw[:], val)
+	return bucket.Put(keyAutoInc, raw[:])
 }
 
 func (e *editor) noteAutoIncrement(ctx *sql.Context, row sql.Row) error {
@@ -847,29 +904,42 @@ func (e *editor) noteAutoIncrement(ctx *sql.Context, row sql.Row) error {
 	if ord < 0 || ord >= len(row) || row[ord] == nil {
 		return nil
 	}
-	current, err := e.table.store.autoIncrement(e.table)
-	if err != nil {
-		return err
-	}
 	col := e.meta.schema[ord]
 	if _, inRange, convErr := col.Type.Convert(ctx, row[ord]); convErr != nil || inRange != sql.InRange {
 		return nil
 	}
-	cmp, err := col.Type.Compare(ctx, row[ord], current)
+	current, err := e.table.store.autoIncrement(e.table)
 	if err != nil {
 		return err
 	}
-	if cmp > 0 {
-		converted, _, err := types.Uint64.Convert(ctx, row[ord])
+	cmp, err := col.Type.Compare(ctx, row[ord], current)
+	if err != nil || cmp < 0 {
+		return err
+	}
+	converted, _, err := types.Uint64.Convert(ctx, row[ord])
+	if err != nil {
+		return err
+	}
+	return e.table.store.observeAutoIncrement(ctx, e.table, converted.(uint64))
+}
+
+// observeAutoIncrement steps the counter past value when value has reached it.
+// A generated value already claimed by allocAutoIncrement is left alone.
+func (s *Store) observeAutoIncrement(ctx *sql.Context, t *Table, value uint64) error {
+	return s.update(func(tx *kvTx) error {
+		bucket, current, err := autoIncrementIn(tx, t)
 		if err != nil {
 			return err
 		}
-		current = converted.(uint64)
-	} else if cmp < 0 {
-		return nil
-	}
-	bumpAutoIncrement(ctx, col, &current)
-	return e.table.store.setAutoIncrement(e.table, current)
+		if value < current {
+			return nil
+		}
+		if value > current {
+			current = value
+		}
+		bumpAutoIncrement(ctx, autoIncrementColumn(t.meta.schema), &current)
+		return putAutoIncrement(bucket, current)
+	})
 }
 
 func bumpAutoIncrement(ctx *sql.Context, col *sql.Column, value *uint64) {
@@ -877,6 +947,10 @@ func bumpAutoIncrement(ctx *sql.Context, col *sql.Column, value *uint64) {
 		return
 	}
 	next := *value + 1
+	if col == nil {
+		*value = next
+		return
+	}
 	if _, inRange, err := col.Type.Convert(ctx, next); err == nil && inRange == sql.InRange {
 		*value = next
 	}

@@ -232,6 +232,12 @@ type TransactionSession interface {
 	ReleaseSavepoint(ctx *Context, transaction Transaction, name string) error
 }
 
+// LockingReadSession records rows read by SELECT ... FOR UPDATE. The storage
+// engine checks those row images when the transaction commits.
+type LockingReadSession interface {
+	SetLockingRead(on bool)
+}
+
 // A LifecycleAwareSession is a a sql.Session that gets lifecycle callbacks
 // from the handler when it begins and ends a command and when it itself ends.
 //

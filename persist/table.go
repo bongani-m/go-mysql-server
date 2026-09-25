@@ -200,6 +200,10 @@ type edit struct {
 	oldKey []byte
 	row    sql.Row
 	raw    []byte
+	// expected is the on-disk row image this update or delete was based on.
+	// Nil means the row existed only in this session's buffer, so apply does
+	// not compare it with disk.
+	expected []byte
 }
 
 // editor buffers one statement. Close writes it, unless the session is inside
@@ -301,7 +305,7 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 	if err := e.checkRow(ctx, newRow); err != nil {
 		return err
 	}
-	oldKey, _, err := e.locate(ctx, oldRow)
+	oldKey, _, expected, err := e.locate(ctx, oldRow)
 	if err != nil {
 		return err
 	}
@@ -334,7 +338,7 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 	if err != nil {
 		return err
 	}
-	e.edits = append(e.edits, edit{op: opUpdate, key: newKey, oldKey: oldKey, row: newRow, raw: raw})
+	e.edits = append(e.edits, edit{op: opUpdate, key: newKey, oldKey: oldKey, row: newRow, raw: raw, expected: copyBytes(expected)})
 	return nil
 }
 
@@ -342,11 +346,11 @@ func (e *editor) Delete(ctx *sql.Context, row sql.Row) error {
 	if err := e.writable(ctx); err != nil {
 		return err
 	}
-	key, _, err := e.locate(ctx, row)
+	key, _, expected, err := e.locate(ctx, row)
 	if err != nil {
 		return err
 	}
-	e.edits = append(e.edits, edit{op: opDelete, key: key, oldKey: key})
+	e.edits = append(e.edits, edit{op: opDelete, key: key, oldKey: key, expected: copyBytes(expected)})
 	return nil
 }
 
@@ -469,35 +473,35 @@ func (e *editor) insertKey(ctx *sql.Context, row sql.Row) ([]byte, error) {
 	return primaryKey(ctx, e.meta.schema, e.meta.pk, row)
 }
 
-func (e *editor) locate(ctx *sql.Context, row sql.Row) ([]byte, sql.Row, error) {
+func (e *editor) locate(ctx *sql.Context, row sql.Row) ([]byte, sql.Row, []byte, error) {
 	if len(e.meta.pk) > 0 {
 		key, err := primaryKey(ctx, e.meta.schema, e.meta.pk, row)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		found, ok, err := e.lookup(ctx, key)
+		found, expected, ok, err := e.table.lookupImage(ctx, key, e)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if !ok {
-			return nil, nil, sql.ErrDeleteRowNotFound.New()
+			return nil, nil, nil, sql.ErrDeleteRowNotFound.New()
 		}
-		return key, found, nil
+		return key, found, expected, nil
 	}
 	rows, err := e.matchingRows(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for _, candidate := range rows {
 		equal, err := rowsEqual(ctx, e.meta.schema, candidate.row, row)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if equal {
-			return candidate.key, candidate.row, nil
+			return candidate.key, candidate.row, candidate.raw, nil
 		}
 	}
-	return nil, nil, sql.ErrDeleteRowNotFound.New()
+	return nil, nil, nil, sql.ErrDeleteRowNotFound.New()
 }
 
 func (e *editor) lookup(ctx *sql.Context, key []byte) (sql.Row, bool, error) {
@@ -505,22 +509,29 @@ func (e *editor) lookup(ctx *sql.Context, key []byte) (sql.Row, bool, error) {
 }
 
 func (t *Table) lookupKey(ctx *sql.Context, key []byte, self *editor) (sql.Row, bool, error) {
+	row, _, ok, err := t.lookupImage(ctx, key, self)
+	return row, ok, err
+}
+
+// lookupImage returns the row and, when it was read from disk, the stored bytes.
+// A row resolved from this session's buffer has a nil image.
+func (t *Table) lookupImage(ctx *sql.Context, key []byte, self *editor) (sql.Row, []byte, bool, error) {
 	if self != nil {
 		if row, ok, decided := lookupEdits(self.edits, key); decided {
-			return row, ok, nil
+			return row, nil, ok, nil
 		}
 	}
 	if sess, ok := sessionFrom(ctx); ok {
 		if self != nil {
 			if row, ok, decided := sess.lookupOpen(self, key); decided {
-				return row, ok, nil
+				return row, nil, ok, nil
 			}
 		}
 		if row, ok, decided := lookupEdits(sess.edits(t.ref()), key); decided {
-			return row, ok, nil
+			return row, nil, ok, nil
 		}
 	}
-	return t.store.getRow(ctx, t, key)
+	return t.store.getRowImage(ctx, t, key)
 }
 
 func (e *editor) matchingRows(ctx *sql.Context) ([]storedRow, error) {
