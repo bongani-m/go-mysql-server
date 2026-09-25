@@ -52,9 +52,9 @@ type transaction struct {
 
 func (t *transaction) String() string {
 	if t.readOnly {
-		return "bbolt read-only transaction"
+		return "badger read-only transaction"
 	}
-	return "bbolt transaction"
+	return "badger transaction"
 }
 
 func (t *transaction) IsReadOnly() bool { return t.readOnly }

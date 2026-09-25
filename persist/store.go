@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"time"
+	"sync"
 
-	bolt "go.etcd.io/bbolt"
+	"github.com/dgraph-io/badger/v4"
 
 	"github.com/dolthub/go-mysql-server/sql"
 )
@@ -34,22 +32,20 @@ var (
 	keyTargetRows   = []byte("targetRowSize")
 )
 
-// Store is a go-mysql-server database provider backed by one bbolt file.
+// Store is a go-mysql-server database provider backed by one Badger directory.
 type Store struct {
-	db   *bolt.DB
+	db   *badger.DB
 	path string
+	mu   sync.Mutex
 }
 
 var _ sql.DatabaseProvider = (*Store)(nil)
 var _ sql.MutableDatabaseProvider = (*Store)(nil)
 
-// Open opens or creates the bbolt file at path. Parent directories are created.
-// GMS_DATA is the usual way to choose the path; the server default is data/gms.db.
+// Open opens or creates the Badger directory at path.
+// GMS_DATA is the usual way to choose the path; the server default is data/gms.
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+	db, err := openBadger(path)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +57,7 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// Path returns the bbolt file path.
+// Path returns the Badger directory path.
 func (s *Store) Path() string {
 	return s.path
 }
@@ -87,7 +83,7 @@ func (s *Store) HasDatabase(ctx *sql.Context, name string) bool {
 // AllDatabases implements sql.DatabaseProvider.
 func (s *Store) AllDatabases(ctx *sql.Context) []sql.Database {
 	var names []string
-	_ = s.db.View(func(tx *bolt.Tx) error {
+	_ = s.view(func(tx *kvTx) error {
 		root := tx.Bucket(bucketDatabases)
 		if root == nil {
 			return nil
@@ -117,7 +113,7 @@ func (s *Store) CreateDatabase(ctx *sql.Context, name string) error {
 	if name == "" {
 		return fmt.Errorf("persist: database name is empty")
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *kvTx) error {
 		root, err := tx.CreateBucketIfNotExists(bucketDatabases)
 		if err != nil {
 			return err
@@ -145,7 +141,7 @@ func (s *Store) CreateDatabase(ctx *sql.Context, name string) error {
 
 // DropDatabase implements sql.MutableDatabaseProvider.
 func (s *Store) DropDatabase(ctx *sql.Context, name string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *kvTx) error {
 		root := tx.Bucket(bucketDatabases)
 		if root == nil || root.Bucket(bucketKey(name)) == nil {
 			return sql.ErrDatabaseNotFound.New(name)
@@ -157,7 +153,7 @@ func (s *Store) DropDatabase(ctx *sql.Context, name string) error {
 func (s *Store) loadDatabase(name string) (*Database, bool, error) {
 	var stored string
 	var found bool
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, name)
 		if bucket == nil {
 			return nil
@@ -197,7 +193,7 @@ func (d *Database) GetTableInsensitive(ctx *sql.Context, tblName string) (sql.Ta
 // GetTableNames implements sql.Database.
 func (d *Database) GetTableNames(ctx *sql.Context) ([]string, error) {
 	var names []string
-	err := d.store.db.View(func(tx *bolt.Tx) error {
+	err := d.store.view(func(tx *kvTx) error {
 		tables := tablesBucket(tx, d.name)
 		if tables == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -230,7 +226,7 @@ func (d *Database) CreateTable(ctx *sql.Context, name string, schema sql.Primary
 	if err != nil {
 		return err
 	}
-	return d.store.db.Update(func(tx *bolt.Tx) error {
+	return d.store.update(func(tx *kvTx) error {
 		tables := tablesBucket(tx, d.name)
 		if tables == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -268,7 +264,7 @@ func (d *Database) RenameTable(ctx *sql.Context, oldName, newName string) error 
 	if newName == "" {
 		return fmt.Errorf("persist: table name is empty")
 	}
-	err := d.store.db.Update(func(tx *bolt.Tx) error {
+	err := d.store.update(func(tx *kvTx) error {
 		tables := tablesBucket(tx, d.name)
 		if tables == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -307,7 +303,7 @@ func (d *Database) RenameTable(ctx *sql.Context, oldName, newName string) error 
 	return nil
 }
 
-func copyBucket(src, dst *bolt.Bucket) error {
+func copyBucket(src, dst *kvBucket) error {
 	return src.ForEach(func(k, v []byte) error {
 		key := append([]byte(nil), k...)
 		if v != nil {
@@ -327,7 +323,7 @@ func copyBucket(src, dst *bolt.Bucket) error {
 
 // DropTable implements sql.TableDropper.
 func (d *Database) DropTable(ctx *sql.Context, name string) error {
-	return d.store.db.Update(func(tx *bolt.Tx) error {
+	return d.store.update(func(tx *kvTx) error {
 		tables := tablesBucket(tx, d.name)
 		if tables == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -343,7 +339,7 @@ func (s *Store) loadTable(dbName, tableName string) (tableMeta, string, bool, er
 	var raw []byte
 	var name string
 	var targetRowSize uint64
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *kvTx) error {
 		tables := tablesBucket(tx, dbName)
 		if tables == nil {
 			return sql.ErrDatabaseNotFound.New(dbName)
@@ -380,7 +376,7 @@ func (s *Store) diskRows(ctx context.Context, t *Table) ([]storedRow, error) {
 		key []byte
 		val []byte
 	}
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *kvTx) error {
 		rows := rowsBucket(tx, t.dbName, t.name)
 		if rows == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -409,7 +405,7 @@ func (s *Store) diskRows(ctx context.Context, t *Table) ([]storedRow, error) {
 
 func (s *Store) getRow(ctx context.Context, t *Table, key []byte) (sql.Row, bool, error) {
 	var raw []byte
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *kvTx) error {
 		rows := rowsBucket(tx, t.dbName, t.name)
 		if rows == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -426,7 +422,7 @@ func (s *Store) getRow(ctx context.Context, t *Table, key []byte) (sql.Row, bool
 
 func (s *Store) nextSequence(t *Table) ([]byte, error) {
 	var key []byte
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *kvTx) error {
 		rows := rowsBucket(tx, t.dbName, t.name)
 		if rows == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -449,7 +445,7 @@ func (s *Store) applyAll(pending map[tableRef][]edit) error {
 	if len(pending) == 0 {
 		return nil
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *kvTx) error {
 		for ref, edits := range pending {
 			if err := applyEdits(tx, ref, edits); err != nil {
 				return err
@@ -459,7 +455,7 @@ func (s *Store) applyAll(pending map[tableRef][]edit) error {
 	})
 }
 
-func applyEdits(tx *bolt.Tx, ref tableRef, edits []edit) error {
+func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 	rows := rowsBucket(tx, ref.db, ref.name)
 	if rows == nil {
 		return sql.ErrTableNotFound.New(ref.name)
@@ -498,7 +494,7 @@ func applyEdits(tx *bolt.Tx, ref tableRef, edits []edit) error {
 
 func (s *Store) truncate(t *Table) (int, error) {
 	var n int
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -526,7 +522,7 @@ func bucketKey(name string) []byte {
 	return []byte(strings.ToLower(name))
 }
 
-func databaseBucket(tx *bolt.Tx, name string) *bolt.Bucket {
+func databaseBucket(tx *kvTx, name string) *kvBucket {
 	root := tx.Bucket(bucketDatabases)
 	if root == nil {
 		return nil
@@ -534,7 +530,7 @@ func databaseBucket(tx *bolt.Tx, name string) *bolt.Bucket {
 	return root.Bucket(bucketKey(name))
 }
 
-func tablesBucket(tx *bolt.Tx, dbName string) *bolt.Bucket {
+func tablesBucket(tx *kvTx, dbName string) *kvBucket {
 	db := databaseBucket(tx, dbName)
 	if db == nil {
 		return nil
@@ -542,7 +538,7 @@ func tablesBucket(tx *bolt.Tx, dbName string) *bolt.Bucket {
 	return db.Bucket(bucketTables)
 }
 
-func tableBucket(tx *bolt.Tx, dbName, tableName string) *bolt.Bucket {
+func tableBucket(tx *kvTx, dbName, tableName string) *kvBucket {
 	tables := tablesBucket(tx, dbName)
 	if tables == nil {
 		return nil
@@ -550,7 +546,7 @@ func tableBucket(tx *bolt.Tx, dbName, tableName string) *bolt.Bucket {
 	return tables.Bucket(bucketKey(tableName))
 }
 
-func rowsBucket(tx *bolt.Tx, dbName, tableName string) *bolt.Bucket {
+func rowsBucket(tx *kvTx, dbName, tableName string) *kvBucket {
 	table := tableBucket(tx, dbName, tableName)
 	if table == nil {
 		return nil

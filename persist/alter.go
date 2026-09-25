@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	bolt "go.etcd.io/bbolt"
-
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
@@ -234,7 +232,7 @@ func (t *Table) writeSchema(ctx *sql.Context, schema sql.Schema, pk []int, rows 
 	if err != nil {
 		return err
 	}
-	err = t.store.db.Update(func(tx *bolt.Tx) error {
+	err = t.store.update(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -361,7 +359,7 @@ func (t *Table) renameIndexColumn(from, to string) error {
 
 // ModifyTargetRowSize implements sql.TargetRowSizeAlterableTable.
 func (t *Table) ModifyTargetRowSize(ctx *sql.Context, sizeInBytes uint64) error {
-	err := t.store.db.Update(func(tx *bolt.Tx) error {
+	err := t.store.update(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -446,7 +444,7 @@ func (t *Table) generateCheckName(checks []sql.CheckDefinition) string {
 
 func (t *Table) readChecks() ([]sql.CheckDefinition, error) {
 	var raw []byte
-	err := t.store.db.View(func(tx *bolt.Tx) error {
+	err := t.store.view(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -469,7 +467,7 @@ func (t *Table) writeChecks(checks []sql.CheckDefinition) error {
 	if err != nil {
 		return err
 	}
-	return t.store.db.Update(func(tx *bolt.Tx) error {
+	return t.store.update(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)

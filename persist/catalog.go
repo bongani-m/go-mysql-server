@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
-
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
@@ -29,7 +27,7 @@ type storedView struct {
 // GetCollation implements sql.CollatedDatabase.
 func (d *Database) GetCollation(ctx *sql.Context) sql.CollationID {
 	collation := sql.Collation_Default
-	_ = d.store.db.View(func(tx *bolt.Tx) error {
+	_ = d.store.view(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return nil
@@ -51,7 +49,7 @@ func (d *Database) SetCollation(ctx *sql.Context, collation sql.CollationID) err
 	if collation == sql.Collation_Unspecified {
 		collation = sql.Collation_Default
 	}
-	return d.store.db.Update(func(tx *bolt.Tx) error {
+	return d.store.update(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -142,7 +140,7 @@ func (d *Database) AllViews(ctx *sql.Context) ([]sql.ViewDefinition, error) {
 
 func (d *Database) readViews() ([]storedView, error) {
 	var raw []byte
-	err := d.store.db.View(func(tx *bolt.Tx) error {
+	err := d.store.view(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -165,7 +163,7 @@ func (d *Database) writeViews(views []storedView) error {
 	if err != nil {
 		return err
 	}
-	return d.store.db.Update(func(tx *bolt.Tx) error {
+	return d.store.update(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -217,7 +215,7 @@ func (d *Database) DropTrigger(ctx *sql.Context, name string) error {
 
 func (d *Database) readTriggers() ([]sql.TriggerDefinition, error) {
 	var raw []byte
-	err := d.store.db.View(func(tx *bolt.Tx) error {
+	err := d.store.view(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -240,7 +238,7 @@ func (d *Database) writeTriggers(triggers []sql.TriggerDefinition) error {
 	if err != nil {
 		return err
 	}
-	return d.store.db.Update(func(tx *bolt.Tx) error {
+	return d.store.update(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -420,7 +418,7 @@ func (d *Database) readEvents() ([]sql.EventDefinition, error) {
 
 func (d *Database) readJSON(key []byte, dest interface{}) error {
 	var raw []byte
-	err := d.store.db.View(func(tx *bolt.Tx) error {
+	err := d.store.view(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -439,7 +437,7 @@ func (d *Database) writeJSON(key []byte, value interface{}) error {
 	if err != nil {
 		return err
 	}
-	return d.store.db.Update(func(tx *bolt.Tx) error {
+	return d.store.update(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -450,7 +448,7 @@ func (d *Database) writeJSON(key []byte, value interface{}) error {
 
 func (d *Database) readForeignKeys() ([]sql.ForeignKeyConstraint, error) {
 	var raw []byte
-	err := d.store.db.View(func(tx *bolt.Tx) error {
+	err := d.store.view(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -473,7 +471,7 @@ func (d *Database) writeForeignKeys(keys []sql.ForeignKeyConstraint) error {
 	if err != nil {
 		return err
 	}
-	return d.store.db.Update(func(tx *bolt.Tx) error {
+	return d.store.update(func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)

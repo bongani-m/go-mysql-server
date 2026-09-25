@@ -451,7 +451,7 @@ func narrowForType(typ sql.Type, value interface{}) interface{} {
 	}
 }
 
-// primaryKey builds the bbolt key for a row that has a primary key.
+// primaryKey builds the storage key for a row that has a primary key.
 // Each part is length-prefixed so composite keys cannot run together.
 func primaryKey(ordinals []int, row sql.Row) ([]byte, error) {
 	var buf []byte

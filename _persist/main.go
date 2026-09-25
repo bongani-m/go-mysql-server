@@ -17,14 +17,14 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
-// Persistent MySQL server for the example people table. Rows live in a bbolt
-// file and are still there after this process exits.
+// Persistent MySQL server for the example people table. Rows live in a Badger
+// directory and are still there after this process exits.
 //
 //	go run ./_persist
 //	mysql --host=127.0.0.1 --port=3306 --user=root mydb --execute="SELECT name, email FROM mytable;"
 //
 // The HTTP API in _example_webapp connects to this server unchanged.
-// Set GMS_DATA to choose the file. The default is data/gms.db.
+// Set GMS_DATA to choose the directory. The default is data/gms.
 
 var (
 	dbName    = "mydb"
@@ -36,7 +36,7 @@ var (
 func main() {
 	path := os.Getenv("GMS_DATA")
 	if path == "" {
-		path = "data/gms.db"
+		path = "data/gms"
 	}
 	store, err := persist.Open(path)
 	if err != nil {

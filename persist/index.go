@@ -8,8 +8,6 @@ import (
 	"sort"
 	"strings"
 
-	bolt "go.etcd.io/bbolt"
-
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -354,7 +352,7 @@ func (t *Table) RenameIndex(ctx *sql.Context, fromIndexName, toIndexName string)
 
 func (t *Table) readIndexes() ([]storedIndex, error) {
 	var raw []byte
-	err := t.store.db.View(func(tx *bolt.Tx) error {
+	err := t.store.view(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -377,7 +375,7 @@ func (t *Table) writeIndexes(indexes []storedIndex) error {
 	if err != nil {
 		return err
 	}
-	return t.store.db.Update(func(tx *bolt.Tx) error {
+	return t.store.update(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -544,7 +542,7 @@ func (e *editor) PreciseMatch() bool { return true }
 
 func (s *Store) autoIncrement(t *Table) (uint64, error) {
 	current := uint64(1)
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
@@ -559,7 +557,7 @@ func (s *Store) autoIncrement(t *Table) (uint64, error) {
 }
 
 func (s *Store) setAutoIncrement(t *Table, val uint64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)

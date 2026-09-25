@@ -12,7 +12,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
-// persistHarness runs enginetest against a fresh bbolt file per engine.
+// persistHarness runs enginetest against a fresh Badger directory per engine.
 type persistHarness struct {
 	setupData []setup.SetupScript
 	store     *Store
