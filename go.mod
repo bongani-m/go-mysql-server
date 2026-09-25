@@ -17,6 +17,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/sirupsen/logrus v1.8.3
 	github.com/stretchr/testify v1.11.1
+	go.etcd.io/bbolt v1.5.0
 	go.opentelemetry.io/otel v1.41.0
 	go.opentelemetry.io/otel/trace v1.41.0
 	golang.org/x/sync v0.20.0

@@ -29,10 +29,10 @@ import (
 )
 
 var expectedResults = [][]string{
-	{"Jane Deo", "janedeo@gmail.com", `["556-565-566", "777-777-777"]`, "2022-11-01 12:00:00.000001"},
-	{"Jane Doe", "jane@doe.com", `[]`, "2022-11-01 12:00:00.000001"},
-	{"John Doe", "john@doe.com", `["555-555-555"]`, "2022-11-01 12:00:00.000001"},
-	{"John Doe", "johnalt@doe.com", `[]`, "2022-11-01 12:00:00.000001"},
+	{"1", "Jane Deo", "janedeo@gmail.com", `["556-565-566", "777-777-777"]`, "2022-11-01 12:00:00.000001"},
+	{"2", "Jane Doe", "jane@doe.com", `[]`, "2022-11-01 12:00:00.000001"},
+	{"3", "John Doe", "john@doe.com", `["555-555-555"]`, "2022-11-01 12:00:00.000001"},
+	{"4", "John Doe", "johnalt@doe.com", `[]`, "2022-11-01 12:00:00.000001"},
 }
 
 func TestExampleUsersDisabled(t *testing.T) {

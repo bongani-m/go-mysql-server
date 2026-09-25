@@ -5,6 +5,16 @@
 
 # Compiled binaries
 _example/_example
+_example_webapp/examplewebapp
+_example_webapp/_example_webapp
+_persist/_persist
+
+# Local persist example database
+/data/
+_persist/data/
+
+# Local environment
+.env
 
 # Folders
 _obj
