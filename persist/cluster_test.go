@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -279,4 +280,189 @@ func TestClusterSnapshotJoin(t *testing.T) {
 	leaderRows := waitRows(t, leader, 1)
 	require.Equal(t, leaderRows[0][0], rows[0][0])
 	require.Equal(t, leaderRows[0][1], rows[0][1])
+}
+
+func startTrio(t *testing.T) (stores []*Store, leader *Store) {
+	t.Helper()
+	mem := newMemCluster(t, 3)
+	stores = make([]*Store, 3)
+	stores[0] = mem.open(t, 0, true, nil)
+	require.NoError(t, stores[0].WaitReady(10*time.Second))
+	for i := 1; i < 3; i++ {
+		stores[i] = mem.open(t, i, false, nil)
+		require.NoError(t, stores[0].AddVoter(fmt.Sprintf("node-%d", i), string(mem.addrs[i])))
+		waitCaughtUp(t, stores[0], stores[i])
+	}
+	return stores, waitLeader(t, stores)
+}
+
+func TestClusterConcurrentInserts(t *testing.T) {
+	stores, leader := startTrio(t)
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, leader)
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c := sql.NewContext(context.Background())
+			errs[i] = insertRows(c, table, sql.NewRow(int64(i+1), fmt.Sprintf("n%d", i)))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoErrorf(t, err, "insert %d", i)
+	}
+
+	for _, store := range stores {
+		rows := waitRows(t, store, n)
+		got := map[int64]string{}
+		for _, row := range rows {
+			got[row[0].(int64)] = row[1].(string)
+		}
+		for i := 0; i < n; i++ {
+			require.Equal(t, fmt.Sprintf("n%d", i), got[int64(i+1)])
+		}
+	}
+
+	seqs := writeGTIDSequences(t, leader)
+	require.Len(t, seqs, n)
+	seen := map[int64]bool{}
+	var maxSeq int64
+	for _, seq := range seqs {
+		require.False(t, seen[seq], "duplicate GTID sequence %d", seq)
+		seen[seq] = true
+		if seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	last, err := leader.LastIndex()
+	require.NoError(t, err)
+	require.Equal(t, int64(last), maxSeq)
+}
+
+func TestClusterConcurrentDuplicateKey(t *testing.T) {
+	stores, leader := startTrio(t)
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, leader)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			c := sql.NewContext(context.Background())
+			errs[i] = insertRows(c, table, sql.NewRow(int64(1), "ada"))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var ok, bad int
+	for _, err := range errs {
+		if err == nil {
+			ok++
+			continue
+		}
+		require.Truef(t, sql.ErrPrimaryKeyViolation.Is(err), "got %v", err)
+		bad++
+	}
+	require.Equal(t, 1, ok)
+	require.Equal(t, 1, bad)
+
+	for _, store := range stores {
+		rows := waitRows(t, store, 1)
+		require.Equal(t, int64(1), rows[0][0])
+		require.Equal(t, "ada", rows[0][1])
+	}
+}
+
+func TestClusterCommitSeesInflight(t *testing.T) {
+	stores, leader := startTrio(t)
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, leader)
+
+	gateEntered := make(chan struct{})
+	release := make(chan struct{})
+	var entered sync.Once
+	var released sync.Once
+	releaseGate := func() { released.Do(func() { close(release) }) }
+	t.Cleanup(releaseGate)
+	leader.cluster.gate = func() {
+		entered.Do(func() { close(gateEntered) })
+		<-release
+	}
+
+	first := make(chan error, 1)
+	go func() {
+		c := sql.NewContext(context.Background())
+		first <- insertRows(c, table, sql.NewRow(int64(1), "ada"))
+	}()
+	select {
+	case <-gateEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("proposer did not reach the gate")
+	}
+
+	dupErr := make(chan error, 1)
+	go func() {
+		c := sql.NewContext(context.Background())
+		dupErr <- insertRows(c, table, sql.NewRow(int64(1), "ada"))
+	}()
+	select {
+	case err := <-dupErr:
+		require.Truef(t, sql.ErrPrimaryKeyViolation.Is(err), "got %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("duplicate insert blocked on raft")
+	}
+
+	second := make(chan error, 1)
+	go func() {
+		c := sql.NewContext(context.Background())
+		second <- insertRows(c, table, sql.NewRow(int64(2), "bea"))
+	}()
+	require.Eventually(t, func() bool {
+		leader.mu.Lock()
+		defer leader.mu.Unlock()
+		return len(leader.cluster.queue) == 1
+	}, 10*time.Second, 10*time.Millisecond)
+
+	releaseGate()
+	require.NoError(t, <-first)
+	require.NoError(t, <-second)
+
+	for _, store := range stores {
+		rows := waitRows(t, store, 2)
+		got := map[int64]string{}
+		for _, row := range rows {
+			got[row[0].(int64)] = row[1].(string)
+		}
+		require.Equal(t, "ada", got[int64(1)])
+		require.Equal(t, "bea", got[int64(2)])
+	}
+}
+
+func writeGTIDSequences(t *testing.T, store *Store) []int64 {
+	t.Helper()
+	events, format, err := store.ReadBinlog()
+	require.NoError(t, err)
+	var seq int64
+	var out []int64
+	for _, ev := range events {
+		if ev.IsGTID() {
+			gtid, _, gerr := ev.GTID(format)
+			require.NoError(t, gerr)
+			seq = gtid.(mysql.Mysql56GTID).Sequence
+		}
+		if ev.IsWriteRows() {
+			out = append(out, seq)
+		}
+	}
+	return out
 }

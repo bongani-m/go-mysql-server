@@ -1,18 +1,28 @@
 package persist
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 )
+
+// pendingCap is how many recorded batches may wait for Raft at once.
+// Past that, commit waits until an apply frees a slot.
+const pendingCap = 32
+
+var errClusterClosed = errors.New("persist: cluster shut down")
 
 // Peer is one voter in the Raft group.
 type Peer struct {
@@ -125,12 +135,32 @@ func loadServerUUID(dir, id string) (string, error) {
 	return id, nil
 }
 
+// queuedCommit is one recorded statement waiting for its Raft result.
+type queuedCommit struct {
+	id    uint64
+	batch replBatch
+	done  chan error
+}
+
 type cluster struct {
 	store     *Store
 	raft      *raft.Raft
 	log       *raftboltdb.BoltStore
 	transport raft.Transport
 	timeout   time.Duration
+
+	// recordMu serializes recording. It is not held while Raft waits, so the
+	// next statement can record against batches still in flight.
+	recordMu sync.Mutex
+	cond     *sync.Cond
+	inflight []*queuedCommit
+	queue    []*queuedCommit
+	nextID   uint64
+	stopped  bool
+	exited   chan struct{}
+	// gate, if set, runs on the proposer before each group is sent to Raft.
+	// Tests hold it to observe a commit that is recorded but not yet applied.
+	gate func()
 }
 
 func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
@@ -196,13 +226,28 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		closeTransport(transport)
 		return nil, err
 	}
-	return &cluster{
+	c := &cluster{
 		store:     store,
 		raft:      r,
 		log:       bolt,
 		transport: transport,
 		timeout:   opts.ApplyTimeout,
-	}, nil
+		exited:    make(chan struct{}),
+		nextID:    newBatchEpoch(),
+	}
+	c.cond = sync.NewCond(&store.mu)
+	go c.proposeLoop()
+	return c, nil
+}
+
+// newBatchEpoch keeps in-flight ids from matching commands replayed out of an
+// older log. noteApplied ignores id 0, so an epoch of 0 becomes 1.
+func newBatchEpoch() uint64 {
+	var seed uint64
+	if err := binary.Read(rand.Reader, binary.LittleEndian, &seed); err != nil || seed == 0 {
+		return 1
+	}
+	return seed
 }
 
 func (o ClusterOptions) servers() []raft.Server {
@@ -226,19 +271,238 @@ func (o ClusterOptions) servers() []raft.Server {
 	return out
 }
 
-func (c *cluster) propose(batch replBatch) error {
-	payload, err := encodeBatch(batch)
-	if err != nil {
-		return err
+// beginRecord waits for a free in-flight slot and returns the writes the next
+// statement must see. The caller holds recordMu and does not hold the store lock.
+func (c *cluster) beginRecord() ([]kvOp, error) {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	for {
+		if c.stopped {
+			return nil, errClusterClosed
+		}
+		if c.raft.State() != raft.Leader {
+			return nil, c.notLeader()
+		}
+		if len(c.inflight) < pendingCap {
+			break
+		}
+		c.cond.Wait()
 	}
-	future := c.raft.Apply(payload, c.timeout)
-	if err := future.Error(); err != nil {
-		return err
+	return snapshotOps(c.inflight), nil
+}
+
+func snapshotOps(pending []*queuedCommit) []kvOp {
+	n := 0
+	for _, q := range pending {
+		n += len(q.batch.Ops)
 	}
-	if resp, ok := future.Response().(error); ok && resp != nil {
-		return resp
+	ops := make([]kvOp, 0, n)
+	for _, q := range pending {
+		ops = append(ops, q.batch.Ops...)
 	}
-	return nil
+	return ops
+}
+
+// enqueue assigns a batch id and hands it to the proposer. The caller holds recordMu.
+func (c *cluster) enqueue(batch replBatch) (chan error, error) {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	if c.stopped {
+		return nil, errClusterClosed
+	}
+	if c.raft.State() != raft.Leader {
+		return nil, c.notLeader()
+	}
+	c.nextID++
+	if c.nextID == 0 {
+		c.nextID = 1
+	}
+	batch.ID = c.nextID
+	q := &queuedCommit{
+		id:    batch.ID,
+		batch: batch,
+		done:  make(chan error, 1),
+	}
+	c.inflight = append(c.inflight, q)
+	c.queue = append(c.queue, q)
+	c.cond.Broadcast()
+	return q.done, nil
+}
+
+// proposeLoop sends each recorded group to Raft in record order, and only then
+// waits. Raft coalesces those entries into one AppendEntries round trip.
+func (c *cluster) proposeLoop() {
+	defer close(c.exited)
+	for {
+		group := c.takeQueue()
+		if group == nil {
+			return
+		}
+		c.proposeGroup(group)
+	}
+}
+
+func (c *cluster) takeQueue() []*queuedCommit {
+	c.store.mu.Lock()
+	for len(c.queue) == 0 && !c.stopped {
+		c.cond.Wait()
+	}
+	if c.stopped {
+		queued := c.detachQueuedLocked()
+		c.store.mu.Unlock()
+		for _, q := range queued {
+			q.done <- errClusterClosed
+		}
+		return nil
+	}
+	group := c.queue
+	c.queue = nil
+	c.store.mu.Unlock()
+	return group
+}
+
+func (c *cluster) proposeGroup(group []*queuedCommit) {
+	if c.gate != nil {
+		c.gate()
+	}
+	futures := make([]raft.ApplyFuture, len(group))
+	for i, q := range group {
+		payload, err := encodeBatch(q.batch)
+		if err != nil {
+			c.finishProposed(group, futures, i, err)
+			return
+		}
+		futures[i] = c.raft.Apply(payload, c.timeout)
+	}
+	c.finishProposed(group, futures, len(group), nil)
+}
+
+// finishProposed waits for futures that were sent. A Raft error from index
+// failAt, or an encode error there, fails that batch and every later one,
+// including batches recorded after this group.
+func (c *cluster) finishProposed(group []*queuedCommit, futures []raft.ApplyFuture, failAt int, failErr error) {
+	results := make([]error, len(group))
+	firstRaftFail := failAt
+	if failAt < len(group) && failErr != nil {
+		results[failAt] = failErr
+	}
+	for i := 0; i < len(group) && i < failAt; i++ {
+		err := futures[i].Error()
+		if err != nil {
+			results[i] = err
+			if firstRaftFail > i {
+				firstRaftFail = i
+				failErr = err
+			}
+			continue
+		}
+		if resp, ok := futures[i].Response().(error); ok && resp != nil {
+			results[i] = resp
+		}
+	}
+	if firstRaftFail < len(group) {
+		notified := make(map[uint64]bool, len(group)-firstRaftFail)
+		for i := firstRaftFail; i < len(group); i++ {
+			notified[group[i].id] = true
+			err := results[i]
+			if err == nil {
+				err = failErr
+			}
+			group[i].done <- err
+		}
+		c.abandonFrom(group[firstRaftFail].id, failErr, notified)
+		for i := 0; i < firstRaftFail; i++ {
+			group[i].done <- results[i]
+		}
+		return
+	}
+	for i, q := range group {
+		q.done <- results[i]
+	}
+}
+
+// abandonFrom drops id and every in-flight batch recorded after it.
+// alreadyNotified batches are left for the caller to wake.
+func (c *cluster) abandonFrom(id uint64, err error, alreadyNotified map[uint64]bool) {
+	var dropped []*queuedCommit
+	c.store.mu.Lock()
+	drop := false
+	kept := make([]*queuedCommit, 0, len(c.inflight))
+	for _, q := range c.inflight {
+		if q.id == id {
+			drop = true
+		}
+		if drop {
+			dropped = append(dropped, q)
+			continue
+		}
+		kept = append(kept, q)
+	}
+	if drop {
+		c.inflight = kept
+		skip := make(map[uint64]bool, len(dropped))
+		for _, q := range dropped {
+			skip[q.id] = true
+		}
+		queued := make([]*queuedCommit, 0, len(c.queue))
+		for _, q := range c.queue {
+			if !skip[q.id] {
+				queued = append(queued, q)
+			}
+		}
+		c.queue = queued
+		c.cond.Broadcast()
+	}
+	c.store.mu.Unlock()
+	for _, q := range dropped {
+		if alreadyNotified[q.id] {
+			continue
+		}
+		q.done <- err
+	}
+}
+
+// detachQueuedLocked removes batches still waiting to be proposed. The store lock is held.
+func (c *cluster) detachQueuedLocked() []*queuedCommit {
+	queued := c.queue
+	c.queue = nil
+	if len(queued) == 0 {
+		return nil
+	}
+	skip := make(map[uint64]bool, len(queued))
+	for _, q := range queued {
+		skip[q.id] = true
+	}
+	kept := make([]*queuedCommit, 0, len(c.inflight))
+	for _, q := range c.inflight {
+		if !skip[q.id] {
+			kept = append(kept, q)
+		}
+	}
+	c.inflight = kept
+	c.cond.Broadcast()
+	return queued
+}
+
+// noteApplied drops the leader's in-flight batch once its writes are in Badger.
+// id 0 is a log entry that this process did not propose.
+func (s *Store) noteApplied(id uint64) {
+	if id == 0 || s.cluster == nil {
+		return
+	}
+	c := s.cluster
+	s.mu.Lock()
+	for i, q := range c.inflight {
+		if q.id != id {
+			continue
+		}
+		copy(c.inflight[i:], c.inflight[i+1:])
+		c.inflight[len(c.inflight)-1] = nil
+		c.inflight = c.inflight[:len(c.inflight)-1]
+		c.cond.Broadcast()
+		break
+	}
+	s.mu.Unlock()
 }
 
 func (c *cluster) notLeader() error {
@@ -250,16 +514,22 @@ func (c *cluster) notLeader() error {
 }
 
 func (c *cluster) shutdown() error {
+	c.store.mu.Lock()
+	c.stopped = true
+	c.cond.Broadcast()
+	c.store.mu.Unlock()
+	var err error
 	if c.raft != nil {
-		if err := c.raft.Shutdown().Error(); err != nil {
-			return err
-		}
+		err = c.raft.Shutdown().Error()
 	}
+	<-c.exited
 	closeTransport(c.transport)
 	if c.log != nil {
-		return c.log.Close()
+		if cerr := c.log.Close(); err == nil {
+			err = cerr
+		}
 	}
-	return nil
+	return err
 }
 
 // IsLeader reports whether this process currently accepts SQL writes.

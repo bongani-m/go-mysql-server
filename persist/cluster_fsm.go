@@ -23,7 +23,9 @@ func (f *storeFSM) Apply(log *raft.Log) interface{} {
 	if err != nil {
 		return err
 	}
-	if err := f.store.applyOps(batch.Ops); err != nil {
+	err = f.store.applyOps(batch.Ops)
+	f.store.noteApplied(batch.ID)
+	if err != nil {
 		return err
 	}
 	if err := f.store.appendBinlog(log.Index, batch); err != nil {

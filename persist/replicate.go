@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/hashicorp/raft"
 )
 
 // errReplicate aborts the Badger transaction that computed a commit. The
@@ -36,11 +35,15 @@ type rowChange struct {
 
 // replBatch is one Raft log entry: the key/value writes, row images for DML,
 // and the statement text for a catalog change that has no row images.
+// ID is set by the leader that proposed the batch and is zero on entries
+// restored from an older log. The leader uses it to drop that batch from
+// its in-flight list; followers do not.
 type replBatch struct {
 	Ops       []kvOp
 	Rows      []rowChange
 	Statement string
 	Unix      uint32
+	ID        uint64
 }
 
 // recordingTxn copies every Set and Delete while the real transaction still
@@ -79,22 +82,36 @@ func (tx *kvTx) noteRow(ch rowChange) {
 }
 
 // commit runs fn as the single writer. Without a cluster it commits directly.
-// With a cluster the leader records the writes, rolls them back, and proposes
-// the batch. Followers reject the SQL write.
+// With a cluster the leader records the writes, rolls them back, and queues
+// the batch. The lock is not held while Raft waits for a quorum, so the next
+// statement can record against the in-flight batches.
 func (s *Store) commit(statement string, fn func(tx *kvTx) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	db := s.badgerDB()
 	if s.cluster == nil {
-		return db.Update(func(txn *badger.Txn) error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.badgerDB().Update(func(txn *badger.Txn) error {
 			return fn(&kvTx{txn: txn})
 		})
 	}
-	if s.cluster.raft.State() != raft.Leader {
-		return s.cluster.notLeader()
+	return s.cluster.commit(statement, fn)
+}
+
+// commit records one statement on the leader and waits for its Raft future.
+// Recording is serialized by recordMu. The store lock is not held across the
+// quorum wait or across the Badger transaction, so an apply can land and the
+// next statement can record while this one is still in flight.
+func (c *cluster) commit(statement string, fn func(tx *kvTx) error) error {
+	c.recordMu.Lock()
+	snap, err := c.beginRecord()
+	if err != nil {
+		c.recordMu.Unlock()
+		return err
 	}
 	rec := &recordingTxn{}
-	err := db.Update(func(txn *badger.Txn) error {
+	err = c.store.badgerDB().Update(func(txn *badger.Txn) error {
+		if err := replayOps(txn, snap); err != nil {
+			return err
+		}
 		rec.Txn = txn
 		if err := fn(&kvTx{txn: rec}); err != nil {
 			return err
@@ -102,17 +119,42 @@ func (s *Store) commit(statement string, fn func(tx *kvTx) error) error {
 		return errReplicate
 	})
 	if err != nil && !errors.Is(err, errReplicate) {
+		c.recordMu.Unlock()
 		return err
 	}
 	if len(rec.ops) == 0 {
+		c.recordMu.Unlock()
 		return nil
 	}
-	return s.cluster.propose(replBatch{
+	done, err := c.enqueue(replBatch{
 		Ops:       rec.ops,
 		Rows:      rec.rows,
 		Statement: statement,
 		Unix:      uint32(time.Now().Unix()),
 	})
+	c.recordMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return <-done
+}
+
+// replayOps installs in-flight writes into txn so fn sees them. The sets go
+// to the Badger transaction directly and are not recorded as new operations.
+// The transaction still rolls back; Raft apply is what lands them.
+func replayOps(txn *badger.Txn, ops []kvOp) error {
+	for _, op := range ops {
+		if op.Delete {
+			if err := txn.Delete(op.Key); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+				return err
+			}
+			continue
+		}
+		if err := txn.Set(op.Key, op.Value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func encodeBatch(batch replBatch) ([]byte, error) {
