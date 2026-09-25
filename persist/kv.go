@@ -1,6 +1,7 @@
 package persist
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +11,11 @@ import (
 	"github.com/dgraph-io/badger/v4"
 )
 
+// rawMark prefixes row and index keys stored in key order. Ten 0xFF bytes
+// overflow a uvarint, so these keys are not bucket entries, and a constant
+// prefix keeps their relative order equal to the memcomparable key.
+var rawMark = bytes.Repeat([]byte{0xFF}, binary.MaxVarintLen64)
+
 const (
 	kindValue  byte = 0
 	kindBucket byte = 1
@@ -17,7 +23,7 @@ const (
 
 // openBadger opens or creates a Badger directory. An existing file at path is
 // refused: bbolt files are not migrated.
-func openBadger(path string) (*badger.DB, error) {
+func openBadger(path string, syncWrites bool) (*badger.DB, error) {
 	info, err := os.Stat(path)
 	if err == nil && !info.IsDir() {
 		return nil, fmt.Errorf("persist: %s is a file, not a Badger directory (bbolt files are not migrated)", path)
@@ -29,7 +35,7 @@ func openBadger(path string) (*badger.DB, error) {
 		return nil, err
 	}
 	opts := badger.DefaultOptions(path).
-		WithSyncWrites(true).
+		WithSyncWrites(syncWrites).
 		WithLoggingLevel(badger.WARNING)
 	return badger.Open(opts)
 }
@@ -200,6 +206,99 @@ func (b *kvBucket) SetSequence(seq uint64) error {
 	binary.BigEndian.PutUint64(raw[:], seq)
 	return b.tx.txn.Set(append([]byte(nil), b.prefix...), append([]byte(nil), raw[:]...))
 }
+
+func (b *kvBucket) rawFull(key []byte) []byte {
+	full := make([]byte, 0, len(b.prefix)+len(rawMark)+len(key))
+	full = append(full, b.prefix...)
+	full = append(full, rawMark...)
+	full = append(full, key...)
+	return full
+}
+
+func (b *kvBucket) GetRaw(key []byte) []byte {
+	val, err := b.tx.get(b.rawFull(key))
+	if err != nil {
+		return nil
+	}
+	return val
+}
+
+func (b *kvBucket) PutRaw(key, value []byte) error {
+	if value == nil {
+		value = []byte{}
+	}
+	return b.tx.txn.Set(b.rawFull(key), append([]byte(nil), value...))
+}
+
+func (b *kvBucket) DeleteRaw(key []byte) error {
+	stored := b.rawFull(key)
+	val, err := b.tx.get(stored)
+	if err != nil || val == nil {
+		return err
+	}
+	return b.tx.txn.Delete(stored)
+}
+
+func (b *kvBucket) forEachRaw(fn func(k, v []byte) error) error {
+	it := b.rawIter(false)
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		val, err := it.Value()
+		if err != nil {
+			return err
+		}
+		if err := fn(it.Key(), val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rawIter walks keys stored with PutRaw, in memcomparable order.
+type rawIter struct {
+	it     *badger.Iterator
+	prefix []byte
+}
+
+func (b *kvBucket) rawIter(reverse bool) *rawIter {
+	opts := badger.DefaultIteratorOptions
+	opts.Prefix = append(append([]byte(nil), b.prefix...), rawMark...)
+	opts.Reverse = reverse
+	return &rawIter{it: b.tx.txn.NewIterator(opts), prefix: opts.Prefix}
+}
+
+func (it *rawIter) Seek(key []byte) {
+	target := append(append([]byte(nil), it.prefix...), key...)
+	it.it.Seek(target)
+}
+
+// seekEnd positions a reverse iterator on the last key in the prefix. Rewind
+// seeks the prefix itself, and a reverse seek stops on the key before that
+// prefix, which is outside it.
+func (it *rawIter) seekEnd() {
+	end := prefixEnd(it.prefix)
+	if end == nil {
+		end = append(append([]byte(nil), it.prefix...), 0)
+	}
+	it.it.Seek(end)
+}
+
+func (it *rawIter) Rewind() { it.it.Rewind() }
+
+func (it *rawIter) Valid() bool { return it.it.ValidForPrefix(it.prefix) }
+
+func (it *rawIter) Next() { it.it.Next() }
+
+func (it *rawIter) Key() []byte {
+	full := it.it.Item().Key()
+	return append([]byte(nil), full[len(it.prefix):]...)
+}
+
+func (it *rawIter) Value() ([]byte, error) {
+	return it.it.Item().ValueCopy(nil)
+}
+
+func (it *rawIter) Close() { it.it.Close() }
 
 func (b *kvBucket) NextSequence() (uint64, error) {
 	seq := b.Sequence()

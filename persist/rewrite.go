@@ -157,7 +157,39 @@ func (t *Table) reconcileIndexes(ctx *sql.Context, oldColumn, newColumn *sql.Col
 	if err := t.writeIndexes(kept); err != nil {
 		return err
 	}
+	// writeSchema runs before the definitions are renamed, so an index on the
+	// old column name was not rebuilt. Fill it now that the names match.
+	if err := t.backfillIndexes(ctx, kept); err != nil {
+		return err
+	}
 	return t.dropFulltextTables(ctx, dropped, kept)
+}
+
+func (t *Table) backfillIndexes(ctx *sql.Context, indexes []storedIndex) error {
+	return t.store.update(func(tx *kvTx) error {
+		bucket := tableBucket(tx, t.dbName, t.name)
+		if bucket == nil {
+			return sql.ErrTableNotFound.New(t.name)
+		}
+		for _, idx := range indexes {
+			if !indexMaintained(idx) {
+				continue
+			}
+			parent, err := indexParent(bucket)
+			if err != nil {
+				return err
+			}
+			if parent.Bucket([]byte(idx.Name)) != nil {
+				if err := parent.DeleteBucket([]byte(idx.Name)); err != nil {
+					return err
+				}
+			}
+			if err := backfillIndexUnique(ctx, bucket, t.meta.schema, idx); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // trimFulltextColumns drops index columns that the rewrite removed and renames

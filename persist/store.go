@@ -30,7 +30,15 @@ var (
 	keyAutoInc      = []byte("autoinc")
 	keyChecks       = []byte("checks")
 	keyTargetRows   = []byte("targetRowSize")
+	keyFormat       = []byte("format")
+	keyRowCount     = []byte("rowCount")
+	keyDataBytes    = []byte("dataBytes")
+	bucketIndex     = []byte("index")
 )
+
+// formatCurrent is sortable keys plus binary rows. A missing key is the
+// previous format: decimal key parts wrapped as bucket entries, and JSON rows.
+const formatCurrent uint16 = 1
 
 // Store is a go-mysql-server database provider backed by one Badger directory.
 type Store struct {
@@ -42,10 +50,23 @@ type Store struct {
 var _ sql.DatabaseProvider = (*Store)(nil)
 var _ sql.MutableDatabaseProvider = (*Store)(nil)
 
+// OpenOptions controls how a store is opened.
+type OpenOptions struct {
+	// BulkLoad turns fsync off for the life of the store. Normal commits keep
+	// SyncWrites on, matching InnoDB with flush at commit.
+	BulkLoad bool
+}
+
 // Open opens or creates the Badger directory at path.
 // GMS_DATA is the usual way to choose the path; the server default is data/gms.
+// Commits fsync. Use OpenWithOptions for a bulk load.
 func Open(path string) (*Store, error) {
-	db, err := openBadger(path)
+	return OpenWithOptions(path, OpenOptions{})
+}
+
+// OpenWithOptions opens or creates the Badger directory at path.
+func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
+	db, err := openBadger(path, !opts.BulkLoad)
 	if err != nil {
 		return nil, err
 	}
@@ -254,6 +275,15 @@ func (d *Database) CreateTable(ctx *sql.Context, name string, schema sql.Primary
 		if err := bucket.Put(keyCollation, coll[:]); err != nil {
 			return err
 		}
+		if err := putFormat(bucket); err != nil {
+			return err
+		}
+		if err := putUint64(bucket, keyRowCount, 0); err != nil {
+			return err
+		}
+		if err := putUint64(bucket, keyDataBytes, 0); err != nil {
+			return err
+		}
 		_, err = bucket.CreateBucket(bucketRows)
 		return err
 	})
@@ -304,6 +334,11 @@ func (d *Database) RenameTable(ctx *sql.Context, oldName, newName string) error 
 }
 
 func copyBucket(src, dst *kvBucket) error {
+	if err := src.forEachRaw(func(k, v []byte) error {
+		return dst.PutRaw(k, v)
+	}); err != nil {
+		return err
+	}
 	return src.ForEach(func(k, v []byte) error {
 		key := append([]byte(nil), k...)
 		if v != nil {
@@ -336,9 +371,24 @@ func (d *Database) DropTable(ctx *sql.Context, name string) error {
 }
 
 func (s *Store) loadTable(dbName, tableName string) (tableMeta, string, bool, error) {
+	meta, name, format, ok, err := s.readTable(dbName, tableName)
+	if err != nil || !ok {
+		return tableMeta{}, "", false, err
+	}
+	if format < formatCurrent {
+		if err := s.migrateTable(dbName, tableName); err != nil {
+			return tableMeta{}, "", false, err
+		}
+		meta, name, _, ok, err = s.readTable(dbName, tableName)
+	}
+	return meta, name, ok, err
+}
+
+func (s *Store) readTable(dbName, tableName string) (tableMeta, string, uint16, bool, error) {
 	var raw []byte
 	var name string
 	var targetRowSize uint64
+	var format uint16
 	err := s.view(func(tx *kvTx) error {
 		tables := tablesBucket(tx, dbName)
 		if tables == nil {
@@ -350,57 +400,26 @@ func (s *Store) loadTable(dbName, tableName string) (tableMeta, string, bool, er
 		}
 		raw = append([]byte(nil), bucket.Get(keySchema)...)
 		name = string(bucket.Get(keyName))
+		format = tableFormat(bucket)
 		if size := bucket.Get(keyTargetRows); len(size) == 8 {
 			targetRowSize = binary.BigEndian.Uint64(size)
 		}
 		return nil
 	})
 	if err != nil || raw == nil {
-		return tableMeta{}, "", false, err
+		return tableMeta{}, "", 0, false, err
 	}
 	meta, err := decodeSchema(raw, dbName, name)
 	if err != nil {
-		return tableMeta{}, "", false, err
+		return tableMeta{}, "", 0, false, err
 	}
 	meta.targetRowSize = targetRowSize
-	return meta, name, true, nil
+	return meta, name, format, true, nil
 }
 
 type storedRow struct {
 	key []byte
 	row sql.Row
-}
-
-func (s *Store) diskRows(ctx context.Context, t *Table) ([]storedRow, error) {
-	var raws []struct {
-		key []byte
-		val []byte
-	}
-	err := s.view(func(tx *kvTx) error {
-		rows := rowsBucket(tx, t.dbName, t.name)
-		if rows == nil {
-			return sql.ErrTableNotFound.New(t.name)
-		}
-		return rows.ForEach(func(k, v []byte) error {
-			raws = append(raws, struct {
-				key []byte
-				val []byte
-			}{key: append([]byte(nil), k...), val: append([]byte(nil), v...)})
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]storedRow, len(raws))
-	for i, raw := range raws {
-		row, err := decodeRow(ctx, t.meta.schema, raw.val)
-		if err != nil {
-			return nil, err
-		}
-		out[i] = storedRow{key: raw.key, row: row}
-	}
-	return out, nil
 }
 
 func (s *Store) getRow(ctx context.Context, t *Table, key []byte) (sql.Row, bool, error) {
@@ -410,7 +429,7 @@ func (s *Store) getRow(ctx context.Context, t *Table, key []byte) (sql.Row, bool
 		if rows == nil {
 			return sql.ErrTableNotFound.New(t.name)
 		}
-		raw = append([]byte(nil), rows.Get(key)...)
+		raw = append([]byte(nil), rows.GetRaw(key)...)
 		return nil
 	})
 	if err != nil || len(raw) == 0 {
@@ -420,21 +439,20 @@ func (s *Store) getRow(ctx context.Context, t *Table, key []byte) (sql.Row, bool
 	return row, err == nil, err
 }
 
-func (s *Store) nextSequence(t *Table) ([]byte, error) {
-	var key []byte
-	err := s.update(func(tx *kvTx) error {
-		rows := rowsBucket(tx, t.dbName, t.name)
-		if rows == nil {
-			return sql.ErrTableNotFound.New(t.name)
+func (s *Store) indexGet(t *Table, indexName string, key []byte) ([]byte, error) {
+	var val []byte
+	err := s.view(func(tx *kvTx) error {
+		data := indexData(tx, t.dbName, t.name, indexName)
+		if data == nil {
+			return nil
 		}
-		seq, err := rows.NextSequence()
-		if err != nil {
-			return err
-		}
-		key = sequenceKey(seq)
+		val = append([]byte(nil), data.GetRaw(key)...)
 		return nil
 	})
-	return key, err
+	if err != nil || len(val) == 0 {
+		return nil, err
+	}
+	return val, nil
 }
 
 func (s *Store) apply(t *Table, edits []edit) error {
@@ -456,40 +474,107 @@ func (s *Store) applyAll(pending map[tableRef][]edit) error {
 }
 
 func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
-	rows := rowsBucket(tx, ref.db, ref.name)
+	bucket := tableBucket(tx, ref.db, ref.name)
+	if bucket == nil {
+		return sql.ErrTableNotFound.New(ref.name)
+	}
+	rows := bucket.Bucket(bucketRows)
 	if rows == nil {
 		return sql.ErrTableNotFound.New(ref.name)
 	}
+	schemaRaw := bucket.Get(keySchema)
+	meta, err := decodeSchema(schemaRaw, ref.db, ref.name)
+	if err != nil {
+		return err
+	}
+	edits, err = resolveProvisional(rows, edits)
+	if err != nil {
+		return err
+	}
+	indexes, err := indexesIn(bucket)
+	if err != nil {
+		return err
+	}
+	count, nbytes, err := loadCounts(bucket, rows)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
 	for _, ed := range edits {
 		switch ed.op {
 		case opDelete:
-			if err := rows.Delete(ed.key); err != nil {
+			old := rows.GetRaw(ed.key)
+			if len(old) == 0 {
+				continue
+			}
+			oldRow, err := decodeRow(ctx, meta.schema, old)
+			if err != nil {
 				return err
 			}
+			if err := deleteIndexEntries(ctx, bucket, meta.schema, indexes, oldRow, ed.key); err != nil {
+				return err
+			}
+			if err := rows.DeleteRaw(ed.key); err != nil {
+				return err
+			}
+			count--
+			nbytes -= uint64(len(old))
+		case opInsert:
+			if rows.GetRaw(ed.key) != nil {
+				return sql.ErrPrimaryKeyViolation.New()
+			}
+			if err := checkUniqueWrite(ctx, bucket, meta.schema, indexes, ed.row, ed.key, nil); err != nil {
+				return err
+			}
+			if err := rows.PutRaw(ed.key, ed.raw); err != nil {
+				return err
+			}
+			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, ed.row, ed.key); err != nil {
+				return err
+			}
+			count++
+			nbytes += uint64(len(ed.raw))
 		case opUpdate:
-			if len(ed.oldKey) > 0 && !bytesEqual(ed.oldKey, ed.key) {
-				if err := rows.Delete(ed.oldKey); err != nil {
+			old := rows.GetRaw(ed.oldKey)
+			var oldRow sql.Row
+			if len(old) > 0 {
+				oldRow, err = decodeRow(ctx, meta.schema, old)
+				if err != nil {
 					return err
 				}
+				if err := deleteIndexEntries(ctx, bucket, meta.schema, indexes, oldRow, ed.oldKey); err != nil {
+					return err
+				}
+				if !bytesEqual(ed.oldKey, ed.key) {
+					if err := rows.DeleteRaw(ed.oldKey); err != nil {
+						return err
+					}
+				}
+				count--
+				nbytes -= uint64(len(old))
 			}
-			if existing := rows.Get(ed.key); existing != nil && !bytesEqual(ed.oldKey, ed.key) {
+			if !bytesEqual(ed.oldKey, ed.key) && rows.GetRaw(ed.key) != nil {
 				return sql.ErrPrimaryKeyViolation.New()
 			}
-			if err := rows.Put(ed.key, ed.raw); err != nil {
+			if err := checkUniqueWrite(ctx, bucket, meta.schema, indexes, ed.row, ed.key, ed.oldKey); err != nil {
 				return err
 			}
-		case opInsert:
-			if rows.Get(ed.key) != nil {
-				return sql.ErrPrimaryKeyViolation.New()
-			}
-			if err := rows.Put(ed.key, ed.raw); err != nil {
+			if err := rows.PutRaw(ed.key, ed.raw); err != nil {
 				return err
 			}
+			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, ed.row, ed.key); err != nil {
+				return err
+			}
+			count++
+			nbytes += uint64(len(ed.raw))
 		default:
 			return fmt.Errorf("persist: unknown edit %d", ed.op)
 		}
 	}
-	return nil
+	if err := putUint64(bucket, keyRowCount, count); err != nil {
+		return err
+	}
+	return putUint64(bucket, keyDataBytes, nbytes)
 }
 
 func (s *Store) truncate(t *Table) (int, error) {
@@ -503,19 +588,113 @@ func (s *Store) truncate(t *Table) (int, error) {
 		if rows == nil {
 			return sql.ErrTableNotFound.New(t.name)
 		}
-		if err := rows.ForEach(func(_, _ []byte) error {
-			n++
-			return nil
-		}); err != nil {
+		count, _, err := loadCounts(bucket, rows)
+		if err != nil {
+			return err
+		}
+		n = int(count)
+		if err := clearIndexData(bucket); err != nil {
 			return err
 		}
 		if err := bucket.DeleteBucket(bucketRows); err != nil {
 			return err
 		}
-		_, err := bucket.CreateBucket(bucketRows)
-		return err
+		if _, err := bucket.CreateBucket(bucketRows); err != nil {
+			return err
+		}
+		if err := putUint64(bucket, keyRowCount, 0); err != nil {
+			return err
+		}
+		return putUint64(bucket, keyDataBytes, 0)
 	})
 	return n, err
+}
+
+func (s *Store) migrateTable(dbName, tableName string) error {
+	return s.update(func(tx *kvTx) error {
+		bucket := tableBucket(tx, dbName, tableName)
+		if bucket == nil {
+			return sql.ErrTableNotFound.New(tableName)
+		}
+		if tableFormat(bucket) >= formatCurrent {
+			return nil
+		}
+		schemaRaw := bucket.Get(keySchema)
+		name := string(bucket.Get(keyName))
+		meta, err := decodeSchema(schemaRaw, dbName, name)
+		if err != nil {
+			return err
+		}
+		rows := bucket.Bucket(bucketRows)
+		ctx := context.Background()
+		stored, err := readStoredRows(ctx, rows, meta.schema)
+		if err != nil {
+			return err
+		}
+		var maxSeq uint64
+		if rows != nil && rows.Sequence() > maxSeq {
+			maxSeq = rows.Sequence()
+		}
+		rewritten := make([]storedRow, 0, len(stored))
+		for _, row := range stored {
+			key := row.key
+			if len(meta.pk) == 0 {
+				if len(key) == 8 {
+					seq := binary.BigEndian.Uint64(key)
+					if seq > maxSeq {
+						maxSeq = seq
+					}
+				}
+			} else {
+				key, err = primaryKey(ctx, meta.schema, meta.pk, row.row)
+				if err != nil {
+					return err
+				}
+			}
+			rewritten = append(rewritten, storedRow{key: key, row: row.row})
+		}
+		// Re-encode while writing so the byte length matches the stored value.
+		if err := clearIndexData(bucket); err != nil {
+			return err
+		}
+		if rows != nil {
+			if err := bucket.DeleteBucket(bucketRows); err != nil {
+				return err
+			}
+		}
+		fresh, err := bucket.CreateBucket(bucketRows)
+		if err != nil {
+			return err
+		}
+		if err := fresh.SetSequence(maxSeq); err != nil {
+			return err
+		}
+		indexes, err := indexesIn(bucket)
+		if err != nil {
+			return err
+		}
+		var nbytes uint64
+		for _, row := range rewritten {
+			raw, err := encodeRow(ctx, meta.schema, row.row)
+			if err != nil {
+				return err
+			}
+			if err := fresh.PutRaw(row.key, raw); err != nil {
+				return err
+			}
+			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, row.row, row.key); err != nil {
+				return err
+			}
+			nbytes += uint64(len(raw))
+		}
+		if err := putUint64(bucket, keyRowCount, uint64(len(rewritten))); err != nil {
+			return err
+		}
+		if err := putUint64(bucket, keyDataBytes, nbytes); err != nil {
+			return err
+		}
+		return putFormat(bucket)
+	})
 }
 
 func bucketKey(name string) []byte {

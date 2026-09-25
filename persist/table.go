@@ -1,6 +1,7 @@
 package persist
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -8,8 +9,8 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
-// Table is one persisted MySQL table. Scans read the whole rows bucket;
-// the engine applies filters, ordering, and limits.
+// Table is one persisted MySQL table. A primary-key equality reads one row.
+// Other scans walk the rows bucket in key order.
 type Table struct {
 	store  *Store
 	dbName string
@@ -75,11 +76,7 @@ func (t *Table) Partitions(*sql.Context) (sql.PartitionIter, error) {
 
 // PartitionRows implements sql.Table.
 func (t *Table) PartitionRows(ctx *sql.Context, _ sql.Partition) (sql.RowIter, error) {
-	rows, err := t.visibleRows(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return &rowIter{rows: rows}, nil
+	return t.streamRows(ctx, nil, keySpan{}, false)
 }
 
 // Inserter implements sql.InsertableTable.
@@ -133,15 +130,38 @@ func (e *editor) bind(ctx *sql.Context) *editor {
 // visibleRows returns the committed rows overlaid with the session's
 // uncommitted edits, plus any extra edits an open editor has buffered.
 func (t *Table) visibleRows(ctx *sql.Context, extra ...edit) ([]sql.Row, error) {
-	base, err := t.store.diskRows(ctx, t)
+	iter, err := t.streamRows(ctx, extra, keySpan{}, false)
 	if err != nil {
 		return nil, err
 	}
-	var pending []edit
-	if sess, ok := sessionFrom(ctx); ok {
-		pending = sess.edits(t.ref())
+	return sql.RowIterToRows(ctx, iter)
+}
+
+func (t *Table) streamRows(ctx *sql.Context, extra []edit, span keySpan, reverse bool) (sql.RowIter, error) {
+	var base context.Context
+	if ctx != nil {
+		base = ctx
+	} else {
+		base = context.Background()
 	}
-	return mergeRows(base, append(append([]edit{}, pending...), extra...)), nil
+	return t.store.mergeRows(base, t, t.editsFor(ctx, nil, extra), span, reverse)
+}
+
+// editsFor orders edits so the last one wins: session, then siblings, then
+// this editor. Scans pass the editor's edits in extra instead.
+func (t *Table) editsFor(ctx *sql.Context, self *editor, extra []edit) []edit {
+	var out []edit
+	if sess, ok := sessionFrom(ctx); ok {
+		out = append(out, sess.edits(t.ref())...)
+		if self != nil {
+			out = append(out, sess.openEditsExcept(t.ref(), self)...)
+		}
+	}
+	out = append(out, extra...)
+	if self != nil {
+		out = append(out, self.edits...)
+	}
+	return out
 }
 
 type partition struct {
@@ -191,6 +211,7 @@ type editor struct {
 	mark      int
 	discarded bool
 	closed    bool
+	nextProv  uint64
 }
 
 var _ sql.RowInserter = (*editor)(nil)
@@ -261,7 +282,7 @@ func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {
 	if err := e.noteAutoIncrement(ctx, row); err != nil {
 		return err
 	}
-	raw, err := encodeRow(ctx, row)
+	raw, err := encodeRow(ctx, e.meta.schema, row)
 	if err != nil {
 		return err
 	}
@@ -285,7 +306,7 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 	if len(e.meta.pk) == 0 {
 		newKey = oldKey
 	} else {
-		newKey, err = primaryKey(e.meta.pk, newRow)
+		newKey, err = primaryKey(ctx, e.meta.schema, e.meta.pk, newRow)
 		if err != nil {
 			return err
 		}
@@ -305,7 +326,7 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 	if err := e.noteAutoIncrement(ctx, newRow); err != nil {
 		return err
 	}
-	raw, err := encodeRow(ctx, newRow)
+	raw, err := encodeRow(ctx, e.meta.schema, newRow)
 	if err != nil {
 		return err
 	}
@@ -328,7 +349,7 @@ func (e *editor) Delete(ctx *sql.Context, row sql.Row) error {
 // HasUniqueKeyConflict implements sql.UniqueKeyConflictCheckingRowInserter.
 func (e *editor) HasUniqueKeyConflict(ctx *sql.Context, row sql.Row, columns []string) (bool, error) {
 	if len(e.meta.pk) > 0 && pkColumnsCovered(e.meta, columns) {
-		key, err := primaryKey(e.meta.pk, row)
+		key, err := primaryKey(ctx, e.meta.schema, e.meta.pk, row)
 		if err != nil {
 			return false, err
 		}
@@ -339,25 +360,75 @@ func (e *editor) HasUniqueKeyConflict(ctx *sql.Context, row sql.Row, columns []s
 	if err != nil {
 		return false, err
 	}
-	rows, err := e.matchingRows(ctx)
-	if err != nil {
-		return false, err
-	}
 	for _, idx := range indexes {
-		if !indexColumnsMatch(idx, columns) {
+		if !indexIsUnique(idx) || !indexMaintained(idx) {
 			continue
 		}
-		for _, existing := range rows {
-			conflict, err := indexRowsConflict(ctx, e.meta.schema, idx, existing.row, row)
-			if err != nil {
-				return false, err
-			}
-			if conflict {
-				return true, nil
-			}
+		if len(columns) > 0 && !indexColumnsMatch(idx, columns) {
+			continue
+		}
+		hit, _, err := e.uniqueHit(ctx, idx, row, nil)
+		if err != nil || hit {
+			return hit, err
 		}
 	}
 	return false, nil
+}
+
+func (e *editor) pendingEdits(ctx *sql.Context) []edit {
+	return e.table.editsFor(ctx, e, nil)
+}
+
+func (e *editor) uniqueHit(ctx *sql.Context, idx storedIndex, row, skip sql.Row) (bool, sql.Row, error) {
+	fields, err := indexFields(e.meta.schema, idx)
+	if err != nil {
+		return false, nil, err
+	}
+	colKey, hasNull, err := encodeIndexColumns(ctx, fields, row)
+	if err != nil || hasNull {
+		return false, nil, err
+	}
+	for _, existing := range buildOverlay(e.pendingEdits(ctx)) {
+		if existing.tomb {
+			continue
+		}
+		if skip != nil {
+			same, err := rowsEqual(ctx, e.meta.schema, existing.row, skip)
+			if err != nil {
+				return false, nil, err
+			}
+			if same {
+				continue
+			}
+		}
+		key, nulls, err := encodeIndexColumns(ctx, fields, existing.row)
+		if err != nil {
+			return false, nil, err
+		}
+		if nulls || !bytesEqual(key, colKey) {
+			continue
+		}
+		return true, existing.row, nil
+	}
+	pk, err := e.table.store.indexGet(e.table, idx.Name, colKey)
+	if err != nil || len(pk) == 0 {
+		return false, nil, err
+	}
+	existing, ok, err := e.lookup(ctx, pk)
+	if err != nil || !ok {
+		return false, nil, err
+	}
+	if skip != nil {
+		same, err := rowsEqual(ctx, e.meta.schema, existing, skip)
+		if err != nil || same {
+			return false, nil, err
+		}
+	}
+	conflict, err := indexRowsConflict(ctx, e.meta.schema, idx, existing, row)
+	if err != nil || !conflict {
+		return false, nil, err
+	}
+	return true, existing, nil
 }
 
 // checkRow rejects a row the schema cannot hold. The engine converts values to
@@ -386,16 +457,17 @@ func (e *editor) writable(ctx *sql.Context) error {
 	return nil
 }
 
-func (e *editor) insertKey(_ *sql.Context, row sql.Row) ([]byte, error) {
+func (e *editor) insertKey(ctx *sql.Context, row sql.Row) ([]byte, error) {
 	if len(e.meta.pk) == 0 {
-		return e.table.store.nextSequence(e.table)
+		e.nextProv++
+		return provisionalKey(e.nextProv), nil
 	}
-	return primaryKey(e.meta.pk, row)
+	return primaryKey(ctx, e.meta.schema, e.meta.pk, row)
 }
 
 func (e *editor) locate(ctx *sql.Context, row sql.Row) ([]byte, sql.Row, error) {
 	if len(e.meta.pk) > 0 {
-		key, err := primaryKey(e.meta.pk, row)
+		key, err := primaryKey(ctx, e.meta.schema, e.meta.pk, row)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -425,33 +497,56 @@ func (e *editor) locate(ctx *sql.Context, row sql.Row) ([]byte, sql.Row, error) 
 }
 
 func (e *editor) lookup(ctx *sql.Context, key []byte) (sql.Row, bool, error) {
-	if row, ok, decided := lookupEdits(e.edits, key); decided {
-		return row, ok, nil
+	return e.table.lookupKey(ctx, key, e)
+}
+
+func (t *Table) lookupKey(ctx *sql.Context, key []byte, self *editor) (sql.Row, bool, error) {
+	if self != nil {
+		if row, ok, decided := lookupEdits(self.edits, key); decided {
+			return row, ok, nil
+		}
 	}
 	if sess, ok := sessionFrom(ctx); ok {
-		if row, ok, decided := sess.lookupOpen(e, key); decided {
-			return row, ok, nil
+		if self != nil {
+			if row, ok, decided := sess.lookupOpen(self, key); decided {
+				return row, ok, nil
+			}
 		}
-		if row, ok, decided := lookupEdits(sess.edits(e.table.ref()), key); decided {
+		if row, ok, decided := lookupEdits(sess.edits(t.ref()), key); decided {
 			return row, ok, nil
 		}
 	}
-	return e.table.store.getRow(ctx, e.table, key)
+	return t.store.getRow(ctx, t, key)
 }
 
 func (e *editor) matchingRows(ctx *sql.Context) ([]storedRow, error) {
-	base, err := e.table.store.diskRows(ctx, e.table)
+	var extra []edit
+	if sess, ok := sessionFrom(ctx); ok {
+		extra = sess.openEdits(e.table.ref())
+	} else {
+		extra = e.edits
+	}
+	iter, err := e.table.streamRows(ctx, extra, keySpan{}, false)
 	if err != nil {
 		return nil, err
 	}
-	var pending []edit
-	if sess, ok := sessionFrom(ctx); ok {
-		// openEdits includes this editor, so its own buffer is already here.
-		pending = append(sess.edits(e.table.ref()), sess.openEdits(e.table.ref())...)
-	} else {
-		pending = e.edits
+	defer iter.Close(ctx)
+	merger, ok := iter.(*mergeIter)
+	if !ok {
+		return nil, fmt.Errorf("persist: scan is %T", iter)
 	}
-	return mergeStored(base, pending), nil
+	var rows []storedRow
+	for {
+		row, err := merger.nextStored(ctx)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
 }
 
 func lookupEdits(edits []edit, key []byte) (sql.Row, bool, bool) {

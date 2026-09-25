@@ -1,9 +1,11 @@
 package persist
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"strings"
@@ -68,11 +70,24 @@ func (idx *Index) IsGenerated() bool                          { return false }
 func (idx *Index) CanSupport(*sql.Context, ...sql.Range) bool { return true }
 func (idx *Index) CanSupportOrderBy(sql.Expression) bool      { return false }
 
-// Order reports no scan order. Rows are filtered from a full scan, so the
-// engine must keep its own sort. ColumnOrders still records DESC for SHOW CREATE.
-func (idx *Index) Order(*sql.Context) sql.IndexOrder { return sql.IndexOrderNone }
+// Order is ascending for a btree index with no DESC column. A descending
+// column is reported by ColumnOrders, and Order stays unordered so a caller
+// that only understands one direction does not assume ascending.
+func (idx *Index) Order(*sql.Context) sql.IndexOrder {
+	if idx.full || idx.spatial || idx.vector {
+		return sql.IndexOrderNone
+	}
+	for _, down := range idx.descending {
+		if down {
+			return sql.IndexOrderNone
+		}
+	}
+	return sql.IndexOrderAsc
+}
 
-func (idx *Index) Reversible(*sql.Context) bool { return false }
+func (idx *Index) Reversible(*sql.Context) bool {
+	return !idx.full && !idx.spatial && !idx.vector
+}
 
 func (idx *Index) ColumnOrders(*sql.Context) []sql.IndexColumnOrder {
 	if len(idx.descending) == 0 {
@@ -345,7 +360,26 @@ func (t *Table) appendStoredIndex(ctx *sql.Context, indexDef sql.IndexDef, ft *s
 		stored.Fulltext = copyStoredFulltext(ft)
 	}
 	indexes = append(indexes, stored)
-	return t.writeIndexes(indexes)
+	raw, err := json.Marshal(indexes)
+	if err != nil {
+		return err
+	}
+	return t.store.update(func(tx *kvTx) error {
+		bucket := tableBucket(tx, t.dbName, t.name)
+		if bucket == nil {
+			return sql.ErrTableNotFound.New(t.name)
+		}
+		if err := bucket.Put(keyIndexes, raw); err != nil {
+			return err
+		}
+		if err := syncIndexBuckets(bucket, indexes); err != nil {
+			return err
+		}
+		if !indexMaintained(stored) {
+			return nil
+		}
+		return backfillIndexUnique(ctx, bucket, t.meta.schema, stored)
+	})
 }
 
 // DropIndex implements sql.IndexAlterableTable.
@@ -394,7 +428,20 @@ func (t *Table) RenameIndex(ctx *sql.Context, fromIndexName, toIndexName string)
 	if !found {
 		return sql.ErrIndexNotFound.New(fromIndexName)
 	}
-	return t.writeIndexes(indexes)
+	raw, err := json.Marshal(indexes)
+	if err != nil {
+		return err
+	}
+	return t.store.update(func(tx *kvTx) error {
+		bucket := tableBucket(tx, t.dbName, t.name)
+		if bucket == nil {
+			return sql.ErrTableNotFound.New(t.name)
+		}
+		if err := renameIndexBucket(bucket, fromIndexName, toIndexName); err != nil {
+			return err
+		}
+		return bucket.Put(keyIndexes, raw)
+	})
 }
 
 func (t *Table) readIndexes() ([]storedIndex, error) {
@@ -427,7 +474,10 @@ func (t *Table) writeIndexes(indexes []storedIndex) error {
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)
 		}
-		return bucket.Put(keyIndexes, raw)
+		if err := bucket.Put(keyIndexes, raw); err != nil {
+			return err
+		}
+		return syncIndexBuckets(bucket, indexes)
 	})
 }
 
@@ -450,6 +500,138 @@ func (t *indexedTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup
 }
 
 func (t *indexedTable) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.RowIter, error) {
+	if t.lookup.IsEmptyRange {
+		return sql.RowsToRowIter(), nil
+	}
+	idx, ok := t.lookup.Index.(*Index)
+	ranges, rangesOK := t.lookup.Ranges.(sql.MySQLRangeCollection)
+	if !ok || !rangesOK || idx.full || idx.spatial || idx.vector {
+		return t.filteredRows(ctx)
+	}
+	fields, err := t.lookupFields(idx)
+	if err != nil {
+		return nil, err
+	}
+	var opens []func() (sql.RowIter, error)
+	for _, rang := range ranges {
+		span, exact, empty, encoded, err := spanForRange(ctx, fields, rang)
+		if err != nil {
+			return nil, err
+		}
+		if !encoded {
+			return t.filteredRows(ctx)
+		}
+		if empty {
+			continue
+		}
+		sp, ex, one := span, exact, rang
+		opens = append(opens, func() (sql.RowIter, error) {
+			iter, err := t.openLookup(ctx, idx, fields, sp, ex)
+			if err != nil || ex || spanCovers(one) {
+				return iter, err
+			}
+			// The seek stops at the first ranged column. A constraint on a
+			// later column is applied to the rows that seek returns.
+			return t.restrict(ctx, iter, sql.MySQLRangeCollection{one})
+		})
+	}
+	if len(opens) == 0 {
+		return sql.RowsToRowIter(), nil
+	}
+	return &concatIter{open: opens}, nil
+}
+
+func (t *indexedTable) lookupFields(idx *Index) ([]indexField, error) {
+	if idx.name == "PRIMARY" {
+		return pkFields(t.meta.schema, t.meta.pk), nil
+	}
+	return indexFields(t.meta.schema, storedIndex{
+		Name:       idx.name,
+		Columns:    idx.columns,
+		Lengths:    idx.lengths,
+		Descending: idx.descending,
+	})
+}
+
+func (t *indexedTable) openLookup(ctx *sql.Context, idx *Index, fields []indexField, span keySpan, exact bool) (sql.RowIter, error) {
+	if exact && idx.name == "PRIMARY" {
+		row, ok, err := t.lookupKey(ctx, span.start, t.editor)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return sql.RowsToRowIter(), nil
+		}
+		return &rowIter{rows: []sql.Row{row}}, nil
+	}
+	if exact && idx.unique {
+		return t.secondaryPoint(ctx, idx, fields, span.start)
+	}
+	edits := t.editsFor(ctx, t.editor, nil)
+	if idx.name == "PRIMARY" {
+		var base context.Context
+		if ctx != nil {
+			base = ctx
+		} else {
+			base = context.Background()
+		}
+		return t.store.mergeRows(base, t.Table, t.editsFor(ctx, t.editor, nil), span, t.lookup.IsReverse)
+	}
+	return t.store.openIndexIter(ctx, t.Table, idx.name, fields, idx.unique, edits, span, t.lookup.IsReverse)
+}
+
+func (t *indexedTable) secondaryPoint(ctx *sql.Context, idx *Index, fields []indexField, colKey []byte) (sql.RowIter, error) {
+	var rows []sql.Row
+	seen := make(map[string]struct{})
+	for _, entry := range buildOverlay(t.editsFor(ctx, t.editor, nil)) {
+		seen[string(entry.key)] = struct{}{}
+		if entry.tomb {
+			continue
+		}
+		key, hasNull, err := encodeIndexColumns(ctx, fields, entry.row)
+		if err != nil {
+			return nil, err
+		}
+		if hasNull || !bytesEqual(key, colKey) {
+			continue
+		}
+		rows = append(rows, entry.row)
+	}
+	pk, err := t.store.indexGet(t.Table, idx.name, colKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(pk) > 0 {
+		if _, ok := seen[string(pk)]; !ok {
+			row, ok, err := t.lookupKey(ctx, pk, t.editor)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				rows = append(rows, row)
+			}
+		}
+	}
+	return &rowIter{rows: rows}, nil
+}
+
+func (t *indexedTable) restrict(ctx *sql.Context, iter sql.RowIter, ranges sql.MySQLRangeCollection) (sql.RowIter, error) {
+	idx, ok := t.lookup.Index.(*Index)
+	if !ok {
+		return iter, nil
+	}
+	filter, err := expression.NewRangeFilterExpr(ctx, idx.exprs(), ranges)
+	if err != nil {
+		_ = iter.Close(ctx)
+		return nil, err
+	}
+	if filter == nil {
+		return iter, nil
+	}
+	return &filterIter{iter: iter, filter: filter}, nil
+}
+
+func (t *indexedTable) filteredRows(ctx *sql.Context) (sql.RowIter, error) {
 	var extra []edit
 	if t.editor != nil {
 		extra = append(extra, t.editor.edits...)
@@ -457,11 +639,10 @@ func (t *indexedTable) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.
 			extra = append(extra, sess.openEditsExcept(t.ref(), t.editor)...)
 		}
 	}
-	rows, err := t.Table.visibleRows(ctx, extra...)
+	iter, err := t.streamRows(ctx, extra, keySpan{}, false)
 	if err != nil {
 		return nil, err
 	}
-	iter := sql.RowIter(&rowIter{rows: rows})
 	if t.lookup.IsEmptyRange {
 		_ = iter.Close(ctx)
 		return sql.RowsToRowIter(), nil
@@ -484,6 +665,46 @@ func (t *indexedTable) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.
 		return iter, nil
 	}
 	return &filterIter{iter: iter, filter: filter}, nil
+}
+
+type concatIter struct {
+	open []func() (sql.RowIter, error)
+	cur  sql.RowIter
+	n    int
+}
+
+func (it *concatIter) Next(ctx *sql.Context) (sql.Row, error) {
+	for {
+		if it.cur == nil {
+			if it.n >= len(it.open) {
+				return nil, io.EOF
+			}
+			next, err := it.open[it.n]()
+			it.n++
+			if err != nil {
+				return nil, err
+			}
+			it.cur = next
+		}
+		row, err := it.cur.Next(ctx)
+		if err == io.EOF {
+			if err := it.cur.Close(ctx); err != nil {
+				return nil, err
+			}
+			it.cur = nil
+			continue
+		}
+		return row, err
+	}
+}
+
+func (it *concatIter) Close(ctx *sql.Context) error {
+	if it.cur == nil {
+		return nil
+	}
+	err := it.cur.Close(ctx)
+	it.cur = nil
+	return err
 }
 
 type filterIter struct {
@@ -675,31 +896,16 @@ func (e *editor) checkUniqueIndexes(ctx *sql.Context, row sql.Row, skip sql.Row)
 	if err != nil {
 		return err
 	}
-	rows, err := e.matchingRows(ctx)
-	if err != nil {
-		return err
-	}
 	for _, idx := range indexes {
-		if sql.IndexConstraint(idx.Constraint) != sql.IndexConstraint_Unique {
+		if !indexIsUnique(idx) || !indexMaintained(idx) {
 			continue
 		}
-		for _, existing := range rows {
-			if skip != nil {
-				same, err := rowsEqual(ctx, e.meta.schema, existing.row, skip)
-				if err != nil {
-					return err
-				}
-				if same {
-					continue
-				}
-			}
-			conflict, err := indexRowsConflict(ctx, e.meta.schema, idx, existing.row, row)
-			if err != nil {
-				return err
-			}
-			if conflict {
-				return sql.NewUniqueKeyErr(idx.Name, false, existing.row)
-			}
+		hit, existing, err := e.uniqueHit(ctx, idx, row, skip)
+		if err != nil {
+			return err
+		}
+		if hit {
+			return sql.NewUniqueKeyErr(idx.Name, false, existing)
 		}
 	}
 	return nil
@@ -873,26 +1079,123 @@ func (t *Table) database() *Database {
 
 // RowCount implements sql.StatisticsTable. The count includes uncommitted edits.
 func (t *Table) RowCount(ctx *sql.Context) (uint64, bool, error) {
-	rows, err := t.visibleRows(ctx)
+	base, err := t.stat(ctx, keyRowCount)
 	if err != nil {
 		return 0, false, err
 	}
-	return uint64(len(rows)), true, nil
+	delta, _, err := t.pendingDelta(ctx, t.editsFor(ctx, nil, nil))
+	if err != nil {
+		return 0, false, err
+	}
+	return addUint(base, delta), true, nil
 }
 
 // DataLength implements sql.StatisticsTable.
 func (t *Table) DataLength(ctx *sql.Context) (uint64, error) {
-	rows, err := t.visibleRows(ctx)
+	base, err := t.stat(ctx, keyDataBytes)
 	if err != nil {
 		return 0, err
 	}
-	var n uint64
-	for _, row := range rows {
-		raw, err := encodeRow(ctx, row)
-		if err != nil {
-			return 0, err
-		}
-		n += uint64(len(raw))
+	_, delta, err := t.pendingDelta(ctx, t.editsFor(ctx, nil, nil))
+	if err != nil {
+		return 0, err
 	}
-	return n, nil
+	return addUint(base, delta), nil
+}
+
+func (t *Table) stat(ctx *sql.Context, key []byte) (uint64, error) {
+	var value uint64
+	var ok bool
+	err := t.store.view(func(tx *kvTx) error {
+		bucket := tableBucket(tx, t.dbName, t.name)
+		if bucket == nil {
+			return sql.ErrTableNotFound.New(t.name)
+		}
+		value, ok = getUint64(bucket, key)
+		if ok {
+			return nil
+		}
+		rows := bucket.Bucket(bucketRows)
+		count, nbytes, err := countRows(rows)
+		if err != nil {
+			return err
+		}
+		if bytesEqual(key, keyRowCount) {
+			value = count
+		} else {
+			value = nbytes
+		}
+		return nil
+	})
+	if err != nil || ok {
+		return value, err
+	}
+	// Remember the count so the next read is a point get. Writers are serialized.
+	err = t.store.update(func(tx *kvTx) error {
+		bucket := tableBucket(tx, t.dbName, t.name)
+		if bucket == nil {
+			return sql.ErrTableNotFound.New(t.name)
+		}
+		if _, exists := getUint64(bucket, key); exists {
+			return nil
+		}
+		rows := bucket.Bucket(bucketRows)
+		count, nbytes, err := countRows(rows)
+		if err != nil {
+			return err
+		}
+		if err := putUint64(bucket, keyRowCount, count); err != nil {
+			return err
+		}
+		return putUint64(bucket, keyDataBytes, nbytes)
+	})
+	return value, err
+}
+
+func (t *Table) pendingDelta(ctx *sql.Context, edits []edit) (int64, int64, error) {
+	overlay := buildOverlay(edits)
+	if len(overlay) == 0 {
+		return 0, 0, nil
+	}
+	var count, nbytes int64
+	err := t.store.view(func(tx *kvTx) error {
+		rows := rowsBucket(tx, t.dbName, t.name)
+		if rows == nil {
+			return sql.ErrTableNotFound.New(t.name)
+		}
+		for _, entry := range overlay {
+			raw := rows.GetRaw(entry.key)
+			onDisk := len(raw) > 0
+			if entry.tomb {
+				if onDisk {
+					count--
+					nbytes -= int64(len(raw))
+				}
+				continue
+			}
+			encoded, err := encodeRow(ctx, t.meta.schema, entry.row)
+			if err != nil {
+				return err
+			}
+			if onDisk {
+				nbytes += int64(len(encoded)) - int64(len(raw))
+				continue
+			}
+			count++
+			nbytes += int64(len(encoded))
+		}
+		return nil
+	})
+	return count, nbytes, err
+}
+
+func addUint(base uint64, delta int64) uint64 {
+	if delta >= 0 {
+		return base + uint64(delta)
+	}
+	sub := uint64(-delta)
+	if sub > base {
+		return 0
+	}
+	return base - sub
 }

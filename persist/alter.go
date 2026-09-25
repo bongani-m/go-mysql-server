@@ -132,13 +132,15 @@ func (t *Table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 		}
 		rows[i] = next
 	}
-	if err := t.commitSchema(ctx, schema, rows); err != nil {
-		return err
-	}
+	// Rename the index definitions before the rows are rewritten. writeSchema
+	// skips an index whose column is no longer in the schema, which drops the
+	// entries for the name this column is about to leave behind.
 	if !strings.EqualFold(columnName, column.Name) {
-		return t.renameIndexColumn(columnName, column.Name)
+		if err := t.renameIndexColumn(columnName, column.Name); err != nil {
+			return err
+		}
 	}
-	return nil
+	return t.commitSchema(ctx, schema, rows)
 }
 
 // CreatePrimaryKey implements sql.PrimaryKeyAlterableTable.
@@ -173,7 +175,7 @@ func (t *Table) CreatePrimaryKey(ctx *sql.Context, columns []sql.IndexColumn) er
 				return sql.ErrInsertIntoNonNullableProvidedNull.New(schema[ord].Name)
 			}
 		}
-		key, err := primaryKey(pk, row)
+		key, err := primaryKey(ctx, schema, pk, row)
 		if err != nil {
 			return err
 		}
@@ -240,6 +242,9 @@ func (t *Table) writeSchema(ctx *sql.Context, schema sql.Schema, pk []int, rows 
 		if err := bucket.Put(keySchema, rawSchema); err != nil {
 			return err
 		}
+		if err := clearIndexData(bucket); err != nil {
+			return err
+		}
 		if err := bucket.DeleteBucket(bucketRows); err != nil {
 			return err
 		}
@@ -247,8 +252,14 @@ func (t *Table) writeSchema(ctx *sql.Context, schema sql.Schema, pk []int, rows 
 		if err != nil {
 			return err
 		}
+		indexes, err := indexesIn(bucket)
+		if err != nil {
+			return err
+		}
+		var nbytes uint64
+		written := make([]storedRow, 0, len(rows))
 		for _, row := range rows {
-			encoded, err := encodeRow(ctx, row)
+			encoded, err := encodeRow(ctx, schema, row)
 			if err != nil {
 				return err
 			}
@@ -260,16 +271,45 @@ func (t *Table) writeSchema(ctx *sql.Context, schema sql.Schema, pk []int, rows 
 				}
 				key = sequenceKey(seq)
 			} else {
-				key, err = primaryKey(pk, row)
+				key, err = primaryKey(ctx, schema, pk, row)
 				if err != nil {
 					return err
 				}
 			}
-			if err := rowsBucket.Put(key, encoded); err != nil {
+			if err := rowsBucket.PutRaw(key, encoded); err != nil {
+				return err
+			}
+			written = append(written, storedRow{key: key, row: row})
+			nbytes += uint64(len(encoded))
+		}
+		for _, row := range written {
+			kept := indexes[:0:0]
+			for _, idx := range indexes {
+				if !indexMaintained(idx) {
+					continue
+				}
+				ok := true
+				for _, name := range idx.Columns {
+					if columnOrdinal(schema, name) < 0 {
+						ok = false
+						break
+					}
+				}
+				if ok {
+					kept = append(kept, idx)
+				}
+			}
+			if err := putIndexEntries(ctx, bucket, schema, kept, row.row, row.key); err != nil {
 				return err
 			}
 		}
-		return nil
+		if err := putUint64(bucket, keyRowCount, uint64(len(rows))); err != nil {
+			return err
+		}
+		if err := putUint64(bucket, keyDataBytes, nbytes); err != nil {
+			return err
+		}
+		return putFormat(bucket)
 	})
 	if err != nil {
 		return err

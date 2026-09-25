@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -284,7 +285,36 @@ func parseSQLType(typeName string) (sql.Type, error) {
 	return types.ColumnTypeToType(&parsedType)
 }
 
-func encodeRow(ctx context.Context, row sql.Row) ([]byte, error) {
+// rowFormatBinary is the first byte of a compact row. A JSON row from before
+// that format starts with '['.
+const rowFormatBinary byte = 1
+
+func encodeRow(ctx context.Context, schema sql.Schema, row sql.Row) ([]byte, error) {
+	if schema != nil && len(schema) != len(row) {
+		return nil, fmt.Errorf("persist: row has %d values for %d columns", len(row), len(schema))
+	}
+	n := len(row)
+	bitmap := make([]byte, (n+7)/8)
+	var payloads []byte
+	for i, value := range row {
+		if value == nil {
+			bitmap[i/8] |= 1 << (uint(i) % 8)
+			continue
+		}
+		payload, err := encodePayload(ctx, value)
+		if err != nil {
+			return nil, err
+		}
+		payloads = append(payloads, payload...)
+	}
+	buf := make([]byte, 0, 1+len(bitmap)+len(payloads))
+	buf = append(buf, rowFormatBinary)
+	buf = append(buf, bitmap...)
+	buf = append(buf, payloads...)
+	return buf, nil
+}
+
+func encodeRowJSON(ctx context.Context, row sql.Row) ([]byte, error) {
 	cells := make([]cell, len(row))
 	for i, value := range row {
 		encoded, err := encodeValue(ctx, value)
@@ -297,6 +327,41 @@ func encodeRow(ctx context.Context, row sql.Row) ([]byte, error) {
 }
 
 func decodeRow(ctx context.Context, schema sql.Schema, raw []byte) (sql.Row, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("persist: row is empty")
+	}
+	if raw[0] == '[' {
+		return decodeRowJSON(ctx, schema, raw)
+	}
+	if raw[0] != rowFormatBinary {
+		return nil, fmt.Errorf("persist: row format %d", raw[0])
+	}
+	n := len(schema)
+	bitmapLen := (n + 7) / 8
+	if len(raw) < 1+bitmapLen {
+		return nil, fmt.Errorf("persist: row is shorter than its null bitmap")
+	}
+	bitmap := raw[1 : 1+bitmapLen]
+	rest := raw[1+bitmapLen:]
+	row := make(sql.Row, n)
+	for i := 0; i < n; i++ {
+		if bitmap[i/8]&(1<<(uint(i)%8)) != 0 {
+			continue
+		}
+		value, read, err := decodePayload(ctx, schema[i].Type, rest)
+		if err != nil {
+			return nil, fmt.Errorf("persist: column %s: %w", schema[i].Name, err)
+		}
+		row[i] = value
+		rest = rest[read:]
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("persist: row has %d trailing bytes", len(rest))
+	}
+	return row, nil
+}
+
+func decodeRowJSON(ctx context.Context, schema sql.Schema, raw []byte) (sql.Row, error) {
 	var cells []cell
 	if err := json.Unmarshal(raw, &cells); err != nil {
 		return nil, fmt.Errorf("persist: row: %w", err)
@@ -313,6 +378,151 @@ func decodeRow(ctx context.Context, schema sql.Schema, raw []byte) (sql.Row, err
 		row[i] = value
 	}
 	return row, nil
+}
+
+func encodePayload(ctx context.Context, value interface{}) ([]byte, error) {
+	encoded, err := encodeValue(ctx, value)
+	if err != nil {
+		return nil, err
+	}
+	if encoded.Null {
+		return nil, fmt.Errorf("persist: null payload")
+	}
+	body, err := payloadBody(encoded)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 0, 1+len(body))
+	buf = append(buf, encoded.Kind[0])
+	buf = append(buf, body...)
+	return buf, nil
+}
+
+func payloadBody(encoded cell) ([]byte, error) {
+	switch encoded.Kind {
+	case "i":
+		n, err := strconv.ParseInt(encoded.Str, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(n))
+		return buf[:], nil
+	case "u":
+		n, err := strconv.ParseUint(encoded.Str, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], n)
+		return buf[:], nil
+	case "f":
+		n, err := strconv.ParseFloat(encoded.Str, 64)
+		if err != nil {
+			return nil, err
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], math.Float64bits(n))
+		return buf[:], nil
+	case "t":
+		parsed, err := decodeTime(encoded.Str)
+		if err != nil {
+			return nil, err
+		}
+		return timePayload(parsed), nil
+	case "s", "d", "j", "J", "z":
+		return lenPrefixed([]byte(encoded.Str)), nil
+	case "y", "g":
+		raw, err := base64.StdEncoding.DecodeString(encoded.Str)
+		if err != nil {
+			return nil, err
+		}
+		return lenPrefixed(raw), nil
+	default:
+		return nil, fmt.Errorf("persist: cannot encode kind %q", encoded.Kind)
+	}
+}
+
+func timePayload(v time.Time) []byte {
+	u := v.UTC()
+	var buf [13]byte
+	binary.BigEndian.PutUint32(buf[0:4], uint32(int32(u.Year())))
+	buf[4] = byte(u.Month())
+	buf[5] = byte(u.Day())
+	buf[6] = byte(u.Hour())
+	buf[7] = byte(u.Minute())
+	buf[8] = byte(u.Second())
+	binary.BigEndian.PutUint32(buf[9:], uint32(u.Nanosecond()))
+	return buf[:]
+}
+
+func lenPrefixed(b []byte) []byte {
+	var n [binary.MaxVarintLen64]byte
+	nn := binary.PutUvarint(n[:], uint64(len(b)))
+	buf := make([]byte, 0, nn+len(b))
+	buf = append(buf, n[:nn]...)
+	buf = append(buf, b...)
+	return buf
+}
+
+func decodePayload(ctx context.Context, typ sql.Type, raw []byte) (interface{}, int, error) {
+	if len(raw) == 0 {
+		return nil, 0, fmt.Errorf("missing payload")
+	}
+	kind := string(raw[0:1])
+	body := raw[1:]
+	var encoded cell
+	var read int
+	switch kind {
+	case "i":
+		if len(body) < 8 {
+			return nil, 0, fmt.Errorf("short integer")
+		}
+		encoded = cell{Kind: "i", Str: strconv.FormatInt(int64(binary.BigEndian.Uint64(body[:8])), 10)}
+		read = 9
+	case "u":
+		if len(body) < 8 {
+			return nil, 0, fmt.Errorf("short integer")
+		}
+		encoded = cell{Kind: "u", Str: strconv.FormatUint(binary.BigEndian.Uint64(body[:8]), 10)}
+		read = 9
+	case "f":
+		if len(body) < 8 {
+			return nil, 0, fmt.Errorf("short float")
+		}
+		encoded = cell{Kind: "f", Str: strconv.FormatFloat(math.Float64frombits(binary.BigEndian.Uint64(body[:8])), 'g', -1, 64)}
+		read = 9
+	case "t":
+		if len(body) < 13 {
+			return nil, 0, fmt.Errorf("short time")
+		}
+		encoded = cell{Kind: "t", Str: encodeTime(timeFromPayload(body[:13]))}
+		read = 14
+	case "s", "d", "j", "J", "z", "y", "g":
+		n, k := binary.Uvarint(body)
+		if k <= 0 || uint64(k)+n > uint64(len(body)) {
+			return nil, 0, fmt.Errorf("short bytes")
+		}
+		payload := body[k : k+int(n)]
+		if kind == "y" || kind == "g" {
+			encoded = cell{Kind: kind, Str: base64.StdEncoding.EncodeToString(payload)}
+		} else {
+			encoded = cell{Kind: kind, Str: string(payload)}
+		}
+		read = 1 + k + int(n)
+	default:
+		return nil, 0, fmt.Errorf("unknown value kind %q", kind)
+	}
+	value, err := decodeValue(ctx, typ, encoded)
+	if err != nil {
+		return nil, 0, err
+	}
+	return value, read, nil
+}
+
+func timeFromPayload(b []byte) time.Time {
+	year := int32(binary.BigEndian.Uint32(b[0:4]))
+	return time.Date(int(year), time.Month(b[4]), int(b[5]), int(b[6]), int(b[7]), int(b[8]), int(binary.BigEndian.Uint32(b[9:13])), time.UTC)
 }
 
 func encodeValue(ctx context.Context, value interface{}) (cell, error) {
@@ -449,76 +659,6 @@ func narrowForType(typ sql.Type, value interface{}) interface{} {
 	default:
 		return value
 	}
-}
-
-// primaryKey builds the storage key for a row that has a primary key.
-// Each part is length-prefixed so composite keys cannot run together.
-func primaryKey(ordinals []int, row sql.Row) ([]byte, error) {
-	var buf []byte
-	for _, ord := range ordinals {
-		if ord < 0 || ord >= len(row) {
-			return nil, fmt.Errorf("persist: primary key ordinal %d is outside the row", ord)
-		}
-		part := encodeKeyPart(row[ord])
-		var n [4]byte
-		binary.BigEndian.PutUint32(n[:], uint32(len(part)))
-		buf = append(buf, n[:]...)
-		buf = append(buf, part...)
-	}
-	return buf, nil
-}
-
-func encodeKeyPart(value interface{}) []byte {
-	if value == nil {
-		return []byte{0}
-	}
-	var payload []byte
-	switch v := value.(type) {
-	case string:
-		payload = []byte(v)
-	case []byte:
-		payload = v
-	case bool:
-		if v {
-			payload = []byte{1}
-		} else {
-			payload = []byte{0}
-		}
-	case int:
-		payload = strconv.AppendInt(nil, int64(v), 10)
-	case int8:
-		payload = strconv.AppendInt(nil, int64(v), 10)
-	case int16:
-		payload = strconv.AppendInt(nil, int64(v), 10)
-	case int32:
-		payload = strconv.AppendInt(nil, int64(v), 10)
-	case int64:
-		payload = strconv.AppendInt(nil, v, 10)
-	case uint:
-		payload = strconv.AppendUint(nil, uint64(v), 10)
-	case uint8:
-		payload = strconv.AppendUint(nil, uint64(v), 10)
-	case uint16:
-		payload = strconv.AppendUint(nil, uint64(v), 10)
-	case uint32:
-		payload = strconv.AppendUint(nil, uint64(v), 10)
-	case uint64:
-		payload = strconv.AppendUint(nil, v, 10)
-	case float32:
-		payload = strconv.AppendFloat(nil, float64(v), 'g', -1, 32)
-	case float64:
-		payload = strconv.AppendFloat(nil, v, 'g', -1, 64)
-	case time.Time:
-		payload = []byte(v.UTC().Format(time.RFC3339Nano))
-	case *apd.Decimal:
-		payload = []byte(v.String())
-	default:
-		payload = []byte(fmt.Sprint(v))
-	}
-	out := make([]byte, 1+len(payload))
-	out[0] = 1
-	copy(out[1:], payload)
-	return out
 }
 
 func sequenceKey(seq uint64) []byte {
