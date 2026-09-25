@@ -234,7 +234,7 @@ func (t *Table) writeSchema(ctx *sql.Context, schema sql.Schema, pk []int, rows 
 	if err != nil {
 		return err
 	}
-	err = t.store.update(func(tx *kvTx) error {
+	err = t.store.updateQuery(ctx, func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
 			return sql.ErrTableNotFound.New(t.name)

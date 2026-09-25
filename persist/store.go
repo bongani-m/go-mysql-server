@@ -42,9 +42,13 @@ const formatCurrent uint16 = 1
 
 // Store is a go-mysql-server database provider backed by one Badger directory.
 type Store struct {
-	db   *badger.DB
-	path string
-	mu   sync.Mutex
+	db         *badger.DB
+	path       string
+	mu         sync.Mutex
+	dbMu       sync.RWMutex
+	syncWrites bool
+	cluster    *cluster
+	bin        *binlog
 }
 
 var _ sql.DatabaseProvider = (*Store)(nil)
@@ -66,15 +70,33 @@ func Open(path string) (*Store, error) {
 
 // OpenWithOptions opens or creates the Badger directory at path.
 func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
-	db, err := openBadger(path, !opts.BulkLoad)
+	syncWrites := !opts.BulkLoad
+	db, err := openBadger(path, syncWrites)
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db, path: path}, nil
+	return &Store{db: db, path: path, syncWrites: syncWrites}, nil
 }
 
-// Close releases the file lock.
+// badgerDB returns the open database. A snapshot restore swaps it under dbMu.
+func (s *Store) badgerDB() *badger.DB {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.db
+}
+
+// Close releases the file lock. A cluster node leaves the Raft group first.
 func (s *Store) Close() error {
+	if s.cluster != nil {
+		if err := s.cluster.shutdown(); err != nil {
+			return err
+		}
+	}
+	if s.bin != nil {
+		s.bin.close()
+	}
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
 	return s.db.Close()
 }
 
@@ -134,7 +156,7 @@ func (s *Store) CreateDatabase(ctx *sql.Context, name string) error {
 	if name == "" {
 		return fmt.Errorf("persist: database name is empty")
 	}
-	return s.update(func(tx *kvTx) error {
+	return s.updateQuery(ctx, func(tx *kvTx) error {
 		root, err := tx.CreateBucketIfNotExists(bucketDatabases)
 		if err != nil {
 			return err
@@ -162,7 +184,7 @@ func (s *Store) CreateDatabase(ctx *sql.Context, name string) error {
 
 // DropDatabase implements sql.MutableDatabaseProvider.
 func (s *Store) DropDatabase(ctx *sql.Context, name string) error {
-	return s.update(func(tx *kvTx) error {
+	return s.updateQuery(ctx, func(tx *kvTx) error {
 		root := tx.Bucket(bucketDatabases)
 		if root == nil || root.Bucket(bucketKey(name)) == nil {
 			return sql.ErrDatabaseNotFound.New(name)
@@ -247,7 +269,7 @@ func (d *Database) CreateTable(ctx *sql.Context, name string, schema sql.Primary
 	if err != nil {
 		return err
 	}
-	return d.store.update(func(tx *kvTx) error {
+	return d.store.updateQuery(ctx, func(tx *kvTx) error {
 		tables := tablesBucket(tx, d.name)
 		if tables == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -358,7 +380,7 @@ func copyBucket(src, dst *kvBucket) error {
 
 // DropTable implements sql.TableDropper.
 func (d *Database) DropTable(ctx *sql.Context, name string) error {
-	return d.store.update(func(tx *kvTx) error {
+	return d.store.updateQuery(ctx, func(tx *kvTx) error {
 		tables := tablesBucket(tx, d.name)
 		if tables == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -455,15 +477,15 @@ func (s *Store) indexGet(t *Table, indexName string, key []byte) ([]byte, error)
 	return val, nil
 }
 
-func (s *Store) apply(t *Table, edits []edit) error {
-	return s.applyAll(map[tableRef][]edit{t.ref(): edits})
+func (s *Store) apply(t *Table, edits []edit, statement string) error {
+	return s.applyAll(map[tableRef][]edit{t.ref(): edits}, statement)
 }
 
-func (s *Store) applyAll(pending map[tableRef][]edit) error {
+func (s *Store) applyAll(pending map[tableRef][]edit, statement string) error {
 	if len(pending) == 0 {
 		return nil
 	}
-	return s.update(func(tx *kvTx) error {
+	return s.commit(statement, func(tx *kvTx) error {
 		for ref, edits := range pending {
 			if err := applyEdits(tx, ref, edits); err != nil {
 				return err
@@ -482,7 +504,7 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 	if rows == nil {
 		return sql.ErrTableNotFound.New(ref.name)
 	}
-	schemaRaw := bucket.Get(keySchema)
+	schemaRaw := append([]byte(nil), bucket.Get(keySchema)...)
 	meta, err := decodeSchema(schemaRaw, ref.db, ref.name)
 	if err != nil {
 		return err
@@ -517,6 +539,13 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 			if err := rows.DeleteRaw(ed.key); err != nil {
 				return err
 			}
+			tx.noteRow(rowChange{
+				Database: ref.db,
+				Table:    ref.name,
+				Schema:   schemaRaw,
+				Op:       int(opDelete),
+				Before:   old,
+			})
 			count--
 			nbytes -= uint64(len(old))
 		case opInsert:
@@ -532,6 +561,13 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, ed.row, ed.key); err != nil {
 				return err
 			}
+			tx.noteRow(rowChange{
+				Database: ref.db,
+				Table:    ref.name,
+				Schema:   schemaRaw,
+				Op:       int(opInsert),
+				After:    ed.raw,
+			})
 			count++
 			nbytes += uint64(len(ed.raw))
 		case opUpdate:
@@ -565,6 +601,14 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, ed.row, ed.key); err != nil {
 				return err
 			}
+			tx.noteRow(rowChange{
+				Database: ref.db,
+				Table:    ref.name,
+				Schema:   schemaRaw,
+				Op:       int(opUpdate),
+				Before:   old,
+				After:    ed.raw,
+			})
 			count++
 			nbytes += uint64(len(ed.raw))
 		default:

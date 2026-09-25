@@ -9,6 +9,8 @@ import (
 	"os"
 
 	"github.com/dgraph-io/badger/v4"
+
+	"github.com/dolthub/go-mysql-server/sql"
 )
 
 // rawMark prefixes row and index keys stored in key order. Ten 0xFF bytes
@@ -42,7 +44,7 @@ func openBadger(path string, syncWrites bool) (*badger.DB, error) {
 
 // view runs fn in a read-only transaction.
 func (s *Store) view(fn func(tx *kvTx) error) error {
-	return s.db.View(func(txn *badger.Txn) error {
+	return s.badgerDB().View(func(txn *badger.Txn) error {
 		return fn(&kvTx{txn: txn})
 	})
 }
@@ -51,17 +53,32 @@ func (s *Store) view(fn func(tx *kvTx) error) error {
 // does not retry a conflicting commit, and this store read-modify-writes
 // sequences and JSON blobs the way a single bbolt writer did.
 func (s *Store) update(fn func(tx *kvTx) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.db.Update(func(txn *badger.Txn) error {
-		return fn(&kvTx{txn: txn})
-	})
+	return s.commit("", fn)
+}
+
+// updateQuery is update, and it keeps the statement text for a catalog-only
+// binlog event when this store is replicating.
+func (s *Store) updateQuery(ctx *sql.Context, fn func(tx *kvTx) error) error {
+	statement := ""
+	if ctx != nil {
+		statement = ctx.Query()
+	}
+	return s.commit(statement, fn)
+}
+
+// kvTxn is the Badger transaction surface this store uses. A recording
+// transaction wraps it while a cluster commit is being built.
+type kvTxn interface {
+	Set(key, val []byte) error
+	Delete(key []byte) error
+	Get(key []byte) (*badger.Item, error)
+	NewIterator(opt badger.IteratorOptions) *badger.Iterator
 }
 
 // kvTx is one Badger transaction. Nested buckets are prefixes, not a separate
 // type in the database.
 type kvTx struct {
-	txn *badger.Txn
+	txn kvTxn
 }
 
 func (tx *kvTx) root() *kvBucket {

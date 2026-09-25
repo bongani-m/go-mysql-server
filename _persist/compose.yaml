@@ -1,0 +1,82 @@
+# Three-node Raft cluster for the persistent MySQL server.
+#
+#	docker compose -f _persist/compose.yaml up --build
+#
+# n1 bootstraps the group. n2 and n3 join it. MySQL is published on 3306, 3307,
+# and 3308. Writes succeed on the leader; the other nodes serve local reads.
+# Raft stays on the compose network.
+
+name: gms-persist
+
+x-build: &build
+  context: ..
+  dockerfile: _persist/Dockerfile
+  additional_contexts:
+    badger: ../../badger
+
+services:
+  n1:
+    build: *build
+    image: gms-persist
+    hostname: n1
+    restart: unless-stopped
+    depends_on:
+      - n2
+      - n3
+    environment:
+      GMS_NODE_ID: n1
+      GMS_RAFT_ADDR: 0.0.0.0:7001
+      GMS_RAFT_ADVERTISE: n1:7001
+      GMS_RAFT_BOOTSTRAP: "1"
+      GMS_SERVER_UUID: 11111111-1111-1111-1111-111111111111
+      GMS_RAFT_PEERS: n1=n1:7001,n2=n2:7001,n3=n3:7001
+      GMS_RAFT_DIR: /data/raft
+      GMS_DATA: /data/gms
+      GMS_MYSQL_HOST: 0.0.0.0
+    ports:
+      - "3306:3306"
+    volumes:
+      - n1:/data
+
+  n2:
+    build: *build
+    image: gms-persist
+    hostname: n2
+    restart: unless-stopped
+    environment:
+      GMS_NODE_ID: n2
+      GMS_RAFT_ADDR: 0.0.0.0:7001
+      GMS_RAFT_ADVERTISE: n2:7001
+      GMS_SERVER_UUID: 11111111-1111-1111-1111-111111111111
+      GMS_RAFT_PEERS: n1=n1:7001,n2=n2:7001,n3=n3:7001
+      GMS_RAFT_DIR: /data/raft
+      GMS_DATA: /data/gms
+      GMS_MYSQL_HOST: 0.0.0.0
+    ports:
+      - "3307:3306"
+    volumes:
+      - n2:/data
+
+  n3:
+    build: *build
+    image: gms-persist
+    hostname: n3
+    restart: unless-stopped
+    environment:
+      GMS_NODE_ID: n3
+      GMS_RAFT_ADDR: 0.0.0.0:7001
+      GMS_RAFT_ADVERTISE: n3:7001
+      GMS_SERVER_UUID: 11111111-1111-1111-1111-111111111111
+      GMS_RAFT_PEERS: n1=n1:7001,n2=n2:7001,n3=n3:7001
+      GMS_RAFT_DIR: /data/raft
+      GMS_DATA: /data/gms
+      GMS_MYSQL_HOST: 0.0.0.0
+    ports:
+      - "3308:3306"
+    volumes:
+      - n3:/data
+
+volumes:
+  n1:
+  n2:
+  n3:

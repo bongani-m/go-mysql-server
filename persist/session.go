@@ -77,7 +77,11 @@ func (s *Session) CommitTransaction(ctx *sql.Context, tx sql.Transaction) error 
 	if len(pending) == 0 {
 		return nil
 	}
-	if err := s.store.applyAll(pending); err != nil {
+	statement := ""
+	if ctx != nil {
+		statement = ctx.Query()
+	}
+	if err := s.store.applyAll(pending, statement); err != nil {
 		s.mu.Lock()
 		s.restore(pending)
 		s.mu.Unlock()

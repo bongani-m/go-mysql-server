@@ -49,7 +49,7 @@ func (d *Database) SetCollation(ctx *sql.Context, collation sql.CollationID) err
 	if collation == sql.Collation_Unspecified {
 		collation = sql.Collation_Default
 	}
-	return d.store.update(func(tx *kvTx) error {
+	return d.store.updateQuery(ctx, func(tx *kvTx) error {
 		bucket := databaseBucket(tx, d.name)
 		if bucket == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)

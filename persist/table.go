@@ -252,7 +252,11 @@ func (e *editor) Close(ctx *sql.Context) error {
 			return nil
 		}
 	}
-	return e.table.store.apply(e.table, edits)
+	statement := ""
+	if ctx != nil {
+		statement = ctx.Query()
+	}
+	return e.table.store.apply(e.table, edits, statement)
 }
 
 func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {

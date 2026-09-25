@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dolthub/vitess/go/vt/proto/query"
@@ -24,6 +26,28 @@ import (
 //
 // The HTTP API in _example_webapp connects to this server unchanged.
 // Set GMS_DATA to choose the directory. The default is data/gms.
+//
+// Cluster mode is off unless GMS_RAFT_ADDR is set. One node bootstraps:
+//
+//	GMS_NODE_ID=n1 GMS_RAFT_ADDR=127.0.0.1:7001 GMS_RAFT_BOOTSTRAP=1 \
+//	  GMS_SERVER_UUID=11111111-1111-1111-1111-111111111111 \
+//	  GMS_RAFT_PEERS=n1=127.0.0.1:7001,n2=127.0.0.1:7002 go run ./_persist
+//
+// Other nodes use the same GMS_SERVER_UUID and GMS_RAFT_PEERS, their own
+// GMS_NODE_ID and GMS_RAFT_ADDR, and leave GMS_RAFT_BOOTSTRAP unset. Start
+// them with the bootstrap node so the group can elect a leader.
+//
+//	docker compose -f _persist/compose.yaml up --build
+//
+// Then, from the host:
+//
+//	mysql --host=127.0.0.1 --port=3306 --user=root mydb --execute="SELECT name, email FROM mytable;"
+//	mysql --host=127.0.0.1 --port=3307 --user=root mydb --execute="SELECT name, email FROM mytable;"
+//
+// GMS_MYSQL_HOST defaults to localhost. Set it to 0.0.0.0 to accept connections
+// from other containers and from published host ports. GMS_MYSQL_PORT overrides
+// 3306. GMS_RAFT_ADVERTISE is the address other nodes dial; GMS_RAFT_ADDR is
+// the address this process binds.
 
 var (
 	dbName    = "mydb"
@@ -33,22 +57,37 @@ var (
 )
 
 func main() {
+	if host := os.Getenv("GMS_MYSQL_HOST"); host != "" {
+		address = host
+	}
+	if raw := os.Getenv("GMS_MYSQL_PORT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 65535 {
+			log.Fatalf("GMS_MYSQL_PORT: %q", raw)
+		}
+		port = parsed
+	}
 	path := os.Getenv("GMS_DATA")
 	if path == "" {
 		path = "data/gms"
 	}
-	store, err := persist.Open(path)
+	store, err := openStore(path)
 	if err != nil {
 		log.Fatalf("open %s: %v", path, err)
 	}
 	defer store.Close()
 
 	ctx := sql.NewContext(context.Background())
-	if err := ensureExample(ctx, store); err != nil {
-		log.Fatalf("seed %s.%s: %v", dbName, tableName, err)
+	if !store.Replicating() || store.IsLeader() {
+		if err := ensureExample(ctx, store); err != nil {
+			log.Fatalf("seed %s.%s: %v", dbName, tableName, err)
+		}
 	}
 
 	engine := sqle.NewDefault(store)
+	if store.Replicating() {
+		engine.Analyzer.Catalog.BinlogPrimaryController = store
+	}
 	config := server.Config{
 		Protocol: "tcp",
 		Address:  fmt.Sprintf("%s:%d", address, port),
@@ -61,6 +100,41 @@ func main() {
 	if err = s.Start(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func openStore(path string) (*persist.Store, error) {
+	addr := os.Getenv("GMS_RAFT_ADDR")
+	if addr == "" {
+		return persist.Open(path)
+	}
+	id := os.Getenv("GMS_NODE_ID")
+	if id == "" {
+		id = addr
+	}
+	peers, err := persist.ParsePeers(os.Getenv("GMS_RAFT_PEERS"))
+	if err != nil {
+		return nil, err
+	}
+	bootstrap := os.Getenv("GMS_RAFT_BOOTSTRAP") == "1" || strings.EqualFold(os.Getenv("GMS_RAFT_BOOTSTRAP"), "true")
+	store, err := persist.OpenCluster(path, persist.ClusterOptions{
+		ID:         id,
+		Bind:       addr,
+		Advertise:  os.Getenv("GMS_RAFT_ADVERTISE"),
+		RaftDir:    os.Getenv("GMS_RAFT_DIR"),
+		Peers:      peers,
+		Bootstrap:  bootstrap,
+		ServerUUID: os.Getenv("GMS_SERVER_UUID"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if bootstrap {
+		if err := store.WaitReady(30 * time.Second); err != nil {
+			store.Close()
+			return nil, err
+		}
+	}
+	return store, nil
 }
 
 func ensureExample(ctx *sql.Context, store *persist.Store) error {
