@@ -9,7 +9,7 @@ default: &default
   encoding: utf8mb4
   max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
   username: <%= ENV.fetch("MYSQL_USER", "root") %>
-  password: <%= ENV["MYSQL_PASSWORD"] %>
+  password: <%= ENV.fetch("MYSQL_PASSWORD", "dev-only-change-me") %>
   host: <%= ENV.fetch("MYSQL_HOST", "127.0.0.1") %>
   database: <%= ENV.fetch("MYSQL_DB", "mydb") %>
   <%# Default trusts the _persist dev certificate. MYSQL_TLS_CA=off uses plaintext. %>

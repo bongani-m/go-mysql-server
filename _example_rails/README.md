@@ -17,7 +17,6 @@ Then:
 ```bash
 cd _example_rails
 bundle install
-MYSQL_PASSWORD=dev-only-change-me \
 bin/rails server
 ```
 
@@ -30,7 +29,7 @@ Open http://localhost:3000.
 | `MYSQL_REPLICA_N2_PORT` | `3307` |
 | `MYSQL_REPLICA_N3_PORT` | `3308` |
 | `MYSQL_USER` | `root` |
-| `MYSQL_PASSWORD` | empty |
+| `MYSQL_PASSWORD` | `dev-only-change-me` |
 | `MYSQL_TLS_CA` | `../_persist/certs/server.crt`. Set to `off` for a plaintext server. |
 | `MYSQL_DB` | `mydb` |
 

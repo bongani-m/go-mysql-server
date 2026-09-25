@@ -11,7 +11,7 @@ Start that server first, then:
 Writes use MYSQL_HOST and MYSQL_PORT (default localhost:3306). To read from
 the other nodes in ../_persist/compose.yaml:
 
-    MYSQL_PASSWORD=secret MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 python main.py
+    MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 python main.py
 
 Those nodes can lag the leader. Leave MYSQL_READ_ADDRS unset to read and
 write the same server. Connections use TLS and trust ../_persist/certs/server.crt.
@@ -313,7 +313,7 @@ def mysql_from_env() -> MySQLStore:
         primary,
         replicas,
         user=env("MYSQL_USER", "root"),
-        password=os.environ.get("MYSQL_PASSWORD", ""),
+        password=env("MYSQL_PASSWORD", "dev-only-change-me"),
         database=env("MYSQL_DB", "mydb"),
         ssl_ca=tls_ca_path(),
     )
