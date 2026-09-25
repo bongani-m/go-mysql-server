@@ -20,14 +20,14 @@
 //	curl -s localhost:8080/people?size=2
 //	curl -s 'localhost:8080/people?name=Jane'
 //
-// Writes use MYSQL_HOST and MYSQL_PORT (default localhost:3306). To read from
-// the other nodes in _persist/compose.yaml:
+// Writes use MYSQL_HOST and MYSQL_PORT (default localhost:3306). The password
+// matches the compose cluster default. To read from the other nodes:
 //
-//	MYSQL_PASSWORD=secret MYSQL_TLS_CA=../_persist/certs/server.crt \
-//	  MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 go run .
+//	MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 go run .
 //
 // Those nodes can lag the leader. Leave MYSQL_READ_ADDRS unset to read and
-// write the same server. Leave MYSQL_TLS_CA unset to connect without TLS.
+// write the same server. Connections use TLS and trust ../_persist/certs/server.crt.
+// Set MYSQL_TLS_CA to another PEM file, or to off for a plaintext server.
 package main
 
 import (
@@ -40,6 +40,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -47,10 +49,11 @@ import (
 )
 
 func main() {
-	if ca := os.Getenv("MYSQL_TLS_CA"); ca != "" {
+	if ca, ok := tlsCAPath(); ok {
 		if err := registerMySQLTLS(ca); err != nil {
 			log.Fatal(err)
 		}
+		log.Printf("MySQL TLS CA %s", ca)
 	}
 	primaryAddr := net.JoinHostPort(env("MYSQL_HOST", "localhost"), env("MYSQL_PORT", "3306"))
 	primary, err := openMySQL(primaryAddr)
@@ -101,7 +104,7 @@ func openMySQL(addr string) (*sql.DB, error) {
 func mysqlDSN(addr string) string {
 	cfg := mysql.Config{
 		User:                 env("MYSQL_USER", "root"),
-		Passwd:               os.Getenv("MYSQL_PASSWORD"),
+		Passwd:               env("MYSQL_PASSWORD", "dev-only-change-me"),
 		Net:                  "tcp",
 		Addr:                 addr,
 		DBName:               env("MYSQL_DB", "mydb"),
@@ -109,10 +112,26 @@ func mysqlDSN(addr string) string {
 		Loc:                  time.UTC,
 		AllowNativePasswords: true,
 	}
-	if os.Getenv("MYSQL_TLS_CA") != "" {
+	if _, ok := tlsCAPath(); ok {
 		cfg.TLSConfig = "gms"
 	}
 	return cfg.FormatDSN()
+}
+
+// tlsCAPath is the PEM file the client uses to verify the server.
+// The default is the dev certificate for _persist. MYSQL_TLS_CA=off skips TLS.
+func tlsCAPath() (string, bool) {
+	if ca, ok := os.LookupEnv("MYSQL_TLS_CA"); ok {
+		if ca == "" || ca == "off" {
+			return "", false
+		}
+		return ca, true
+	}
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return filepath.Join("..", "_persist", "certs", "server.crt"), true
+	}
+	return filepath.Join(filepath.Dir(file), "..", "_persist", "certs", "server.crt"), true
 }
 
 // registerMySQLTLS trusts the server certificate signed by the PEM file at caPath.

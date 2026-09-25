@@ -39,9 +39,9 @@ docker run --rm -p 3306:3306 -v gms-data:/data \
 
 `docker compose up n1` still starts `n2` and `n3`, because `n1` depends on them and every service sets `GMS_RAFT_ADDR`.
 
-## Three nodes
+## Local testing
 
-Generate a dev certificate before the first `up`. It is not committed. The names are the ones clients dial: `127.0.0.1` from the host, and `n1`, `n2`, `n3` from another container.
+Create a test certificate before the first `up`. It is not committed. The names are the ones clients dial: `127.0.0.1` from the host, the node names, and the private addresses Compose assigns.
 
 ```bash
 mkdir -p _persist/certs
@@ -50,19 +50,17 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -out _persist/certs/server.crt \
   -days 365 \
   -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,DNS:n1,DNS:n2,DNS:n3,IP:127.0.0.1"
+  -addext "subjectAltName=DNS:localhost,DNS:n1,DNS:n2,DNS:n3,IP:127.0.0.1,IP:10.116.0.2,IP:10.116.0.3,IP:10.116.0.4"
 docker compose -f _persist/compose.yaml up --build
 ```
-
-Compose sets `GMS_BOOTSTRAP_PASSWORD` to `dev-only-change-me` unless you override it. That value is used only when a node has no accounts yet. TLS is required on the published MySQL ports. Raft on port 7001 stays on the compose network and is not wrapped in TLS.
-
-`n1` bootstraps the Raft group. `n2` and `n3` join it. Writes succeed on the leader. The other nodes are read-only until one of them is elected, and they can lag. A client that writes to a follower gets the read-only error. `FLUSH BINARY LOGS` on the leader rolls every node's binlog together. Any node can stream that binlog; the GTID stream is the same after a promotion.
 
 | Node | Host port |
 |------|-----------|
 | n1   | 3306      |
 | n2   | 3307      |
 | n3   | 3308      |
+
+Check the leader, then a follower:
 
 ```bash
 mysql --host=127.0.0.1 --port=3306 --user=root --password=dev-only-change-me \
@@ -73,28 +71,36 @@ mysql --host=127.0.0.1 --port=3307 --user=root --password=dev-only-change-me \
   mydb --execute="SELECT name, email FROM mytable;"
 ```
 
-Raft stays on the compose network. Each node keeps `/data` in its own volume.
+## Three nodes
+
+Compose sets `GMS_BOOTSTRAP_PASSWORD` to `dev-only-change-me` unless you override it. That value is used only when a node has no accounts yet. TLS is required on the published MySQL ports. Each node binds Raft and MySQL to its address on the `vpc` network: `10.116.0.2`, `10.116.0.3`, and `10.116.0.4`. Raft on port 7001 is not published and is not wrapped in TLS.
+
+A volume created before those addresses still has the old Raft peer list (`n1:7001` and so on). Remove it before the first start on this plan: `docker compose -f _persist/compose.yaml down -v`.
+
+The same addresses, with host networking and a Cloud Firewall, are what a DigitalOcean deployment uses. See [droplets/README.md](droplets/README.md).
+
+`n1` bootstraps the Raft group. `n2` and `n3` join it. Writes succeed on the leader. The other nodes are read-only until one of them is elected, and they can lag. A client that writes to a follower gets the read-only error. `FLUSH BINARY LOGS` on the leader rolls every node's binlog together. Any node can stream that binlog; the GTID stream is the same after a promotion.
+
+Raft stays on `10.116.0.0/24` and is not published to the host. Each node keeps `/data` in its own volume.
 
 The example API sends writes to `n1` and reads to `n2` and `n3`:
 
 ```bash
 cd _example_webapp
-MYSQL_PASSWORD=dev-only-change-me \
-MYSQL_TLS_CA=../_persist/certs/server.crt \
 MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 \
 go run .
 ```
 
-Leave `MYSQL_READ_ADDRS` unset to use only `localhost:3306`.
+The example clients trust `_persist/certs/server.crt` unless `MYSQL_TLS_CA` is set. `MYSQL_TLS_CA=off` connects without TLS. Leave `MYSQL_READ_ADDRS` unset to use only `localhost:3306`.
 
 ## Environment
 
 | Variable | Role |
 |----------|------|
 | `GMS_DATA` | Badger directory. Default `data/gms`. |
-| `GMS_MYSQL_HOST` | MySQL bind address. Default `localhost`. Use `0.0.0.0` in containers. |
+| `GMS_MYSQL_HOST` | MySQL bind address. Default `localhost`. Use `0.0.0.0` for one published container. The three-node compose file binds each node's private address. |
 | `GMS_MYSQL_PORT` | MySQL port. Default `3306`. |
-| `GMS_RAFT_ADDR` | Turns cluster mode on and sets the Raft bind address, such as `0.0.0.0:7001`. |
+| `GMS_RAFT_ADDR` | Turns cluster mode on and sets the Raft bind address, such as `10.116.0.2:7001`. `0.0.0.0` listens on every interface. |
 | `GMS_RAFT_ADVERTISE` | Address other nodes dial. Defaults to `GMS_RAFT_ADDR`. |
 | `GMS_NODE_ID` | Raft server id. Defaults to the bind address. |
 | `GMS_RAFT_PEERS` | `id=host:port` list, comma-separated. |

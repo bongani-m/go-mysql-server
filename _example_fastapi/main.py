@@ -11,11 +11,11 @@ Start that server first, then:
 Writes use MYSQL_HOST and MYSQL_PORT (default localhost:3306). To read from
 the other nodes in ../_persist/compose.yaml:
 
-    MYSQL_PASSWORD=secret MYSQL_TLS_CA=../_persist/certs/server.crt \
-      MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 python main.py
+    MYSQL_PASSWORD=secret MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 python main.py
 
 Those nodes can lag the leader. Leave MYSQL_READ_ADDRS unset to read and
-write the same server. Leave MYSQL_TLS_CA unset to connect without TLS.
+write the same server. Connections use TLS and trust ../_persist/certs/server.crt.
+Set MYSQL_TLS_CA to another PEM file, or to off for a plaintext server.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import datetime, timezone
 
 import uvicorn
@@ -292,16 +293,29 @@ async def read_json(request: Request) -> dict:
     return body
 
 
+def tls_ca_path() -> str | None:
+    """PEM file used to verify the server. MYSQL_TLS_CA=off skips TLS."""
+    if "MYSQL_TLS_CA" in os.environ:
+        raw = os.environ["MYSQL_TLS_CA"]
+        if raw in ("", "off"):
+            return None
+        return raw
+    return str(Path(__file__).resolve().parent.parent / "_persist" / "certs" / "server.crt")
+
+
 def mysql_from_env() -> MySQLStore:
     primary = f"{env('MYSQL_HOST', 'localhost')}:{env('MYSQL_PORT', '3306')}"
     replicas = split_addrs(os.environ.get("MYSQL_READ_ADDRS", ""))
+    ca = tls_ca_path()
+    if ca:
+        log.info("MySQL TLS CA %s", ca)
     store = MySQLStore(
         primary,
         replicas,
         user=env("MYSQL_USER", "root"),
         password=os.environ.get("MYSQL_PASSWORD", ""),
         database=env("MYSQL_DB", "mydb"),
-        ssl_ca=os.environ.get("MYSQL_TLS_CA") or None,
+        ssl_ca=tls_ca_path(),
     )
     if replicas:
         log.info("MySQL writes %s, reads %s", primary, ", ".join(replicas))

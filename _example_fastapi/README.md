@@ -20,7 +20,6 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 MYSQL_PASSWORD=dev-only-change-me \
-MYSQL_TLS_CA=../_persist/certs/server.crt \
 MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 \
 python main.py
 ```
@@ -41,7 +40,7 @@ curl -s -X POST localhost:8080/people \
 | `MYSQL_READ_ADDRS` | empty (read the write server) |
 | `MYSQL_USER` | `root` |
 | `MYSQL_PASSWORD` | empty |
-| `MYSQL_TLS_CA` | empty (plaintext). PEM file for the server certificate when TLS is required. |
+| `MYSQL_TLS_CA` | `../_persist/certs/server.crt`. Set to `off` for a plaintext server. |
 | `MYSQL_DB` | `mydb` |
 | `HTTP_ADDR` | `:8080` |
 
