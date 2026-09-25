@@ -107,14 +107,15 @@ func (s *Session) CommitTransaction(ctx *sql.Context, tx sql.Transaction) error 
 	s.reads = nil
 	s.savepoints = nil
 	s.mu.Unlock()
-	if len(pending) == 0 && len(reads) == 0 {
+	gtid := sourceGTID(ctx)
+	if len(pending) == 0 && len(reads) == 0 && gtid == "" {
 		return nil
 	}
 	statement := ""
 	if ctx != nil {
 		statement = ctx.Query()
 	}
-	if err := s.store.applyAll(pending, reads, statement); err != nil {
+	if err := s.store.applyAll(pending, reads, statement, gtid); err != nil {
 		if sql.ErrLockDeadlock.Is(err) {
 			return err
 		}

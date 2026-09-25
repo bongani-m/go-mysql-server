@@ -82,3 +82,54 @@ func (f *FlushPrivileges) WithDatabase(db sql.Database) (sql.Node, error) {
 	fp.MysqlDb = db
 	return &fp, nil
 }
+
+// BinaryLogRotator rolls the binary log. Integrators that do not implement
+// it keep FLUSH BINARY LOGS as a no-op.
+type BinaryLogRotator interface {
+	RotateBinaryLog(ctx *sql.Context) error
+}
+
+// FlushBinaryLogs is FLUSH BINARY LOGS for a rotator.
+type FlushBinaryLogs struct {
+	Rotator BinaryLogRotator
+}
+
+var _ sql.Node = (*FlushBinaryLogs)(nil)
+var _ sql.ExecSourceRel = (*FlushBinaryLogs)(nil)
+var _ sql.CollationCoercible = (*FlushBinaryLogs)(nil)
+
+// NewFlushBinaryLogs returns a FLUSH BINARY LOGS node.
+func NewFlushBinaryLogs(rotator BinaryLogRotator) *FlushBinaryLogs {
+	return &FlushBinaryLogs{Rotator: rotator}
+}
+
+func (*FlushBinaryLogs) String() string { return "FLUSH BINARY LOGS" }
+
+func (*FlushBinaryLogs) Resolved() bool { return true }
+
+func (*FlushBinaryLogs) IsReadOnly() bool { return false }
+
+func (*FlushBinaryLogs) Schema(*sql.Context) sql.Schema { return nil }
+
+func (*FlushBinaryLogs) Children() []sql.Node { return nil }
+
+func (f *FlushBinaryLogs) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
+	if len(children) != 0 {
+		return nil, sql.ErrInvalidChildrenNumber.New(f, len(children), 0)
+	}
+	return f, nil
+}
+
+func (*FlushBinaryLogs) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
+	return sql.Collation_binary, 7
+}
+
+// RowIter rolls the binary log.
+func (f *FlushBinaryLogs) RowIter(ctx *sql.Context, row sql.Row) (sql.RowIter, error) {
+	if f.Rotator != nil {
+		if err := f.Rotator.RotateBinaryLog(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return sql.RowsToRowIter(), nil
+}

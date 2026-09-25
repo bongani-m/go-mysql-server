@@ -14,26 +14,28 @@ import (
 )
 
 var (
-	bucketDatabases = []byte("databases")
-	bucketTables    = []byte("tables")
-	bucketRows      = []byte("rows")
-	keyName         = []byte("name")
-	keySchema       = []byte("schema")
-	keyComment      = []byte("comment")
-	keyCollation    = []byte("collation")
-	keyViews        = []byte("views")
-	keyIndexes      = []byte("indexes")
-	keyForeignKeys  = []byte("foreignKeys")
-	keyTriggers     = []byte("triggers")
-	keyProcedures   = []byte("procedures")
-	keyEvents       = []byte("events")
-	keyAutoInc      = []byte("autoinc")
-	keyChecks       = []byte("checks")
-	keyTargetRows   = []byte("targetRowSize")
-	keyFormat       = []byte("format")
-	keyRowCount     = []byte("rowCount")
-	keyDataBytes    = []byte("dataBytes")
-	bucketIndex     = []byte("index")
+	bucketDatabases  = []byte("databases")
+	bucketTables     = []byte("tables")
+	bucketRows       = []byte("rows")
+	keyName          = []byte("name")
+	keySchema        = []byte("schema")
+	keyComment       = []byte("comment")
+	keyCollation     = []byte("collation")
+	keyViews         = []byte("views")
+	keyIndexes       = []byte("indexes")
+	keyForeignKeys   = []byte("foreignKeys")
+	keyTriggers      = []byte("triggers")
+	keyProcedures    = []byte("procedures")
+	keyEvents        = []byte("events")
+	keyAutoInc       = []byte("autoinc")
+	keyChecks        = []byte("checks")
+	keyTargetRows    = []byte("targetRowSize")
+	keyFormat        = []byte("format")
+	keyRowCount      = []byte("rowCount")
+	keyDataBytes     = []byte("dataBytes")
+	bucketIndex      = []byte("index")
+	keySourceGTID    = []byte("sourceGtid")
+	keyReplicaSource = []byte("replicaSource")
 )
 
 // formatCurrent is sortable keys plus binary rows. A missing key is the
@@ -49,6 +51,9 @@ type Store struct {
 	syncWrites bool
 	cluster    *cluster
 	bin        *binlog
+	raftDir    string
+	repl       *replicaState
+	replOnce   sync.Once
 }
 
 var _ sql.DatabaseProvider = (*Store)(nil)
@@ -87,6 +92,7 @@ func (s *Store) badgerDB() *badger.DB {
 
 // Close releases the file lock. A cluster node leaves the Raft group first.
 func (s *Store) Close() error {
+	s.stopReplica()
 	if s.cluster != nil {
 		if err := s.cluster.shutdown(); err != nil {
 			return err
@@ -487,15 +493,18 @@ func (s *Store) indexGet(t *Table, indexName string, key []byte) ([]byte, error)
 	return val, nil
 }
 
-func (s *Store) apply(t *Table, edits []edit, statement string) error {
-	return s.applyAll(map[tableRef][]edit{t.ref(): edits}, nil, statement)
+func (s *Store) apply(t *Table, edits []edit, statement, gtid string) error {
+	return s.applyAll(map[tableRef][]edit{t.ref(): edits}, nil, statement, gtid)
 }
 
-func (s *Store) applyAll(pending map[tableRef][]edit, reads []rowImage, statement string) error {
+func (s *Store) applyAll(pending map[tableRef][]edit, reads []rowImage, statement, gtid string) error {
 	if len(pending) == 0 && len(reads) == 0 {
-		return nil
+		if gtid == "" {
+			return nil
+		}
+		return s.commitGTID("", gtid, func(tx *kvTx) error { return nil })
 	}
-	return s.commit(statement, func(tx *kvTx) error {
+	return s.commitGTID(statement, gtid, func(tx *kvTx) error {
 		if err := checkReads(tx, reads); err != nil {
 			return err
 		}

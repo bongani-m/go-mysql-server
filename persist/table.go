@@ -260,7 +260,7 @@ func (e *editor) Close(ctx *sql.Context) error {
 	if ctx != nil {
 		statement = ctx.Query()
 	}
-	return e.table.store.apply(e.table, edits, statement)
+	return e.table.store.apply(e.table, edits, statement, sourceGTID(ctx))
 }
 
 func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dolthub/vitess/go/vt/proto/query"
@@ -71,7 +72,8 @@ func main() {
 	if path == "" {
 		path = "data/gms"
 	}
-	store, err := openStore(path)
+	gate := &leadershipGate{}
+	store, err := openStore(path, gate.set)
 	if err != nil {
 		log.Fatalf("open %s: %v", path, err)
 	}
@@ -87,6 +89,19 @@ func main() {
 	engine := sqle.NewDefault(store)
 	if store.Replicating() {
 		engine.Analyzer.Catalog.BinlogPrimaryController = store
+		engine.Analyzer.Catalog.BinlogReplicaController = store
+		store.SetReplicaQuery(func(ctx *sql.Context, query string) error {
+			_, iter, _, err := engine.Query(ctx, query)
+			if err != nil {
+				return err
+			}
+			_, err = sql.RowIterToRows(ctx, iter)
+			return err
+		})
+	}
+	gate.bind(engine, store.Replicating(), store.IsLeader())
+	if err := enableUpstream(store); err != nil {
+		log.Fatalf("upstream replica: %v", err)
 	}
 	config := server.Config{
 		Protocol: "tcp",
@@ -102,7 +117,31 @@ func main() {
 	}
 }
 
-func openStore(path string) (*persist.Store, error) {
+// leadershipGate turns the SQL engine read-only while this process is not
+// the Raft primary. The engine does not exist until after the store opens.
+type leadershipGate struct {
+	mu     sync.Mutex
+	engine *sqle.Engine
+}
+
+func (g *leadershipGate) set(isLeader bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.engine != nil {
+		g.engine.ReadOnly.Store(!isLeader)
+	}
+}
+
+func (g *leadershipGate) bind(engine *sqle.Engine, replicating, leader bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.engine = engine
+	if replicating {
+		engine.ReadOnly.Store(!leader)
+	}
+}
+
+func openStore(path string, onLeadership func(bool)) (*persist.Store, error) {
 	addr := os.Getenv("GMS_RAFT_ADDR")
 	if addr == "" {
 		return persist.Open(path)
@@ -116,14 +155,20 @@ func openStore(path string) (*persist.Store, error) {
 		return nil, err
 	}
 	bootstrap := os.Getenv("GMS_RAFT_BOOTSTRAP") == "1" || strings.EqualFold(os.Getenv("GMS_RAFT_BOOTSTRAP"), "true")
+	maxBytes, err := parseBinlogMax(os.Getenv("GMS_BINLOG_MAX_SIZE"))
+	if err != nil {
+		return nil, err
+	}
 	store, err := persist.OpenCluster(path, persist.ClusterOptions{
-		ID:         id,
-		Bind:       addr,
-		Advertise:  os.Getenv("GMS_RAFT_ADVERTISE"),
-		RaftDir:    os.Getenv("GMS_RAFT_DIR"),
-		Peers:      peers,
-		Bootstrap:  bootstrap,
-		ServerUUID: os.Getenv("GMS_SERVER_UUID"),
+		ID:             id,
+		Bind:           addr,
+		Advertise:      os.Getenv("GMS_RAFT_ADVERTISE"),
+		RaftDir:        os.Getenv("GMS_RAFT_DIR"),
+		Peers:          peers,
+		Bootstrap:      bootstrap,
+		ServerUUID:     os.Getenv("GMS_SERVER_UUID"),
+		BinlogMaxBytes: maxBytes,
+		OnLeadership:   onLeadership,
 	})
 	if err != nil {
 		return nil, err
@@ -135,6 +180,35 @@ func openStore(path string) (*persist.Store, error) {
 		}
 	}
 	return store, nil
+}
+
+func parseBinlogMax(raw string) (uint64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("GMS_BINLOG_MAX_SIZE: %q", raw)
+	}
+	return n, nil
+}
+
+func enableUpstream(store *persist.Store) error {
+	host := strings.TrimSpace(os.Getenv("GMS_SOURCE_HOST"))
+	if host == "" {
+		return nil
+	}
+	port := 3306
+	if raw := os.Getenv("GMS_SOURCE_PORT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 65535 {
+			return fmt.Errorf("GMS_SOURCE_PORT: %q", raw)
+		}
+		port = parsed
+	}
+	store.EnableUpstream(host, uint16(port), os.Getenv("GMS_SOURCE_USER"), os.Getenv("GMS_SOURCE_PASSWORD"))
+	return nil
 }
 
 func ensureExample(ctx *sql.Context, store *persist.Store) error {

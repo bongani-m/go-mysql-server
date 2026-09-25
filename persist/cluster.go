@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -45,6 +46,12 @@ type ClusterOptions struct {
 	Config     *raft.Config
 	// ApplyTimeout bounds how long a SQL commit waits for the Raft quorum.
 	ApplyTimeout time.Duration
+	// BinlogMaxBytes rolls the binlog after a transaction crosses this size.
+	// Zero uses the default of 1 GiB.
+	BinlogMaxBytes uint64
+	// OnLeadership runs after this node gains or loses leadership. It is
+	// called from a goroutine that is not the Raft thread.
+	OnLeadership func(isLeader bool)
 }
 
 // ParsePeers parses "id=host:port,id2=host:port". An empty string is no peers.
@@ -94,12 +101,13 @@ func OpenCluster(path string, opts ClusterOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	bin, err := openBinlog(filepath.Join(opts.RaftDir, "binlog"), opts.ServerUUID)
+	bin, err := openBinlog(filepath.Join(opts.RaftDir, "binlog"), opts.ServerUUID, opts.BinlogMaxBytes)
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
 	store.bin = bin
+	store.raftDir = opts.RaftDir
 
 	c, err := startCluster(store, opts)
 	if err != nil {
@@ -109,6 +117,7 @@ func OpenCluster(path string, opts ClusterOptions) (*Store, error) {
 		return nil, err
 	}
 	store.cluster = c
+	go c.watchLeadership(opts.OnLeadership)
 	return store, nil
 }
 
@@ -144,6 +153,7 @@ type queuedCommit struct {
 
 type cluster struct {
 	store     *Store
+	id        raft.ServerID
 	raft      *raft.Raft
 	log       *raftboltdb.BoltStore
 	transport raft.Transport
@@ -228,6 +238,7 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 	}
 	c := &cluster{
 		store:     store,
+		id:        raft.ServerID(opts.ID),
 		raft:      r,
 		log:       bolt,
 		transport: transport,
@@ -238,6 +249,40 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 	c.cond = sync.NewCond(&store.mu)
 	go c.proposeLoop()
 	return c, nil
+}
+
+// watchLeadership reports leadership changes. LeaderCh is a one-slot channel,
+// so the current state is read once before the loop.
+func (c *cluster) watchLeadership(hook func(bool)) {
+	var have bool
+	var last bool
+	notify := func(isLeader bool) {
+		if have && last == isLeader {
+			return
+		}
+		have = true
+		last = isLeader
+		log.Printf("persist: leadership isLeader=%v leader=%s", isLeader, c.raft.Leader())
+		if hook != nil {
+			hook(isLeader)
+		}
+		c.store.onLeadership(isLeader)
+	}
+	if c.raft.State() == raft.Leader {
+		notify(true)
+	}
+	ch := c.raft.LeaderCh()
+	for {
+		select {
+		case <-c.exited:
+			return
+		case isLeader, ok := <-ch:
+			if !ok {
+				return
+			}
+			notify(isLeader)
+		}
+	}
 }
 
 // newBatchEpoch keeps in-flight ids from matching commands replayed out of an
@@ -535,6 +580,15 @@ func (c *cluster) shutdown() error {
 // IsLeader reports whether this process currently accepts SQL writes.
 func (s *Store) IsLeader() bool {
 	return s.cluster != nil && s.cluster.raft.State() == raft.Leader
+}
+
+// Leader is the advertised address of the current primary. It is empty when
+// the group has not elected one.
+func (s *Store) Leader() string {
+	if s.cluster == nil {
+		return ""
+	}
+	return string(s.cluster.raft.Leader())
 }
 
 // Replicating reports whether commits go through Raft.

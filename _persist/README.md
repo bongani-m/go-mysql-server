@@ -40,7 +40,7 @@ docker run --rm -p 3306:3306 -v gms-data:/data -e GMS_MYSQL_HOST=0.0.0.0 gms-per
 docker compose -f _persist/compose.yaml up --build
 ```
 
-`n1` bootstraps the Raft group. `n2` and `n3` join it. Writes succeed on the leader. The other nodes serve local reads and can lag.
+`n1` bootstraps the Raft group. `n2` and `n3` join it. Writes succeed on the leader. The other nodes are read-only until one of them is elected, and they can lag. A client that writes to a follower gets the read-only error. `FLUSH BINARY LOGS` on the leader rolls every node's binlog together. Any node can stream that binlog; the GTID stream is the same after a promotion.
 
 | Node | Host port |
 |------|-----------|
@@ -78,3 +78,10 @@ Leave `MYSQL_READ_ADDRS` unset to use only `localhost:3306`.
 | `GMS_RAFT_BOOTSTRAP` | `1` on exactly one node, the first time the group starts. |
 | `GMS_RAFT_DIR` | Raft log, snapshots, server UUID, and binlog. Default is beside the data directory. |
 | `GMS_SERVER_UUID` | Shared by every node. It is the GTID server id in the binlog. |
+| `GMS_BINLOG_MAX_SIZE` | Rolls the binlog after a transaction crosses this many bytes. Default is 1 GiB. `FLUSH BINARY LOGS` rolls it immediately. |
+| `GMS_SOURCE_HOST` | Upstream MySQL host. When set, the current primary replicates from it. Set the same value on every node. |
+| `GMS_SOURCE_PORT` | Upstream MySQL port. Default `3306`. |
+| `GMS_SOURCE_USER` | Upstream MySQL user. |
+| `GMS_SOURCE_PASSWORD` | Upstream MySQL password. It stays in a local file beside the Raft directory. A promoted node can dial only if it already has this password. |
+
+`CHANGE REPLICATION SOURCE TO`, `START REPLICA`, and `STOP REPLICA` configure that upstream job. The primary is the only node that connects. After a failover the new primary continues from the GTID stored with the applied rows. Replication filters are unsupported.

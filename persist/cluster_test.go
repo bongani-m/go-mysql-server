@@ -3,6 +3,8 @@ package persist
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/binlogreplication"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
@@ -31,8 +34,10 @@ func testRaftConfig() *raft.Config {
 }
 
 type memCluster struct {
-	addrs []raft.ServerAddress
-	trans []*raft.InmemTransport
+	addrs        []raft.ServerAddress
+	trans        []*raft.InmemTransport
+	onLeadership func(id string, isLeader bool)
+	binlogMax    uint64
 }
 
 func newMemCluster(t *testing.T, n int) *memCluster {
@@ -62,15 +67,23 @@ func (c *memCluster) open(t *testing.T, i int, bootstrap bool, cfg *raft.Config)
 		cfg = testRaftConfig()
 	}
 	dir := t.TempDir()
+	id := fmt.Sprintf("node-%d", i)
+	hook := c.onLeadership
 	store, err := OpenCluster(filepath.Join(dir, "gms"), ClusterOptions{
-		ID:           fmt.Sprintf("node-%d", i),
-		Advertise:    string(c.addrs[i]),
-		RaftDir:      filepath.Join(dir, "raft"),
-		Bootstrap:    bootstrap,
-		ServerUUID:   testServerUUID,
-		Transport:    c.trans[i],
-		Config:       cfg,
-		ApplyTimeout: 10 * time.Second,
+		ID:             id,
+		Advertise:      string(c.addrs[i]),
+		RaftDir:        filepath.Join(dir, "raft"),
+		Bootstrap:      bootstrap,
+		ServerUUID:     testServerUUID,
+		Transport:      c.trans[i],
+		Config:         cfg,
+		ApplyTimeout:   10 * time.Second,
+		BinlogMaxBytes: c.binlogMax,
+		OnLeadership: func(isLeader bool) {
+			if hook != nil {
+				hook(id, isLeader)
+			}
+		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
@@ -464,5 +477,268 @@ func writeGTIDSequences(t *testing.T, store *Store) []int64 {
 			out = append(out, seq)
 		}
 	}
+	return out
+}
+
+func TestClusterLeadershipHook(t *testing.T) {
+	mem := newMemCluster(t, 3)
+	var mu sync.Mutex
+	leaders := map[string]bool{}
+	mem.onLeadership = func(id string, isLeader bool) {
+		mu.Lock()
+		leaders[id] = isLeader
+		mu.Unlock()
+	}
+	stores := make([]*Store, 3)
+	stores[0] = mem.open(t, 0, true, nil)
+	require.NoError(t, stores[0].WaitReady(10*time.Second))
+	for i := 1; i < 3; i++ {
+		stores[i] = mem.open(t, i, false, nil)
+		require.NoError(t, stores[0].AddVoter(fmt.Sprintf("node-%d", i), string(mem.addrs[i])))
+		waitCaughtUp(t, stores[0], stores[i])
+	}
+
+	old := waitLeader(t, stores)
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, old)
+	require.NoError(t, insertRows(ctx, table, sql.NewRow(int64(1), "ada")))
+	require.NotEmpty(t, old.Leader())
+
+	require.NoError(t, old.TransferLeadership())
+	var nextID string
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		var on string
+		for id, leader := range leaders {
+			if !leader {
+				continue
+			}
+			if on != "" {
+				return false
+			}
+			on = id
+		}
+		if on == "" || on == raftID(old) {
+			return false
+		}
+		nextID = on
+		return true
+	}, 10*time.Second, 20*time.Millisecond)
+	next := storeByID(stores, nextID)
+	require.NotNil(t, next)
+	require.NotEqual(t, old, next)
+
+	err := insertRows(ctx, tableNamed(t, ctx, old), sql.NewRow(int64(2), "bea"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not the leader")
+	require.NoError(t, insertRows(ctx, tableNamed(t, ctx, next), sql.NewRow(int64(2), "bea")))
+	for _, store := range stores {
+		rows := waitRows(t, store, 2)
+		require.Equal(t, "bea", rows[1][1])
+	}
+}
+
+func raftID(store *Store) string {
+	return string(store.cluster.id)
+}
+
+func storeByID(stores []*Store, id string) *Store {
+	for _, store := range stores {
+		if raftID(store) == id {
+			return store
+		}
+	}
+	return nil
+}
+
+func TestClusterRotateBinlog(t *testing.T) {
+	stores, leader := startTrio(t)
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, leader)
+	require.NoError(t, insertRows(ctx, table, sql.NewRow(int64(1), "ada")))
+	for _, store := range stores {
+		waitCaughtUp(t, leader, store)
+	}
+	require.NoError(t, leader.RotateBinaryLog(ctx))
+	for _, store := range stores {
+		waitCaughtUp(t, leader, store)
+		logs, err := store.ListBinaryLogs(ctx)
+		require.NoError(t, err)
+		require.Len(t, logs, 2)
+		require.Equal(t, "binlog.000001", logs[0].Name)
+		require.Equal(t, "binlog.000002", logs[1].Name)
+		status, err := store.GetBinaryLogStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "binlog.000002", status[0].File)
+	}
+}
+
+func TestReplicaResumesAfterLeadershipMove(t *testing.T) {
+	srcMem := newMemCluster(t, 1)
+	src := srcMem.open(t, 0, true, nil)
+	require.NoError(t, src.WaitReady(10*time.Second))
+	ctx := sql.NewContext(context.Background())
+	srcTable := kvTable(t, ctx, src)
+	require.NoError(t, insertRows(ctx, srcTable, sql.NewRow(int64(1), "ada")))
+	require.NoError(t, insertRows(ctx, srcTable, sql.NewRow(int64(2), "bea")))
+	events, format, err := src.ReadBinlog()
+	require.NoError(t, err)
+	txns := writeRowTxns(events, format)
+	require.Len(t, txns, 2)
+	var first mysql.GTID
+	for _, ev := range txns[0] {
+		if ev.IsGTID() {
+			first, _, err = ev.GTID(format)
+			require.NoError(t, err)
+		}
+	}
+	require.NotNil(t, first)
+
+	mem := newMemCluster(t, 3)
+	stores := make([]*Store, 3)
+	stores[0] = mem.open(t, 0, true, nil)
+	require.NoError(t, stores[0].WaitReady(10*time.Second))
+	for i := 1; i < 3; i++ {
+		stores[i] = mem.open(t, i, false, nil)
+		require.NoError(t, stores[0].AddVoter(fmt.Sprintf("node-%d", i), string(mem.addrs[i])))
+		waitCaughtUp(t, stores[0], stores[i])
+	}
+	leader := waitLeader(t, stores)
+	_ = kvTable(t, ctx, leader)
+
+	var mu sync.Mutex
+	var calls []string
+	dial := func(_ context.Context, _ string, _ uint16, _, _ string, executed mysql.GTIDSet) (binlogStream, error) {
+		mu.Lock()
+		calls = append(calls, executed.String())
+		mu.Unlock()
+		evs := txns[0]
+		if executed != nil && executed.ContainsGTID(first) {
+			evs = txns[1]
+		}
+		return newSliceStream(evs), nil
+	}
+	for _, store := range stores {
+		store.SetBinlogDial(dial)
+	}
+	require.NoError(t, leader.SetReplicationSourceOptions(ctx, []binlogreplication.ReplicationOption{
+		{Name: "SOURCE_HOST", Value: "example.invalid"},
+		{Name: "SOURCE_USER", Value: "repl"},
+		{Name: "SOURCE_PORT", Value: 3306},
+		{Name: "SOURCE_PASSWORD", Value: "secret"},
+	}))
+	info, err := os.Stat(filepath.Join(leader.raftDir, sourcePasswordFile))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	require.NoError(t, leader.StartReplica(ctx))
+
+	for _, store := range stores {
+		waitRows(t, store, 1)
+	}
+	require.NoError(t, leader.TransferLeadership())
+	require.Eventually(t, func() bool {
+		for _, store := range stores {
+			if store != leader && store.IsLeader() {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 20*time.Millisecond)
+	for _, store := range stores {
+		rows := waitRows(t, store, 2)
+		got := map[int64]string{}
+		for _, row := range rows {
+			got[row[0].(int64)] = row[1].(string)
+		}
+		require.Equal(t, "ada", got[int64(1)])
+		require.Equal(t, "bea", got[int64(2)])
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(calls), 2)
+	var resumed bool
+	for _, call := range calls[1:] {
+		set, err := mysql.ParseMysql56GTIDSet(call)
+		if err == nil && set.ContainsGTID(first) {
+			resumed = true
+		}
+	}
+	require.True(t, resumed)
+}
+
+type sliceStream struct {
+	mu     sync.Mutex
+	events []mysql.BinlogEvent
+	i      int
+	done   chan struct{}
+	once   sync.Once
+}
+
+func newSliceStream(events []mysql.BinlogEvent) *sliceStream {
+	return &sliceStream{events: events, done: make(chan struct{})}
+}
+
+func (s *sliceStream) ReadEvent() (mysql.BinlogEvent, error) {
+	s.mu.Lock()
+	if s.i < len(s.events) {
+		ev := s.events[s.i]
+		s.i++
+		s.mu.Unlock()
+		return ev, nil
+	}
+	s.mu.Unlock()
+	<-s.done
+	return nil, io.EOF
+}
+
+func (s *sliceStream) Close() error {
+	s.once.Do(func() { close(s.done) })
+	return nil
+}
+
+func writeRowTxns(events []mysql.BinlogEvent, format mysql.BinlogFormat) [][]mysql.BinlogEvent {
+	var formatEv mysql.BinlogEvent
+	for _, ev := range events {
+		if ev.IsFormatDescription() {
+			formatEv = ev
+			break
+		}
+	}
+	var cur []mysql.BinlogEvent
+	var out [][]mysql.BinlogEvent
+	in := false
+	hasWrite := false
+	flush := func() {
+		if in && hasWrite && formatEv != nil {
+			txn := make([]mysql.BinlogEvent, 0, len(cur)+1)
+			txn = append(txn, formatEv)
+			txn = append(txn, cur...)
+			out = append(out, txn)
+		}
+		cur = nil
+		in = false
+		hasWrite = false
+	}
+	for _, ev := range events {
+		if ev.IsGTID() {
+			flush()
+			cur = []mysql.BinlogEvent{ev}
+			in = true
+			continue
+		}
+		if !in {
+			continue
+		}
+		cur = append(cur, ev)
+		if ev.IsWriteRows() {
+			hasWrite = true
+		}
+		if ev.IsXID() {
+			flush()
+		}
+	}
+	flush()
+	_ = format
 	return out
 }

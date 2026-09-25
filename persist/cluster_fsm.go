@@ -31,6 +31,11 @@ func (f *storeFSM) Apply(log *raft.Log) interface{} {
 	if err := f.store.appendBinlog(log.Index, batch); err != nil {
 		return err
 	}
+	if batch.Rotate {
+		if err := f.store.rotateBinlog(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

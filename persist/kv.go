@@ -63,7 +63,7 @@ func (s *Store) updateQuery(ctx *sql.Context, fn func(tx *kvTx) error) error {
 	if ctx != nil {
 		statement = ctx.Query()
 	}
-	return s.commit(statement, fn)
+	return s.commitGTID(statement, sourceGTID(ctx), fn)
 }
 
 // kvTxn is the Badger transaction surface this store uses. A recording
@@ -79,6 +79,8 @@ type kvTxn interface {
 // type in the database.
 type kvTx struct {
 	txn kvTxn
+	// rotate asks the commit path to roll the binlog after this batch.
+	rotate bool
 }
 
 func (tx *kvTx) root() *kvBucket {

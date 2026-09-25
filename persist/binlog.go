@@ -8,6 +8,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dolthub/vitess/go/mysql"
@@ -19,21 +22,27 @@ import (
 
 var binlogMagic = []byte{0xfe, 0x62, 0x69, 0x6e}
 
+// defaultBinlogMax is MySQL's default max_binlog_size.
+const defaultBinlogMax = 1 << 30
+
 // binlog is the MySQL row-binlog export of committed Raft batches. It is
 // written on every node from the same log entry, so a new leader can stream
-// it. It is not the consensus log.
+// it. It is not the consensus log. Files roll to binlog.NNNNNN.
 type binlog struct {
-	mu       chan struct{}
-	file     *os.File
-	path     string
-	name     string
-	format   mysql.BinlogFormat
-	sid      mysql.SID
-	events   []mysql.BinlogEvent
-	executed mysql.Mysql56GTIDSet
-	position uint32
-	notify   chan struct{}
-	replicas []registeredReplica
+	mu          chan struct{}
+	dir         string
+	file        *os.File
+	path        string
+	name        string
+	files       []string
+	format      mysql.BinlogFormat
+	sid         mysql.SID
+	executed    mysql.Mysql56GTIDSet
+	position    uint32
+	gtidsInFile int
+	maxBytes    uint64
+	notify      chan struct{}
+	replicas    []registeredReplica
 }
 
 type registeredReplica struct {
@@ -41,78 +50,128 @@ type registeredReplica struct {
 	port uint16
 }
 
-func openBinlog(dir, serverUUID string) (*binlog, error) {
+func openBinlog(dir, serverUUID string, maxBytes uint64) (*binlog, error) {
 	sid, err := mysql.ParseSID(serverUUID)
 	if err != nil {
 		return nil, fmt.Errorf("persist: binlog server uuid: %w", err)
 	}
+	if maxBytes == 0 {
+		maxBytes = defaultBinlogMax
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, "binlog.000001")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	names, err := binlogNames(dir)
 	if err != nil {
 		return nil, err
 	}
 	b := &binlog{
 		mu:       make(chan struct{}, 1),
-		file:     file,
-		path:     path,
-		name:     "binlog.000001",
+		dir:      dir,
 		format:   mysql.NewMySQL56BinlogFormat(),
 		sid:      sid,
 		executed: mysql.Mysql56GTIDSet{},
 		notify:   make(chan struct{}, 1),
+		maxBytes: maxBytes,
+		files:    names,
 	}
 	b.mu <- struct{}{}
+	if len(names) == 0 {
+		if err := b.writeNewFileLocked("binlog.000001", mysql.Mysql56GTIDSet{}); err != nil {
+			return nil, err
+		}
+		b.files = []string{b.name}
+		if err := b.writeIndexLocked(); err != nil {
+			b.file.Close()
+			return nil, err
+		}
+		return b, nil
+	}
+	if err := b.loadExecutedLocked(); err != nil {
+		return nil, err
+	}
+	last := names[len(names)-1]
+	path := filepath.Join(dir, last)
+	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
 		return nil, err
 	}
-	if info.Size() == 0 {
-		if _, err := file.Write(binlogMagic); err != nil {
-			file.Close()
-			return nil, err
-		}
-		b.position = uint32(len(binlogMagic))
-		if err := b.writeBootstrap(); err != nil {
-			file.Close()
-			return nil, err
-		}
-		return b, nil
-	}
-	raw, err := io.ReadAll(file)
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-	events, format, err := parseBinlog(raw)
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-	b.events = events
-	if format.FormatVersion != 0 {
-		b.format = format
-	}
-	b.position = uint32(len(raw))
-	for _, ev := range events {
-		if !ev.IsGTID() {
-			continue
-		}
-		gtid, _, err := ev.GTID(b.format)
-		if err != nil {
-			file.Close()
-			return nil, err
-		}
-		b.executed = b.executed.AddGTID(gtid).(mysql.Mysql56GTIDSet)
-	}
 	if _, err := file.Seek(0, io.SeekEnd); err != nil {
 		file.Close()
 		return nil, err
 	}
+	b.file = file
+	b.path = path
+	b.name = last
+	b.position = uint32(info.Size())
+	events, format, err := readBinlogFile(path)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if format.FormatVersion != 0 {
+		b.format = format
+	}
+	for _, ev := range events {
+		if ev.IsGTID() {
+			b.gtidsInFile++
+		}
+	}
+	if err := b.writeIndexLocked(); err != nil {
+		file.Close()
+		return nil, err
+	}
 	return b, nil
+}
+
+func binlogSequence(name string) (int, bool) {
+	const prefix = "binlog."
+	if !strings.HasPrefix(name, prefix) || len(name) != len(prefix)+6 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(name[len(prefix):])
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
+}
+
+func binlogNames(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, ok := binlogSequence(entry.Name()); ok {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		ai, _ := binlogSequence(names[i])
+		aj, _ := binlogSequence(names[j])
+		return ai < aj
+	})
+	return names, nil
+}
+
+func nextBinlogName(name string) (string, error) {
+	n, ok := binlogSequence(name)
+	if !ok {
+		return "", fmt.Errorf("persist: binlog name %q", name)
+	}
+	if n >= 999999 {
+		return "", fmt.Errorf("persist: binlog sequence exhausted")
+	}
+	return fmt.Sprintf("binlog.%06d", n+1), nil
 }
 
 func (b *binlog) lock() {
@@ -132,12 +191,103 @@ func (b *binlog) close() {
 	}
 }
 
-func (b *binlog) writeBootstrap() error {
+func (b *binlog) writeBootstrapLocked(prev mysql.Mysql56GTIDSet) error {
 	meta := mysql.BinlogEventMetadata{ServerID: 1}
 	if err := b.writeEventLocked(mysql.NewFormatDescriptionEvent(b.format, meta)); err != nil {
 		return err
 	}
-	return b.writeEventLocked(mysql.NewPreviousGtidsEvent(b.format, meta, mysql.Mysql56GTIDSet{}))
+	if prev == nil {
+		prev = mysql.Mysql56GTIDSet{}
+	}
+	return b.writeEventLocked(mysql.NewPreviousGtidsEvent(b.format, meta, prev))
+}
+
+func (b *binlog) writeNewFileLocked(name string, prev mysql.Mysql56GTIDSet) error {
+	path := filepath.Join(b.dir, name)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if b.file != nil {
+		_ = b.file.Close()
+	}
+	b.file = file
+	b.path = path
+	b.name = name
+	b.position = 0
+	b.gtidsInFile = 0
+	if _, err := file.Write(binlogMagic); err != nil {
+		return err
+	}
+	b.position = uint32(len(binlogMagic))
+	return b.writeBootstrapLocked(prev)
+}
+
+func (b *binlog) writeIndexLocked() error {
+	var buf strings.Builder
+	for _, name := range b.files {
+		buf.WriteString(name)
+		buf.WriteByte('\n')
+	}
+	return os.WriteFile(filepath.Join(b.dir, "binlog.index"), []byte(buf.String()), 0o644)
+}
+
+func (b *binlog) loadExecutedLocked() error {
+	b.executed = mysql.Mysql56GTIDSet{}
+	for _, name := range b.files {
+		events, format, err := readBinlogFile(filepath.Join(b.dir, name))
+		if err != nil {
+			return err
+		}
+		if format.FormatVersion != 0 {
+			b.format = format
+		}
+		for _, ev := range events {
+			if !ev.IsGTID() {
+				continue
+			}
+			gtid, _, err := ev.GTID(b.format)
+			if err != nil {
+				return err
+			}
+			b.executed = b.executed.AddGTID(gtid).(mysql.Mysql56GTIDSet)
+		}
+	}
+	return nil
+}
+
+func (b *binlog) maybeRotateLocked() error {
+	if b.gtidsInFile == 0 || b.maxBytes == 0 || uint64(b.position) < b.maxBytes {
+		return nil
+	}
+	return b.rotateLocked()
+}
+
+func (b *binlog) rotate() error {
+	b.lock()
+	defer b.unlock()
+	return b.rotateLocked()
+}
+
+func (b *binlog) rotateLocked() error {
+	next, err := nextBinlogName(b.name)
+	if err != nil {
+		return err
+	}
+	meta := mysql.BinlogEventMetadata{ServerID: 1}
+	if err := b.writeEventLocked(mysql.NewRotateEvent(b.format, meta, 4, next)); err != nil {
+		return err
+	}
+	prev := b.executed
+	if err := b.writeNewFileLocked(next, prev); err != nil {
+		return err
+	}
+	b.files = append(b.files, next)
+	if err := b.writeIndexLocked(); err != nil {
+		return err
+	}
+	b.signal()
+	return nil
 }
 
 func (b *binlog) writeEventLocked(ev mysql.BinlogEvent) error {
@@ -151,7 +301,6 @@ func (b *binlog) writeEventLocked(ev mysql.BinlogEvent) error {
 		return err
 	}
 	b.position = next
-	b.events = append(b.events, ev)
 	return nil
 }
 
@@ -189,7 +338,11 @@ func (b *binlog) append(index uint64, batch replBatch) error {
 				return err
 			}
 			b.executed = b.executed.AddGTID(gtid).(mysql.Mysql56GTIDSet)
+			b.gtidsInFile++
 		}
+	}
+	if err := b.maybeRotateLocked(); err != nil {
+		return err
 	}
 	b.signal()
 	return nil
@@ -530,12 +683,65 @@ func asUint64(v interface{}) (uint64, bool) {
 
 func (b *binlog) read() ([]mysql.BinlogEvent, mysql.BinlogFormat, error) {
 	b.lock()
-	defer b.unlock()
-	raw, err := os.ReadFile(b.path)
+	names := append([]string(nil), b.files...)
+	format := b.format
+	b.unlock()
+	var all []mysql.BinlogEvent
+	for _, name := range names {
+		events, fileFormat, err := readBinlogFile(filepath.Join(b.dir, name))
+		if err != nil {
+			return nil, mysql.BinlogFormat{}, err
+		}
+		if fileFormat.FormatVersion != 0 {
+			format = fileFormat
+		}
+		all = append(all, events...)
+	}
+	return all, format, nil
+}
+
+func readBinlogFile(path string) ([]mysql.BinlogEvent, mysql.BinlogFormat, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, mysql.BinlogFormat{}, err
 	}
 	return parseBinlog(raw)
+}
+
+// eventsFor is the binlog a replica with executed would be sent, across files.
+func (b *binlog) eventsFor(executed mysql.GTIDSet) ([]mysql.BinlogEvent, error) {
+	b.lock()
+	names := append([]string(nil), b.files...)
+	dir := b.dir
+	b.unlock()
+	var out []mysql.BinlogEvent
+	skip := false
+	for _, name := range names {
+		events, format, err := readBinlogFile(filepath.Join(dir, name))
+		if err != nil {
+			return nil, err
+		}
+		for _, ev := range events {
+			if ev.IsGTID() {
+				gtid, _, err := ev.GTID(format)
+				if err != nil {
+					return nil, err
+				}
+				skip = executed != nil && executed.ContainsGTID(gtid)
+			}
+			if skip && !ev.IsFormatDescription() && !ev.IsPreviousGTIDs() && !ev.IsRotate() {
+				continue
+			}
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
+func (b *binlog) fileNames() []string {
+	b.lock()
+	defer b.unlock()
+	return append([]string(nil), b.files...)
 }
 
 func parseBinlog(raw []byte) ([]mysql.BinlogEvent, mysql.BinlogFormat, error) {
@@ -600,13 +806,15 @@ func (s *Store) RegisterReplica(_ *sql.Context, _ *mysql.Conn, host string, port
 }
 
 // BinlogDumpGtid streams row events starting after the replica's executed set.
-// It returns when the connection write fails.
+// It returns when the connection write fails. Closed files are read from disk.
 func (s *Store) BinlogDumpGtid(ctx *sql.Context, conn *mysql.Conn, executed mysql.GTIDSet) error {
 	b, err := s.binlogOrErr()
 	if err != nil {
 		return mysql.NewSQLError(mysql.ERMasterFatalReadingBinlog, "HY000", "%v", err)
 	}
+	fileIdx := 0
 	sent := 0
+	skip := false
 	for {
 		if ctx != nil {
 			select {
@@ -615,20 +823,29 @@ func (s *Store) BinlogDumpGtid(ctx *sql.Context, conn *mysql.Conn, executed mysq
 			default:
 			}
 		}
-		b.lock()
-		events := append([]mysql.BinlogEvent(nil), b.events...)
-		format := b.format
-		b.unlock()
-		skip := false
+		names := b.fileNames()
+		if fileIdx >= len(names) {
+			if err := waitBinlog(ctx, b); err != nil {
+				return err
+			}
+			continue
+		}
+		events, format, err := readBinlogFile(filepath.Join(b.dir, names[fileIdx]))
+		if err != nil {
+			return err
+		}
+		if sent > len(events) {
+			sent = len(events)
+		}
 		for _, ev := range events[sent:] {
 			if ev.IsGTID() {
-				gtid, _, err := ev.GTID(format)
-				if err != nil {
-					return err
+				gtid, _, gerr := ev.GTID(format)
+				if gerr != nil {
+					return gerr
 				}
 				skip = executed != nil && executed.ContainsGTID(gtid)
 			}
-			if skip && !ev.IsFormatDescription() && !ev.IsPreviousGTIDs() {
+			if skip && !ev.IsFormatDescription() && !ev.IsPreviousGTIDs() && !ev.IsRotate() {
 				sent++
 				continue
 			}
@@ -637,10 +854,35 @@ func (s *Store) BinlogDumpGtid(ctx *sql.Context, conn *mysql.Conn, executed mysq
 			}
 			sent++
 		}
+		names = b.fileNames()
+		if fileIdx < len(names)-1 && sent >= len(events) {
+			fileIdx++
+			sent = 0
+			continue
+		}
+		if err := waitBinlog(ctx, b); err != nil {
+			return err
+		}
+	}
+}
+
+func waitBinlog(ctx *sql.Context, b *binlog) error {
+	timer := time.NewTimer(200 * time.Millisecond)
+	defer timer.Stop()
+	if ctx == nil {
 		select {
 		case <-b.notify:
-		case <-time.After(200 * time.Millisecond):
+		case <-timer.C:
 		}
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.notify:
+		return nil
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -655,16 +897,19 @@ func (s *Store) ListBinaryLogs(*sql.Context) ([]binlogreplication.BinaryLogFileM
 	if err != nil {
 		return nil, nil
 	}
-	b.lock()
-	defer b.unlock()
-	info, err := os.Stat(b.path)
-	if err != nil {
-		return nil, err
+	names := b.fileNames()
+	out := make([]binlogreplication.BinaryLogFileMetadata, 0, len(names))
+	for _, name := range names {
+		info, err := os.Stat(filepath.Join(b.dir, name))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, binlogreplication.BinaryLogFileMetadata{
+			Name: name,
+			Size: uint64(info.Size()),
+		})
 	}
-	return []binlogreplication.BinaryLogFileMetadata{{
-		Name: b.name,
-		Size: uint64(info.Size()),
-	}}, nil
+	return out, nil
 }
 
 // GetBinaryLogStatus implements binlogreplication.BinlogPrimaryController.
@@ -680,4 +925,26 @@ func (s *Store) GetBinaryLogStatus(*sql.Context) ([]binlogreplication.BinaryLogS
 		Position:      uint(b.position),
 		ExecutedGtids: b.executed.String(),
 	}}, nil
+}
+
+// RotateBinaryLog rolls the active binlog. In a cluster the roll is a Raft
+// entry, so every node opens the next file at the same point.
+func (s *Store) RotateBinaryLog(*sql.Context) error {
+	if s.bin == nil {
+		return fmt.Errorf("persist: binlog is not enabled")
+	}
+	if s.cluster == nil {
+		return s.bin.rotate()
+	}
+	return s.commitGTID("", "", func(tx *kvTx) error {
+		tx.rotate = true
+		return nil
+	})
+}
+
+func (s *Store) rotateBinlog() error {
+	if s.bin == nil {
+		return fmt.Errorf("persist: binlog is not enabled")
+	}
+	return s.bin.rotate()
 }

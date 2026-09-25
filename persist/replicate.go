@@ -44,6 +44,8 @@ type replBatch struct {
 	Statement string
 	Unix      uint32
 	ID        uint64
+	// Rotate rolls the binlog on every node after this batch is applied.
+	Rotate bool
 }
 
 // recordingTxn copies every Set and Delete while the real transaction still
@@ -86,21 +88,47 @@ func (tx *kvTx) noteRow(ch rowChange) {
 // the batch. The lock is not held while Raft waits for a quorum, so the next
 // statement can record against the in-flight batches.
 func (s *Store) commit(statement string, fn func(tx *kvTx) error) error {
+	return s.commitGTID(statement, "", fn)
+}
+
+// commitGTID is commit, and it stores gtid in the same batch when gtid is set.
+// A transaction that only asks to rotate the binlog is replicated too.
+func (s *Store) commitGTID(statement, gtid string, fn func(tx *kvTx) error) error {
 	if s.cluster == nil {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.badgerDB().Update(func(txn *badger.Txn) error {
-			return fn(&kvTx{txn: txn})
+		var rotate bool
+		err := s.badgerDB().Update(func(txn *badger.Txn) error {
+			tx := &kvTx{txn: txn}
+			if err := fn(tx); err != nil {
+				return err
+			}
+			rotate = tx.rotate
+			return putSourceGTID(tx, gtid)
 		})
+		if err != nil {
+			return err
+		}
+		if rotate {
+			return s.rotateBinlog()
+		}
+		return nil
 	}
-	return s.cluster.commit(statement, fn)
+	return s.cluster.commitGTID(statement, gtid, fn)
+}
+
+func putSourceGTID(tx *kvTx, gtid string) error {
+	if gtid == "" {
+		return nil
+	}
+	return tx.root().Put(keySourceGTID, []byte(gtid))
 }
 
 // commit records one statement on the leader and waits for its Raft future.
 // Recording is serialized by recordMu. The store lock is not held across the
 // quorum wait or across the Badger transaction, so an apply can land and the
 // next statement can record while this one is still in flight.
-func (c *cluster) commit(statement string, fn func(tx *kvTx) error) error {
+func (c *cluster) commitGTID(statement, gtid string, fn func(tx *kvTx) error) error {
 	c.recordMu.Lock()
 	snap, err := c.beginRecord()
 	if err != nil {
@@ -108,13 +136,22 @@ func (c *cluster) commit(statement string, fn func(tx *kvTx) error) error {
 		return err
 	}
 	rec := &recordingTxn{}
+	var rotate bool
 	err = c.store.badgerDB().Update(func(txn *badger.Txn) error {
 		if err := replayOps(txn, snap); err != nil {
 			return err
 		}
 		rec.Txn = txn
-		if err := fn(&kvTx{txn: rec}); err != nil {
+		tx := &kvTx{txn: rec}
+		if err := fn(tx); err != nil {
 			return err
+		}
+		if err := putSourceGTID(tx, gtid); err != nil {
+			return err
+		}
+		rotate = tx.rotate
+		if len(rec.ops) == 0 && !rotate {
+			return nil
 		}
 		return errReplicate
 	})
@@ -122,7 +159,7 @@ func (c *cluster) commit(statement string, fn func(tx *kvTx) error) error {
 		c.recordMu.Unlock()
 		return err
 	}
-	if len(rec.ops) == 0 {
+	if !errors.Is(err, errReplicate) {
 		c.recordMu.Unlock()
 		return nil
 	}
@@ -131,6 +168,7 @@ func (c *cluster) commit(statement string, fn func(tx *kvTx) error) error {
 		Rows:      rec.rows,
 		Statement: statement,
 		Unix:      uint32(time.Now().Unix()),
+		Rotate:    rotate,
 	})
 	c.recordMu.Unlock()
 	if err != nil {
