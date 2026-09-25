@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dolthub/vitess/go/sqltypes"
 	"github.com/dolthub/vitess/go/vt/proto/query"
 	"github.com/stretchr/testify/require"
 
@@ -23,8 +22,8 @@ func TestRowsSurviveReopen(t *testing.T) {
 	db := createPeopleTable(t, ctx, store)
 	table := mustTable(t, ctx, db)
 
-	jane := sql.NewRow("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Jane Deo", "janedeo@gmail.com", types.MustJSON(`["556-565-566","777-777-777"]`), created)
-	john := sql.NewRow("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "John Doe", "john@doe.com", types.MustJSON(`["555-555-555"]`), created)
+	jane := sql.NewRow(int64(1), "Jane Deo", "janedeo@gmail.com", types.MustJSON(`["556-565-566","777-777-777"]`), created)
+	john := sql.NewRow(int64(2), "John Doe", "john@doe.com", types.MustJSON(`["555-555-555"]`), created)
 	require.NoError(t, insertRows(ctx, table, jane, john))
 
 	updated := jane.Copy()
@@ -40,7 +39,7 @@ func TestRowsSurviveReopen(t *testing.T) {
 	table = mustTable(t, ctx, db)
 	rows := readRows(t, ctx, table)
 	require.Len(t, rows, 1)
-	require.Equal(t, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", rows[0][0])
+	require.Equal(t, int64(1), rows[0][0])
 	require.Equal(t, "Jane Deo", rows[0][1])
 	require.Equal(t, "jane@example.com", rows[0][2])
 	phones, err := rows[0][3].(sql.JSONWrapper).ToInterface(ctx)
@@ -58,7 +57,7 @@ func TestDuplicatePrimaryKey(t *testing.T) {
 	table := mustTable(t, ctx, createPeopleTable(t, ctx, store))
 
 	created := time.Unix(0, 1667304000000001000).UTC()
-	row := sql.NewRow("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Jane Deo", "janedeo@gmail.com", types.MustJSON(`[]`), created)
+	row := sql.NewRow(int64(1), "Jane Deo", "janedeo@gmail.com", types.MustJSON(`[]`), created)
 	require.NoError(t, insertRows(ctx, table, row))
 
 	err := insertRows(ctx, table, row)
@@ -82,7 +81,7 @@ func TestTransactionRollbackDropsEdits(t *testing.T) {
 	ctx.SetIgnoreAutoCommit(true)
 
 	created := time.Unix(0, 1667304000000001000).UTC()
-	row := sql.NewRow("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Jane Deo", "janedeo@gmail.com", types.MustJSON(`[]`), created)
+	row := sql.NewRow(int64(1), "Jane Deo", "janedeo@gmail.com", types.MustJSON(`[]`), created)
 	require.NoError(t, insertRows(ctx, table, row))
 	require.Len(t, readRows(t, ctx, table), 1)
 
@@ -110,7 +109,7 @@ func createPeopleTable(t *testing.T, ctx *sql.Context, store *Store) sql.Databas
 	db, err := store.Database(ctx, "mydb")
 	require.NoError(t, err)
 	schema := sql.NewPrimaryKeySchema(sql.Schema{
-		{Name: "id", Type: types.MustCreateStringWithDefaults(sqltypes.Char, 36), Nullable: false, Source: "mytable", PrimaryKey: true},
+		{Name: "id", Type: types.Int64, Nullable: false, Source: "mytable", PrimaryKey: true, AutoIncrement: true},
 		{Name: "name", Type: types.Text, Nullable: false, Source: "mytable"},
 		{Name: "email", Type: types.Text, Nullable: false, Source: "mytable"},
 		{Name: "phone_numbers", Type: types.JSON, Nullable: false, Source: "mytable"},

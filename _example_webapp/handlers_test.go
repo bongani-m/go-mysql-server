@@ -20,76 +20,49 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-func TestRootLinksToCollection(t *testing.T) {
-	rec := perform(t, NewHandler(newSeedStore(), ""), http.MethodGet, "/", "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d", rec.Code)
-	}
-	if ct := rec.Header().Get("Content-Type"); ct != halContentType {
-		t.Fatalf("content type %q", ct)
-	}
-	body := decode[rootDoc](t, rec)
-	if body.Links.People == nil || body.Links.People.Href != "http://example.com/people" {
-		t.Fatalf("people link %#v", body.Links.People)
-	}
-	if body.Links.Self == nil || body.Links.Self.Href != "http://example.com/" {
-		t.Fatalf("self link %#v", body.Links.Self)
-	}
-}
-
-func TestListPaginationLinks(t *testing.T) {
-	rec := perform(t, NewHandler(newSeedStore(), ""), http.MethodGet, "/people", "")
+func TestListPagination(t *testing.T) {
+	rec := perform(t, NewHandler(newSeedStore()), http.MethodGet, "/people", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d body %s", rec.Code, rec.Body)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != jsonContentType {
+		t.Fatalf("content type %q", ct)
 	}
 	body := decode[listDoc](t, rec)
 	if body.Page != 1 || body.Size != 2 || body.Total != 4 {
 		t.Fatalf("page meta %+v", body)
 	}
-	if len(body.Embedded.People) != 2 {
-		t.Fatalf("got %d people", len(body.Embedded.People))
+	if len(body.People) != 2 {
+		t.Fatalf("got %d people", len(body.People))
 	}
-	if body.Embedded.People[0].Name != "Jane Deo" || body.Embedded.People[1].Email != "jane@doe.com" {
-		t.Fatalf("order %+v", body.Embedded.People)
+	if body.People[0].Name != "Jane Deo" || body.People[1].Email != "jane@doe.com" {
+		t.Fatalf("order %+v", body.People)
 	}
-	if body.Embedded.People[0].CreatedAt != "2022-11-01T12:00:00.000001Z" {
-		t.Fatalf("created_at %s", body.Embedded.People[0].CreatedAt)
+	if body.People[0].CreatedAt != "2022-11-01T12:00:00.000001Z" {
+		t.Fatalf("created_at %s", body.People[0].CreatedAt)
 	}
-	self := body.Embedded.People[0].Links.Self
-	if body.Embedded.People[0].ID != idJaneDeo || self == nil || self.Href != "http://example.com/people/"+idJaneDeo {
-		t.Fatalf("item self id=%s %#v", body.Embedded.People[0].ID, self)
+	if body.People[0].ID != idJaneDeo {
+		t.Fatalf("id %d", body.People[0].ID)
 	}
-	if body.Links.Prev != nil {
-		t.Fatalf("unexpected prev %#v", body.Links.Prev)
-	}
-	assertPageQuery(t, body.Links.Next, "2", "2", url.Values{})
-	assertPageQuery(t, body.Links.Last, "2", "2", url.Values{})
-	assertPageQuery(t, body.Links.First, "1", "2", url.Values{})
 
-	rec = perform(t, NewHandler(newSeedStore(), ""), http.MethodGet, "/people?page=2&size=2", "")
+	rec = perform(t, NewHandler(newSeedStore()), http.MethodGet, "/people?page=2&size=2", "")
 	body = decode[listDoc](t, rec)
-	if body.Links.Next != nil {
-		t.Fatalf("unexpected next %#v", body.Links.Next)
-	}
-	assertPageQuery(t, body.Links.Prev, "1", "2", url.Values{})
-	if body.Embedded.People[0].ID != idJohnDoe || body.Embedded.People[1].ID != idJohnAlt {
-		t.Fatalf("page 2 %+v", body.Embedded.People)
+	if body.People[0].ID != idJohnDoe || body.People[1].ID != idJohnAlt {
+		t.Fatalf("page 2 %+v", body.People)
 	}
 }
 
-func TestListCopiesFiltersOntoLinks(t *testing.T) {
+func TestListFilters(t *testing.T) {
 	store := newSeedStore()
 	target := "/people?name=Jane&email=doe.com&phone=555&created_after=2022-01-01T00:00:00Z&created_before=2023-01-01%2000:00:00&size=1"
-	rec := perform(t, NewHandler(store, ""), http.MethodGet, target, "")
+	rec := perform(t, NewHandler(store), http.MethodGet, target, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d body %s", rec.Code, rec.Body)
 	}
@@ -107,32 +80,20 @@ func TestListCopiesFiltersOntoLinks(t *testing.T) {
 	}
 
 	body := decode[listDoc](t, rec)
-	if body.Total != 0 || len(body.Embedded.People) != 0 {
-		t.Fatalf("filtered page total=%d people=%+v", body.Total, body.Embedded.People)
+	if body.Total != 0 || len(body.People) != 0 {
+		t.Fatalf("filtered page total=%d people=%+v", body.Total, body.People)
 	}
-	if body.Links.Next != nil {
-		t.Fatalf("unexpected next %#v", body.Links.Next)
-	}
-	want := url.Values{
-		"name":           []string{"Jane"},
-		"email":          []string{"doe.com"},
-		"phone":          []string{"555"},
-		"created_after":  []string{"2022-01-01T00:00:00Z"},
-		"created_before": []string{"2023-01-01 00:00:00"},
-	}
-	assertPageQuery(t, body.Links.Self, "1", "1", want)
 
-	rec = perform(t, NewHandler(newSeedStore(), ""), http.MethodGet, "/people?name=Jane&size=1", "")
+	rec = perform(t, NewHandler(newSeedStore()), http.MethodGet, "/people?name=Jane&size=1", "")
 	body = decode[listDoc](t, rec)
-	if body.Total != 2 || body.Embedded.People[0].Email != "janedeo@gmail.com" {
+	if body.Total != 2 || body.People[0].Email != "janedeo@gmail.com" {
 		t.Fatalf("name filter %+v", body)
 	}
-	assertPageQuery(t, body.Links.Next, "2", "1", url.Values{"name": []string{"Jane"}})
 }
 
 func TestCreateGetUpdateDelete(t *testing.T) {
 	store := newSeedStore()
-	h := NewHandler(store, "http://api.test")
+	h := NewHandler(store)
 
 	rec := perform(t, h, http.MethodPost, "/people", `{
 		"name": "Ada Lovelace",
@@ -144,17 +105,14 @@ func TestCreateGetUpdateDelete(t *testing.T) {
 		t.Fatalf("create status %d body %s", rec.Code, rec.Body)
 	}
 	created := decode[personDoc](t, rec)
-	if rec.Header().Get("Location") != created.Links.Self.Href {
-		t.Fatalf("location %q self %#v", rec.Header().Get("Location"), created.Links.Self)
+	if created.ID != 5 {
+		t.Fatalf("id %d", created.ID)
 	}
-	if _, err := uuid.Parse(created.ID); err != nil || created.Links.Self.Href != "http://api.test/people/"+created.ID {
-		t.Fatalf("id %s self %q", created.ID, created.Links.Self.Href)
-	}
-	if created.Links.Collection.Href != "http://api.test/people" {
-		t.Fatalf("collection %q", created.Links.Collection.Href)
+	if rec.Header().Get("Location") != personPath(created.ID) {
+		t.Fatalf("location %q id %d", rec.Header().Get("Location"), created.ID)
 	}
 
-	rec = perform(t, h, http.MethodGet, "/people/"+created.ID, "")
+	rec = perform(t, h, http.MethodGet, personPath(created.ID), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("get status %d", rec.Code)
 	}
@@ -163,7 +121,7 @@ func TestCreateGetUpdateDelete(t *testing.T) {
 		t.Fatalf("phones %#v", got.PhoneNumbers)
 	}
 
-	rec = perform(t, h, http.MethodPut, "/people/"+created.ID, `{
+	rec = perform(t, h, http.MethodPut, personPath(created.ID), `{
 		"name": "Ada Lovelace",
 		"email": "ada@example.com",
 		"phone_numbers": ["999"],
@@ -177,7 +135,7 @@ func TestCreateGetUpdateDelete(t *testing.T) {
 		t.Fatalf("updated %+v", updated)
 	}
 
-	rec = perform(t, h, http.MethodDelete, "/people/"+created.ID, "")
+	rec = perform(t, h, http.MethodDelete, personPath(created.ID), "")
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete status %d", rec.Code)
 	}
@@ -185,18 +143,18 @@ func TestCreateGetUpdateDelete(t *testing.T) {
 		t.Fatalf("delete body %q", rec.Body)
 	}
 
-	rec = perform(t, h, http.MethodGet, "/people/"+created.ID, "")
+	rec = perform(t, h, http.MethodGet, personPath(created.ID), "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("missing status %d", rec.Code)
 	}
 	missing := decode[errorDoc](t, rec)
-	if missing.Links.Collection == nil || missing.Links.Collection.Href != "http://api.test/people" {
-		t.Fatalf("404 links %+v", missing.Links)
+	if missing.Error != "not found" {
+		t.Fatalf("404 body %+v", missing)
 	}
 }
 
 func TestBadInput(t *testing.T) {
-	h := NewHandler(newSeedStore(), "")
+	h := NewHandler(newSeedStore())
 
 	rec := perform(t, h, http.MethodGet, "/people?size=0", "")
 	if rec.Code != http.StatusBadRequest {
@@ -214,11 +172,11 @@ func TestBadInput(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("id status %d body %s", rec.Code, rec.Body)
 	}
-	rec = perform(t, h, http.MethodPut, "/people/"+idJaneDoe, `{"phone_numbers":[],"created_at":"2024-01-02T03:04:05Z"}`)
+	rec = perform(t, h, http.MethodPut, personPath(idJaneDoe), `{"phone_numbers":[],"created_at":"2024-01-02T03:04:05Z"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("put status %d body %s", rec.Code, rec.Body)
 	}
-	rec = perform(t, h, http.MethodGet, "/people/"+idMissing, "")
+	rec = perform(t, h, http.MethodGet, personPath(idMissing), "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("missing status %d", rec.Code)
 	}
@@ -245,6 +203,10 @@ func perform(t *testing.T, h http.Handler, method, target, body string) *httptes
 	return rec
 }
 
+func personPath(id int64) string {
+	return "/people/" + strconv.FormatInt(id, 10)
+}
+
 func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 	t.Helper()
 	var v T
@@ -254,26 +216,6 @@ func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 	return v
 }
 
-func assertPageQuery(t *testing.T, l *link, page, size string, extra url.Values) {
-	t.Helper()
-	if l == nil {
-		t.Fatal("missing link")
-	}
-	u, err := url.Parse(l.Href)
-	if err != nil {
-		t.Fatal(err)
-	}
-	q := u.Query()
-	if q.Get("page") != page || q.Get("size") != size {
-		t.Fatalf("page query %s", l.Href)
-	}
-	for key, vals := range extra {
-		if q.Get(key) != vals[0] {
-			t.Fatalf("query %s got %q want %q in %s", key, q.Get(key), vals[0], l.Href)
-		}
-	}
-}
-
 type memoryStore struct {
 	mu     sync.Mutex
 	people []Person
@@ -281,11 +223,11 @@ type memoryStore struct {
 }
 
 const (
-	idJaneDeo = "11111111-1111-4111-8111-111111111111"
-	idJaneDoe = "22222222-2222-4222-8222-222222222222"
-	idJohnDoe = "33333333-3333-4333-8333-333333333333"
-	idJohnAlt = "44444444-4444-4444-8444-444444444444"
-	idMissing = "99999999-9999-4999-8999-999999999999"
+	idJaneDeo int64 = 1
+	idJaneDoe int64 = 2
+	idJohnDoe int64 = 3
+	idJohnAlt int64 = 4
+	idMissing int64 = 999
 )
 
 func newSeedStore() *memoryStore {
@@ -324,7 +266,7 @@ func (m *memoryStore) List(_ context.Context, f Filter, page, size int) (ListRes
 	return ListResult{People: append([]Person(nil), matched[start:end]...), Total: total}, nil
 }
 
-func (m *memoryStore) Get(_ context.Context, id string) (Person, error) {
+func (m *memoryStore) Get(_ context.Context, id int64) (Person, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, p := range m.people {
@@ -339,7 +281,12 @@ func (m *memoryStore) Get(_ context.Context, id string) (Person, error) {
 func (m *memoryStore) Insert(_ context.Context, p Person) (Person, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	p.ID = uuid.New().String()
+	p.ID = 1
+	for _, existing := range m.people {
+		if existing.ID >= p.ID {
+			p.ID = existing.ID + 1
+		}
+	}
 	p.PhoneNumbers = append([]string(nil), normalizePhones(p.PhoneNumbers)...)
 	m.people = append(m.people, p)
 	return p, nil
@@ -358,7 +305,7 @@ func (m *memoryStore) Update(_ context.Context, p Person) error {
 	return ErrNotFound
 }
 
-func (m *memoryStore) Delete(_ context.Context, id string) error {
+func (m *memoryStore) Delete(_ context.Context, id int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i, existing := range m.people {

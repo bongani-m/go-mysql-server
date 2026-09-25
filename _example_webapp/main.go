@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command examplewebapp is a HATEOAS CRUD API for the in-memory MySQL server
+// Command examplewebapp is a CRUD API for the in-memory MySQL server
 // in ../_example. Start that server first (users disabled, database mydb),
 // then run this program:
 //
@@ -48,8 +48,8 @@ func main() {
 	}
 
 	addr := env("HTTP_ADDR", ":8080")
-	log.Printf("HATEOAS API listening on %s", addr)
-	if err := http.ListenAndServe(addr, NewHandler(NewMySQLStore(db), os.Getenv("PUBLIC_BASE_URL"))); err != nil {
+	log.Printf("API listening on %s", addr)
+	if err := http.ListenAndServe(addr, NewHandler(NewMySQLStore(db))); err != nil {
 		log.Fatal(err)
 	}
 }

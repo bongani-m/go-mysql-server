@@ -7,7 +7,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/dolthub/vitess/go/sqltypes"
 	"github.com/dolthub/vitess/go/vt/proto/query"
 
 	sqle "github.com/dolthub/go-mysql-server"
@@ -117,7 +116,7 @@ func ensureExample(ctx *sql.Context, store *persist.Store) error {
 
 func peopleSchema() sql.PrimaryKeySchema {
 	return sql.NewPrimaryKeySchema(sql.Schema{
-		{Name: "id", Type: types.MustCreateStringWithDefaults(sqltypes.Char, 36), Nullable: false, Source: tableName, PrimaryKey: true},
+		{Name: "id", Type: types.Int64, Nullable: false, Source: tableName, PrimaryKey: true, AutoIncrement: true},
 		{Name: "name", Type: types.Text, Nullable: false, Source: tableName},
 		{Name: "email", Type: types.Text, Nullable: false, Source: tableName},
 		{Name: "phone_numbers", Type: types.JSON, Nullable: false, Source: tableName},
@@ -126,13 +125,13 @@ func peopleSchema() sql.PrimaryKeySchema {
 }
 
 var seedPeople = []struct {
-	id     string
+	id     int64
 	name   string
 	email  string
 	phones string
 }{
-	{"6ccd780c-baba-1026-9564-5b8c656024db", "Jane Deo", "janedeo@gmail.com", `["556-565-566","777-777-777"]`},
-	{"6ccd780c-baba-1026-9564-5b8c656024dc", "Jane Doe", "jane@doe.com", `[]`},
-	{"6ccd780c-baba-1026-9564-5b8c656024dd", "John Doe", "john@doe.com", `["555-555-555"]`},
-	{"6ccd780c-baba-1026-9564-5b8c656024de", "John Doe", "johnalt@doe.com", `[]`},
+	{1, "Jane Deo", "janedeo@gmail.com", `["556-565-566","777-777-777"]`},
+	{2, "Jane Doe", "jane@doe.com", `[]`},
+	{3, "John Doe", "john@doe.com", `["555-555-555"]`},
+	{4, "John Doe", "johnalt@doe.com", `[]`},
 }

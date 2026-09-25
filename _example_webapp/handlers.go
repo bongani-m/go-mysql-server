@@ -22,28 +22,23 @@ import (
 	"log"
 	"mime"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 const (
-	halContentType = "application/hal+json"
-	defaultPage    = 1
-	defaultSize    = 2
-	maxPageSize    = 100
-	timeLayout     = "2006-01-02T15:04:05.000000Z"
+	jsonContentType = "application/json"
+	defaultPage     = 1
+	defaultSize     = 2
+	maxPageSize     = 100
+	timeLayout      = "2006-01-02T15:04:05.000000Z"
 )
 
-// NewHandler serves the people collection. publicBaseURL, when set, is used
-// for every link instead of the incoming request host.
-func NewHandler(store Store, publicBaseURL string) http.Handler {
-	h := &handler{store: store, publicBase: strings.TrimRight(publicBaseURL, "/")}
+// NewHandler serves the people collection.
+func NewHandler(store Store) http.Handler {
+	h := &handler{store: store}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", h.root)
 	mux.HandleFunc("GET /people", h.list)
 	mux.HandleFunc("POST /people", h.create)
 	mux.HandleFunc("GET /people/{id}", h.get)
@@ -54,55 +49,31 @@ func NewHandler(store Store, publicBaseURL string) http.Handler {
 }
 
 type handler struct {
-	store      Store
-	publicBase string
-	mux        *http.ServeMux
+	store Store
+	mux   *http.ServeMux
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-type link struct {
-	Href string `json:"href"`
-}
-
-type linkSet struct {
-	Self       *link `json:"self,omitempty"`
-	Collection *link `json:"collection,omitempty"`
-	People     *link `json:"people,omitempty"`
-	First      *link `json:"first,omitempty"`
-	Prev       *link `json:"prev,omitempty"`
-	Next       *link `json:"next,omitempty"`
-	Last       *link `json:"last,omitempty"`
-}
-
 type personDoc struct {
-	ID           string   `json:"id"`
+	ID           int64    `json:"id"`
 	Name         string   `json:"name"`
 	Email        string   `json:"email"`
 	PhoneNumbers []string `json:"phone_numbers"`
 	CreatedAt    string   `json:"created_at"`
-	Links        linkSet  `json:"_links"`
 }
 
 type listDoc struct {
-	Page     int `json:"page"`
-	Size     int `json:"size"`
-	Total    int `json:"total"`
-	Embedded struct {
-		People []personDoc `json:"people"`
-	} `json:"_embedded"`
-	Links linkSet `json:"_links"`
-}
-
-type rootDoc struct {
-	Links linkSet `json:"_links"`
+	Page   int         `json:"page"`
+	Size   int         `json:"size"`
+	Total  int         `json:"total"`
+	People []personDoc `json:"people"`
 }
 
 type errorDoc struct {
-	Error string  `json:"error"`
-	Links linkSet `json:"_links"`
+	Error string `json:"error"`
 }
 
 type personRequest struct {
@@ -112,193 +83,127 @@ type personRequest struct {
 	CreatedAt    *string  `json:"created_at"`
 }
 
-func (h *handler) root(w http.ResponseWriter, r *http.Request) {
-	base := h.baseURL(r)
-	writeJSON(w, http.StatusOK, rootDoc{Links: linkSet{
-		Self:   &link{Href: base + "/"},
-		People: &link{Href: base + "/people"},
-	}})
-}
-
 func (h *handler) list(w http.ResponseWriter, r *http.Request) {
 	page, size, f, err := parseListQuery(r)
 	if err != nil {
-		h.writeError(w, r, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	result, err := h.store.List(r.Context(), f, page, size)
 	if err != nil {
-		h.writeStoreErr(w, r, err)
+		h.writeStoreErr(w, err)
 		return
 	}
 
-	base := h.baseURL(r)
 	people := make([]personDoc, 0, len(result.People))
 	for _, p := range result.People {
-		people = append(people, h.personDoc(base, p))
+		people = append(people, personResponse(p))
 	}
-	doc := listDoc{Page: page, Size: size, Total: result.Total}
-	doc.Embedded.People = people
-	doc.Links = pageLinks(base, page, size, result.Total, r.URL.Query())
-	writeJSON(w, http.StatusOK, doc)
+	writeJSON(w, http.StatusOK, listDoc{Page: page, Size: size, Total: result.Total, People: people})
 }
 
 func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
-		h.writeError(w, r, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	p, err := h.store.Get(r.Context(), id)
 	if err != nil {
-		h.writeStoreErr(w, r, err)
+		h.writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, h.personDoc(h.baseURL(r), p))
+	writeJSON(w, http.StatusOK, personResponse(p))
 }
 
 func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	var req personRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		h.writeError(w, r, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	p, err := personFromCreate(req)
 	if err != nil {
-		h.writeError(w, r, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	p, err = h.store.Insert(r.Context(), p)
 	if err != nil {
-		h.writeStoreErr(w, r, err)
+		h.writeStoreErr(w, err)
 		return
 	}
-	doc := h.personDoc(h.baseURL(r), p)
-	w.Header().Set("Location", doc.Links.Self.Href)
-	writeJSON(w, http.StatusCreated, doc)
+	w.Header().Set("Location", "/people/"+strconv.FormatInt(p.ID, 10))
+	writeJSON(w, http.StatusCreated, personResponse(p))
 }
 
 func (h *handler) update(w http.ResponseWriter, r *http.Request) {
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
-		h.writeError(w, r, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var req personRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		h.writeError(w, r, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	p, err := personFromUpdate(id, req)
 	if err != nil {
-		h.writeError(w, r, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := h.store.Update(r.Context(), p); err != nil {
-		h.writeStoreErr(w, r, err)
+		h.writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, h.personDoc(h.baseURL(r), p))
+	writeJSON(w, http.StatusOK, personResponse(p))
 }
 
 func (h *handler) delete(w http.ResponseWriter, r *http.Request) {
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
-		h.writeError(w, r, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := h.store.Delete(r.Context(), id); err != nil {
-		h.writeStoreErr(w, r, err)
+		h.writeStoreErr(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *handler) personDoc(base string, p Person) personDoc {
+func personResponse(p Person) personDoc {
 	return personDoc{
 		ID:           p.ID,
 		Name:         p.Name,
 		Email:        p.Email,
 		PhoneNumbers: normalizePhones(p.PhoneNumbers),
 		CreatedAt:    p.CreatedAt.UTC().Format(timeLayout),
-		Links: linkSet{
-			Self:       &link{Href: personHref(base, p.ID)},
-			Collection: &link{Href: base + "/people"},
-		},
 	}
 }
 
-func (h *handler) baseURL(r *http.Request) string {
-	if h.publicBase != "" {
-		return h.publicBase
-	}
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return scheme + "://" + r.Host
-}
-
-func (h *handler) writeStoreErr(w http.ResponseWriter, r *http.Request, err error) {
+func (h *handler) writeStoreErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrNotFound):
-		h.writeError(w, r, http.StatusNotFound, "not found")
+		h.writeError(w, http.StatusNotFound, "not found")
 	case errors.Is(err, ErrConflict):
-		h.writeError(w, r, http.StatusConflict, "person already exists")
+		h.writeError(w, http.StatusConflict, "person already exists")
 	default:
 		log.Printf("store error: %v", err)
-		h.writeError(w, r, http.StatusInternalServerError, "internal error")
+		h.writeError(w, http.StatusInternalServerError, "internal error")
 	}
 }
 
-func (h *handler) writeError(w http.ResponseWriter, r *http.Request, status int, msg string) {
-	writeJSON(w, status, errorDoc{
-		Error: msg,
-		Links: linkSet{Collection: &link{Href: h.baseURL(r) + "/people"}},
-	})
+func (h *handler) writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, errorDoc{Error: msg})
 }
 
-func personHref(base string, id string) string {
-	return base + "/people/" + url.PathEscape(id)
-}
-
-func parseID(s string) (string, error) {
-	id, err := uuid.Parse(s)
-	if err != nil {
-		return "", errors.New("id must be a UUID")
+func parseID(s string) (int64, error) {
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || id < 1 {
+		return 0, errors.New("id must be a positive integer")
 	}
-	return id.String(), nil
-}
-
-func pageLinks(base string, page, size, total int, q url.Values) linkSet {
-	last := 1
-	if total > 0 {
-		last = (total + size - 1) / size
-	}
-	links := linkSet{
-		Self:  &link{Href: pageHref(base, page, size, q)},
-		First: &link{Href: pageHref(base, 1, size, q)},
-		Last:  &link{Href: pageHref(base, last, size, q)},
-	}
-	if page > 1 {
-		links.Prev = &link{Href: pageHref(base, page-1, size, q)}
-	}
-	if page < last {
-		links.Next = &link{Href: pageHref(base, page+1, size, q)}
-	}
-	return links
-}
-
-func pageHref(base string, page, size int, q url.Values) string {
-	v := url.Values{}
-	v.Set("page", strconv.Itoa(page))
-	v.Set("size", strconv.Itoa(size))
-	for _, key := range []string{"name", "email", "phone", "created_after", "created_before"} {
-		if s := q.Get(key); s != "" {
-			v.Set(key, s)
-		}
-	}
-	return base + "/people?" + v.Encode()
+	return id, nil
 }
 
 func parseListQuery(r *http.Request) (int, int, Filter, error) {
@@ -363,7 +268,7 @@ func personFromCreate(req personRequest) (Person, error) {
 	}, nil
 }
 
-func personFromUpdate(id string, req personRequest) (Person, error) {
+func personFromUpdate(id int64, req personRequest) (Person, error) {
 	name := strings.TrimSpace(req.Name)
 	email := strings.TrimSpace(req.Email)
 	if name == "" || email == "" {
@@ -418,7 +323,7 @@ func parseTime(value string) (time.Time, error) {
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	if ct := r.Header.Get("Content-Type"); ct != "" {
 		media, _, err := mime.ParseMediaType(ct)
-		if err != nil || (media != "application/json" && media != halContentType) {
+		if err != nil || media != "application/json" {
 			return errors.New("content type must be application/json")
 		}
 	}
@@ -450,7 +355,7 @@ func publicDecodeError(err error) error {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", halContentType)
+	w.Header().Set("Content-Type", jsonContentType)
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)

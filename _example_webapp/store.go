@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/google/uuid"
 )
 
 const peopleTable = "mytable"
@@ -37,7 +36,7 @@ var (
 
 // Person is one row of the example server's mytable.
 type Person struct {
-	ID           string
+	ID           int64
 	Name         string
 	Email        string
 	PhoneNumbers []string
@@ -62,10 +61,10 @@ type ListResult struct {
 // Store is the persistence used by the HTTP API.
 type Store interface {
 	List(ctx context.Context, f Filter, page, size int) (ListResult, error)
-	Get(ctx context.Context, id string) (Person, error)
+	Get(ctx context.Context, id int64) (Person, error)
 	Insert(ctx context.Context, p Person) (Person, error)
 	Update(ctx context.Context, p Person) error
-	Delete(ctx context.Context, id string) error
+	Delete(ctx context.Context, id int64) error
 }
 
 type mysqlStore struct {
@@ -109,7 +108,7 @@ func (s *mysqlStore) List(ctx context.Context, f Filter, page, size int) (ListRe
 	return ListResult{People: people, Total: total}, nil
 }
 
-func (s *mysqlStore) Get(ctx context.Context, id string) (Person, error) {
+func (s *mysqlStore) Get(ctx context.Context, id int64) (Person, error) {
 	row := s.db.QueryRowContext(ctx,
 		"SELECT id, name, email, phone_numbers, created_at FROM "+peopleTable+" WHERE id = ?",
 		id,
@@ -126,13 +125,16 @@ func (s *mysqlStore) Insert(ctx context.Context, p Person) (Person, error) {
 	if err != nil {
 		return Person{}, err
 	}
-	p.ID = uuid.New().String()
-	_, err = s.db.ExecContext(ctx,
-		"INSERT INTO "+peopleTable+" (id, name, email, phone_numbers, created_at) VALUES (?, ?, ?, ?, ?)",
-		p.ID, p.Name, p.Email, phones, p.CreatedAt.UTC(),
+	res, err := s.db.ExecContext(ctx,
+		"INSERT INTO "+peopleTable+" (name, email, phone_numbers, created_at) VALUES (?, ?, ?, ?)",
+		p.Name, p.Email, phones, p.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return Person{}, mapSQL(err)
+	}
+	p.ID, err = res.LastInsertId()
+	if err != nil {
+		return Person{}, err
 	}
 	p.PhoneNumbers = normalizePhones(p.PhoneNumbers)
 	return p, nil
@@ -160,7 +162,7 @@ func (s *mysqlStore) Update(ctx context.Context, p Person) error {
 	return nil
 }
 
-func (s *mysqlStore) Delete(ctx context.Context, id string) error {
+func (s *mysqlStore) Delete(ctx context.Context, id int64) error {
 	res, err := s.db.ExecContext(ctx,
 		"DELETE FROM "+peopleTable+" WHERE id = ?",
 		id,

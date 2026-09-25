@@ -19,9 +19,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/dolthub/vitess/go/sqltypes"
 	"github.com/dolthub/vitess/go/vt/proto/query"
-	"github.com/google/uuid"
 
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/memory"
@@ -34,14 +32,14 @@ import (
 // After running the example, you may connect to it using the following:
 //
 // > mysql --host=localhost --port=3306 --user=root mydb --execute="SELECT * FROM mytable;"
-// +--------------------------------------+----------+-------------------+-------------------------------+----------------------------+
-// | id                                   | name     | email             | phone_numbers                 | created_at                 |
-// +--------------------------------------+----------+-------------------+-------------------------------+----------------------------+
-// | 6ccd780c-baba-1026-9564-5b8c656024db | Jane Deo | janedeo@gmail.com | ["556-565-566","777-777-777"] | 2022-11-01 12:00:00.000001 |
-// | ...                                  |          |                   |                               |                            |
-// +--------------------------------------+----------+-------------------+-------------------------------+----------------------------+
-//
-// id values are generated with uuid.New() at startup, so they change each run.
+// +----+----------+-------------------+-------------------------------+----------------------------+
+// | id | name     | email             | phone_numbers                 | created_at                 |
+// +----+----------+-------------------+-------------------------------+----------------------------+
+// | 1  | Jane Deo | janedeo@gmail.com | ["556-565-566","777-777-777"] | 2022-11-01 12:00:00.000001 |
+// | 2  | Jane Doe | jane@doe.com      | []                            | 2022-11-01 12:00:00.000001 |
+// | 3  | John Doe | john@doe.com      | ["555-555-555"]               | 2022-11-01 12:00:00.000001 |
+// | 4  | John Doe | johnalt@doe.com   | []                            | 2022-11-01 12:00:00.000001 |
+// +----+----------+-------------------+-------------------------------+----------------------------+
 //
 // The included MySQL client is used in this example, however any MySQL-compatible client will work.
 
@@ -93,7 +91,7 @@ func createTestDatabase() *memory.DbProvider {
 	ctx.Session = session
 
 	table := memory.NewTable(ctx, db, tableName, sql.NewPrimaryKeySchema(sql.Schema{
-		{Name: "id", Type: types.MustCreateStringWithDefaults(sqltypes.Char, 36), Nullable: false, Source: tableName, PrimaryKey: true},
+		{Name: "id", Type: types.Int64, Nullable: false, Source: tableName, PrimaryKey: true, AutoIncrement: true},
 		{Name: "name", Type: types.Text, Nullable: false, Source: tableName},
 		{Name: "email", Type: types.Text, Nullable: false, Source: tableName},
 		{Name: "phone_numbers", Type: types.JSON, Nullable: false, Source: tableName},
@@ -102,10 +100,10 @@ func createTestDatabase() *memory.DbProvider {
 	db.AddTable(tableName, table)
 
 	creationTime := time.Unix(0, 1667304000000001000).UTC()
-	_ = table.Insert(ctx, sql.NewRow(uuid.New().String(), "Jane Deo", "janedeo@gmail.com", types.MustJSON(`["556-565-566", "777-777-777"]`), creationTime))
-	_ = table.Insert(ctx, sql.NewRow(uuid.New().String(), "Jane Doe", "jane@doe.com", types.MustJSON(`[]`), creationTime))
-	_ = table.Insert(ctx, sql.NewRow(uuid.New().String(), "John Doe", "john@doe.com", types.MustJSON(`["555-555-555"]`), creationTime))
-	_ = table.Insert(ctx, sql.NewRow(uuid.New().String(), "John Doe", "johnalt@doe.com", types.MustJSON(`[]`), creationTime))
+	_ = table.Insert(ctx, sql.NewRow(int64(1), "Jane Deo", "janedeo@gmail.com", types.MustJSON(`["556-565-566", "777-777-777"]`), creationTime))
+	_ = table.Insert(ctx, sql.NewRow(int64(2), "Jane Doe", "jane@doe.com", types.MustJSON(`[]`), creationTime))
+	_ = table.Insert(ctx, sql.NewRow(int64(3), "John Doe", "john@doe.com", types.MustJSON(`["555-555-555"]`), creationTime))
+	_ = table.Insert(ctx, sql.NewRow(int64(4), "John Doe", "johnalt@doe.com", types.MustJSON(`[]`), creationTime))
 
 	return pro
 }
