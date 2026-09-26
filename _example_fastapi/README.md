@@ -39,7 +39,7 @@ curl -s -X POST localhost:8080/people \
 | `MYSQL_READ_ADDRS` | empty (read the write server) |
 | `MYSQL_USER` | `root` |
 | `MYSQL_PASSWORD` | `dev-only-change-me` |
-| `MYSQL_TLS_CA` | `../_persist/certs/server.crt`. Set to `off` for a plaintext server. |
+| `MYSQL_TLS_CA` | `../_persist/certs/ca.crt`. Set to `off` for a plaintext server. |
 | `MYSQL_DB` | `mydb` |
 | `HTTP_ADDR` | `:8080` |
 

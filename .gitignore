@@ -13,6 +13,10 @@ _persist/_persist
 /data/
 _persist/data/
 _persist/certs/
+_persist/stress/last-compare.txt
+_persist/stress/summary.md
+_persist/stress/results/
+_persist/stress/certs/
 
 # Local environment
 .env

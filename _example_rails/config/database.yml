@@ -13,7 +13,7 @@ default: &default
   host: <%= ENV.fetch("MYSQL_HOST", "127.0.0.1") %>
   database: <%= ENV.fetch("MYSQL_DB", "mydb") %>
   <%# Default trusts the _persist dev certificate. MYSQL_TLS_CA=off uses plaintext. %>
-  <% tls_ca = ENV.fetch("MYSQL_TLS_CA") { Rails.root.join("../_persist/certs/server.crt").to_s } %>
+  <% tls_ca = ENV.fetch("MYSQL_TLS_CA") { Rails.root.join("../_persist/certs/ca.crt").to_s } %>
   <% if tls_ca != "" && tls_ca != "off" %>
   sslca: <%= tls_ca %>
   ssl_mode: required

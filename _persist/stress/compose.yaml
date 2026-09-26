@@ -1,0 +1,261 @@
+# Servers for the stress tool. Ports stay off 3306-3308 so this can run beside
+# the example cluster in ../compose.yaml.
+#
+#   single    127.0.0.1:3316
+#   cluster   write 127.0.0.1:3326, read 127.0.0.1:3327 and 127.0.0.1:3328
+#   mysql     127.0.0.1:3336
+#   tidb      127.0.0.1:3346
+#
+# MySQL flushes the redo log and the binlog on commit, which is the same
+# durability bar as the single-node persist server (Badger SyncWrites).
+# The cluster also waits for a Raft quorum before a write returns.
+# TiDB reads and writes go through one SQL server to three TiKV nodes.
+# A committed write waits for two Raft quorums, prewrite then commit.
+#
+# Every server requires TLS. The persist account is caching_sha2_password,
+# and that plugin is refused on a plaintext TCP connection. MySQL uses the
+# same certificate so the comparison includes the same handshake cost.
+# run.sh writes _persist/stress/certs the first time it starts.
+#
+# Start one profile from go-mysql-server:
+#
+#   docker compose -f _persist/stress/compose.yaml --profile single up -d --build
+#   docker compose -f _persist/stress/compose.yaml --profile cluster up -d --build
+#   docker compose -f _persist/stress/compose.yaml --profile mysql up -d
+#   docker compose -f _persist/stress/compose.yaml --profile tidb up -d
+#
+# _persist/stress/run.sh does that and then runs the client.
+
+name: gms-stress
+
+x-build: &build
+  context: ../..
+  dockerfile: _persist/Dockerfile
+  additional_contexts:
+    badger: ../../../badger
+
+x-gms: &gms
+  GMS_BOOTSTRAP_PASSWORD: stress
+  GMS_DATA: /data/gms
+  GMS_TLS_CERT: /certs/server.crt
+  GMS_TLS_KEY: /certs/server.key
+  GMS_RAFT_TLS_CERT: /certs/server.crt
+  GMS_RAFT_TLS_KEY: /certs/server.key
+  GMS_RAFT_TLS_CA: /certs/ca.crt
+
+x-certs: &certs ./certs:/certs:ro
+
+services:
+  single:
+    profiles: ["single"]
+    build: *build
+    image: gms-stress:local
+    environment:
+      <<: *gms
+      GMS_MYSQL_HOST: 0.0.0.0
+    ports:
+      - "3316:3306"
+    volumes:
+      - single:/data
+      - *certs
+
+  n1:
+    profiles: ["cluster"]
+    build: *build
+    image: gms-stress:local
+    hostname: n1
+    depends_on:
+      - n2
+      - n3
+    networks:
+      stressnet:
+        ipv4_address: 10.117.0.2
+    environment:
+      <<: *gms
+      GMS_NODE_ID: n1
+      GMS_RAFT_ADDR: 10.117.0.2:7001
+      GMS_RAFT_ADVERTISE: 10.117.0.2:7001
+      GMS_RAFT_PEERS: n1=10.117.0.2:7001,n2=10.117.0.3:7001,n3=10.117.0.4:7001
+      GMS_RAFT_BOOTSTRAP: "1"
+      GMS_SERVER_UUID: 22222222-2222-2222-2222-222222222222
+      GMS_RAFT_DIR: /data/raft
+      GMS_MYSQL_HOST: 10.117.0.2
+    ports:
+      - "3326:3306"
+    volumes:
+      - cn1:/data
+      - *certs
+
+  n2:
+    profiles: ["cluster"]
+    build: *build
+    image: gms-stress:local
+    hostname: n2
+    networks:
+      stressnet:
+        ipv4_address: 10.117.0.3
+    environment:
+      <<: *gms
+      GMS_NODE_ID: n2
+      GMS_RAFT_ADDR: 10.117.0.3:7001
+      GMS_RAFT_ADVERTISE: 10.117.0.3:7001
+      GMS_RAFT_PEERS: n1=10.117.0.2:7001,n2=10.117.0.3:7001,n3=10.117.0.4:7001
+      GMS_SERVER_UUID: 22222222-2222-2222-2222-222222222222
+      GMS_RAFT_DIR: /data/raft
+      GMS_MYSQL_HOST: 10.117.0.3
+    ports:
+      - "3327:3306"
+    volumes:
+      - cn2:/data
+      - *certs
+
+  n3:
+    profiles: ["cluster"]
+    build: *build
+    image: gms-stress:local
+    hostname: n3
+    networks:
+      stressnet:
+        ipv4_address: 10.117.0.4
+    environment:
+      <<: *gms
+      GMS_NODE_ID: n3
+      GMS_RAFT_ADDR: 10.117.0.4:7001
+      GMS_RAFT_ADVERTISE: 10.117.0.4:7001
+      GMS_RAFT_PEERS: n1=10.117.0.2:7001,n2=10.117.0.3:7001,n3=10.117.0.4:7001
+      GMS_SERVER_UUID: 22222222-2222-2222-2222-222222222222
+      GMS_RAFT_DIR: /data/raft
+      GMS_MYSQL_HOST: 10.117.0.4
+    ports:
+      - "3328:3306"
+    volumes:
+      - cn3:/data
+      - *certs
+
+  mysql:
+    profiles: ["mysql"]
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: stress
+      MYSQL_DATABASE: stress
+    command:
+      - --innodb-flush-log-at-trx-commit=1
+      - --sync-binlog=1
+      - --require-secure-transport=ON
+      - --ssl-cert=/certs/server.crt
+      - --ssl-key=/certs/server.key
+    ports:
+      - "3336:3306"
+    volumes:
+      - mysql:/var/lib/mysql
+      - *certs
+
+  pd:
+    profiles: ["tidb"]
+    image: pingcap/pd:v8.5.6
+    hostname: pd
+    networks:
+      - stressnet
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+      - --data-dir=/data
+    volumes:
+      - tidb-pd:/data
+
+  tikv1:
+    profiles: ["tidb"]
+    image: pingcap/tikv:v8.5.6
+    hostname: tikv1
+    networks:
+      - stressnet
+    depends_on:
+      - pd
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv1:20160
+      - --data-dir=/data
+      - --pd=pd:2379
+      - --config=/tikv.toml
+    volumes:
+      - tidb-kv1:/data
+      - ./tikv.toml:/tikv.toml:ro
+
+  tikv2:
+    profiles: ["tidb"]
+    image: pingcap/tikv:v8.5.6
+    hostname: tikv2
+    networks:
+      - stressnet
+    depends_on:
+      - pd
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv2:20160
+      - --data-dir=/data
+      - --pd=pd:2379
+      - --config=/tikv.toml
+    volumes:
+      - tidb-kv2:/data
+      - ./tikv.toml:/tikv.toml:ro
+
+  tikv3:
+    profiles: ["tidb"]
+    image: pingcap/tikv:v8.5.6
+    hostname: tikv3
+    networks:
+      - stressnet
+    depends_on:
+      - pd
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv3:20160
+      - --data-dir=/data
+      - --pd=pd:2379
+      - --config=/tikv.toml
+    volumes:
+      - tidb-kv3:/data
+      - ./tikv.toml:/tikv.toml:ro
+
+  tidb:
+    profiles: ["tidb"]
+    image: pingcap/tidb:v8.5.6
+    hostname: tidb
+    networks:
+      - stressnet
+    depends_on:
+      - tikv1
+      - tikv2
+      - tikv3
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --config=/tidb.toml
+      - --advertise-address=tidb
+    ports:
+      - "3346:4000"
+    volumes:
+      - ./tidb.toml:/tidb.toml:ro
+      - *certs
+
+networks:
+  stressnet:
+    ipam:
+      config:
+        - subnet: 10.117.0.0/24
+          gateway: 10.117.0.1
+
+volumes:
+  single:
+  cn1:
+  cn2:
+  cn3:
+  mysql:
+  tidb-pd:
+  tidb-kv1:
+  tidb-kv2:
+  tidb-kv3:

@@ -79,6 +79,11 @@ var _ mysql.Handler = (*Handler)(nil)
 var _ mysql.ExtendedHandler = (*Handler)(nil)
 var _ mysql.BinlogReplicaHandler = (*Handler)(nil)
 
+// ConnectionSession returns the SQL session for a connection.
+func (h *Handler) ConnectionSession(c *mysql.Conn) sql.Session {
+	return h.sm.session(c)
+}
+
 // NewConnection reports that a new connection has been established.
 func (h *Handler) NewConnection(c *mysql.Conn) {
 	if h.sel != nil {
@@ -1196,6 +1201,11 @@ func RowValueToSQLValues(ctx *sql.Context, sch sql.Schema, row sql.ValueRow, buf
 	return outVals, nil
 }
 
+// SchemaToFields converts a schema to MySQL result fields.
+func SchemaToFields(ctx *sql.Context, s sql.Schema) []*querypb.Field {
+	return schemaToFields(ctx, s)
+}
+
 func schemaToFields(ctx *sql.Context, s sql.Schema) []*querypb.Field {
 	charSetResults := ctx.GetCharacterSetResults()
 	fields := make([]*querypb.Field, len(s))
@@ -1309,6 +1319,11 @@ func (h *Handler) executeBoundPlan(
 	qFlags *sql.QueryFlags,
 ) (sql.Schema, sql.RowIter, *sql.QueryFlags, error) {
 	return h.e.PrepQueryPlanForExecution(ctx, query, plan, qFlags)
+}
+
+// BindingsToExprs converts prepared-statement values into parser expressions.
+func BindingsToExprs(bindings map[string]*querypb.BindVariable) (map[string]sqlparser.Expr, error) {
+	return bindingsToExprs(bindings)
 }
 
 func bindingsToExprs(bindings map[string]*querypb.BindVariable) (map[string]sqlparser.Expr, error) {

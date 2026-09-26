@@ -2,6 +2,7 @@ package persist
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -52,6 +53,15 @@ type ClusterOptions struct {
 	// OnLeadership runs after this node gains or loses leadership. It is
 	// called from a goroutine that is not the Raft thread.
 	OnLeadership func(isLeader bool)
+	// TLS is the mutual TLS config for Raft and the forward listener.
+	// A non-loopback bind without TLS is refused.
+	TLS *tls.Config
+	// ForwardAddr is this node's write-forward listener. Empty uses port 7002
+	// on the advertise host when this process opens its own TCP transport.
+	ForwardAddr string
+	// ForwardDir publishes ephemeral forward addresses. Production leaves it
+	// nil and derives the leader's address from the Raft host and port 7002.
+	ForwardDir *ForwardDir
 }
 
 // ParsePeers parses "id=host:port,id2=host:port". An empty string is no peers.
@@ -158,6 +168,13 @@ type cluster struct {
 	log       *raftboltdb.BoltStore
 	transport raft.Transport
 	timeout   time.Duration
+	tls       *tls.Config
+
+	forwardLn   net.Listener
+	forwardPort string
+	forwardDir  *ForwardDir
+	execMu      sync.RWMutex
+	exec        ForwardExec
 
 	// recordMu serializes recording. It is not held while Raft waits, so the
 	// next statement can record against batches still in flight.
@@ -184,12 +201,19 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 	transport := opts.Transport
 	var err error
 	if transport == nil {
+		if opts.TLS == nil && !loopbackHost(opts.Bind) {
+			return nil, fmt.Errorf("persist: raft on %s requires GMS_RAFT_TLS_CERT, GMS_RAFT_TLS_KEY, and GMS_RAFT_TLS_CA", opts.Bind)
+		}
 		var addr *net.TCPAddr
 		addr, err = net.ResolveTCPAddr("tcp", opts.Advertise)
 		if err != nil {
 			return nil, err
 		}
-		transport, err = raft.NewTCPTransport(opts.Bind, addr, 3, 10*time.Second, os.Stderr)
+		if opts.TLS == nil {
+			transport, err = raft.NewTCPTransport(opts.Bind, addr, 3, 10*time.Second, os.Stderr)
+		} else {
+			transport, err = newTLSTransport(opts.Bind, addr, opts.TLS)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -237,18 +261,69 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		return nil, err
 	}
 	c := &cluster{
-		store:     store,
-		id:        raft.ServerID(opts.ID),
-		raft:      r,
-		log:       bolt,
-		transport: transport,
-		timeout:   opts.ApplyTimeout,
-		exited:    make(chan struct{}),
-		nextID:    newBatchEpoch(),
+		store:      store,
+		id:         raft.ServerID(opts.ID),
+		raft:       r,
+		log:        bolt,
+		transport:  transport,
+		timeout:    opts.ApplyTimeout,
+		tls:        opts.TLS,
+		forwardDir: opts.ForwardDir,
+		exited:     make(chan struct{}),
+		nextID:     newBatchEpoch(),
+	}
+	if err := c.listenForward(opts); err != nil {
+		r.Shutdown()
+		closeTransport(transport)
+		bolt.Close()
+		return nil, err
 	}
 	c.cond = sync.NewCond(&store.mu)
 	go c.proposeLoop()
 	return c, nil
+}
+
+func (c *cluster) listenForward(opts ClusterOptions) error {
+	listen, port, ok := forwardListenAddr(opts)
+	if !ok {
+		return nil
+	}
+	ln, err := listenForward(listen, opts.TLS)
+	if err != nil {
+		return err
+	}
+	_, actual, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		ln.Close()
+		return err
+	}
+	c.forwardLn = ln
+	if port == "0" || port == "" {
+		c.forwardPort = actual
+	} else {
+		c.forwardPort = port
+	}
+	opts.ForwardDir.Set(opts.Advertise, ln.Addr().String())
+	go c.serveForward(ln)
+	return nil
+}
+
+func forwardListenAddr(opts ClusterOptions) (listen, port string, ok bool) {
+	if opts.ForwardAddr != "" {
+		_, port, err := net.SplitHostPort(opts.ForwardAddr)
+		if err != nil {
+			return "", "", false
+		}
+		return opts.ForwardAddr, port, true
+	}
+	if opts.Transport != nil {
+		return "", "", false
+	}
+	host, _, err := net.SplitHostPort(opts.Advertise)
+	if err != nil || host == "" {
+		return "", "", false
+	}
+	return net.JoinHostPort(host, defaultForwardPort), defaultForwardPort, true
 }
 
 // watchLeadership reports leadership changes. LeaderCh is a one-slot channel,
@@ -559,6 +634,9 @@ func (c *cluster) notLeader() error {
 }
 
 func (c *cluster) shutdown() error {
+	if c.forwardLn != nil {
+		_ = c.forwardLn.Close()
+	}
 	c.store.mu.Lock()
 	c.stopped = true
 	c.cond.Broadcast()

@@ -2,11 +2,11 @@
 
 Run one Raft group on three droplets in the same region and the same VPC. Clients talk to MySQL on the private addresses. Raft stays on those private addresses too. The public interface does not listen for either port.
 
-Raft is plaintext TCP. A droplet that can open port 7001 can read committed writes and snapshots. The Cloud Firewall is what keeps that port inside the group. MySQL requires TLS.
+Raft and the write-forward port require mutual TLS. The Cloud Firewall keeps ports 7001 and 7002 inside the group. MySQL requires TLS too.
 
-Writes succeed on the Raft leader. The other two nodes are read-only until one of them is elected. Point the application write address at the current leader.
+Writes succeed on the Raft leader. A follower forwards writes to whichever node is the leader, so clients can keep using any MySQL address. A read on that same connection waits until the write is applied locally. Other connections can still lag.
 
-`compose.yaml` in the parent directory is the same address plan on a bridge network named `vpc`. Local testing, including the test certificate, is in [the persist README](../README.md#local-testing). On droplets, use the `docker run` commands below. Three containers cannot share host networking on one machine, because each one binds ports 3306 and 7001.
+`compose.yaml` in the parent directory is the same address plan on a bridge network named `vpc`. Local testing, including the test certificate, is in [the persist README](../README.md#local-testing). On droplets, use the `docker run` commands below. Three containers cannot share host networking on one machine, because each one binds ports 3306, 7001, and 7002.
 
 ## Droplets
 
@@ -29,6 +29,7 @@ One Cloud Firewall, applied to tag `gms`. Inbound rules:
 | SSH | 22 | Your own IP |
 | MySQL | 3306 | Tag `gms`, plus the tag or addresses of the app droplets |
 | Raft | 7001 | Tag `gms` |
+| Forward | 7002 | Tag `gms` |
 
 Leave every other inbound port closed. Do not add a public address to 3306 or 7001.
 
@@ -36,16 +37,27 @@ App droplets in this VPC reach MySQL on the private addresses. A client on the i
 
 ## Certificate
 
-Create one certificate whose names are the addresses clients dial. Run this once, then copy `server.crt` and `server.key` to `/data/certs` on each droplet.
+Create a CA and one certificate whose names are the addresses clients and peers dial. The same certificate authenticates MySQL, Raft, and the write-forward port. Run this once, then copy `ca.crt`, `server.crt`, and `server.key` to `/data/certs` on each droplet.
 
 ```bash
 mkdir -p /data/certs
 openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout /data/certs/server.key \
-  -out /data/certs/server.crt \
+  -keyout /data/certs/ca.key \
+  -out /data/certs/ca.crt \
   -days 365 \
+  -subj "/CN=gms-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+openssl req -newkey rsa:2048 -nodes \
+  -keyout /data/certs/server.key \
+  -out /data/certs/server.csr \
   -subj "/CN=gms" \
-  -addext "subjectAltName=IP:10.116.0.2,IP:10.116.0.3,IP:10.116.0.4"
+  -addext "subjectAltName=IP:10.116.0.2,IP:10.116.0.3,IP:10.116.0.4" \
+  -addext "extendedKeyUsage=serverAuth,clientAuth"
+openssl x509 -req -in /data/certs/server.csr \
+  -CA /data/certs/ca.crt -CAkey /data/certs/ca.key -CAcreateserial \
+  -out /data/certs/server.crt -days 365 \
+  -copy_extensions copy
 ```
 
 ## Node environment
@@ -65,6 +77,9 @@ GMS_MYSQL_HOST=10.116.0.2
 GMS_BOOTSTRAP_PASSWORD=replace-me
 GMS_TLS_CERT=/data/certs/server.crt
 GMS_TLS_KEY=/data/certs/server.key
+GMS_RAFT_TLS_CERT=/data/certs/server.crt
+GMS_RAFT_TLS_KEY=/data/certs/server.key
+GMS_RAFT_TLS_CA=/data/certs/ca.crt
 ```
 
 n2 and n3 use the same peers, the same `GMS_SERVER_UUID`, and the same password and certificate paths. Change `GMS_NODE_ID`, `GMS_RAFT_ADDR`, `GMS_RAFT_ADVERTISE`, and `GMS_MYSQL_HOST` to that droplet's VPC address. Leave `GMS_RAFT_BOOTSTRAP` unset on n2 and n3.
@@ -93,8 +108,8 @@ From an app droplet in the VPC:
 
 ```bash
 mysql --host=10.116.0.2 --port=3306 --user=root --password=replace-me \
-  --ssl-mode=REQUIRED --ssl-ca=/data/certs/server.crt \
+  --ssl-mode=REQUIRED --ssl-ca=/data/certs/ca.crt \
   mydb --execute="SELECT name, email FROM mytable;"
 ```
 
-Use `.3` and `.4` for reads. A write to a follower returns the read-only error. After an election, point writes at whichever node became leader.
+Use `.3` and `.4` for reads. A write to any node is forwarded to the current leader.

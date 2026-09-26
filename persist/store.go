@@ -65,6 +65,8 @@ type Store struct {
 	privSkip int
 	lockOnce sync.Once
 	rowLock  *lockTable
+	gcStop   chan struct{}
+	gcDone   chan struct{}
 }
 
 var _ sql.DatabaseProvider = (*Store)(nil)
@@ -91,7 +93,9 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db, path: path, syncWrites: syncWrites}, nil
+	s := &Store{db: db, path: path, syncWrites: syncWrites}
+	s.startValueLogGC()
+	return s, nil
 }
 
 // badgerDB returns the open database. A snapshot restore swaps it under dbMu.
@@ -103,6 +107,7 @@ func (s *Store) badgerDB() *badger.DB {
 
 // Close releases the file lock. A cluster node leaves the Raft group first.
 func (s *Store) Close() error {
+	s.stopValueLogGC()
 	s.stopReplica()
 	if s.cluster != nil {
 		if err := s.cluster.shutdown(); err != nil {

@@ -807,6 +807,13 @@ func (b *BaseBuilder) buildShowReplicaStatus(ctx *sql.Context, n *plan.ShowRepli
 	replicateIgnoreTables := strings.Join(status.ReplicateIgnoreTables, ",")
 	replicateWildDoTables := strings.Join(status.ReplicateWildDoTables, ",")
 	replicateWildIgnoreTables := strings.Join(status.ReplicateWildIgnoreTables, ",")
+	var replicateDoDB, replicateIgnoreDB interface{}
+	if len(status.ReplicateDoDBs) > 0 {
+		replicateDoDB = strings.Join(status.ReplicateDoDBs, ",")
+	}
+	if len(status.ReplicateIgnoreDBs) > 0 {
+		replicateIgnoreDB = strings.Join(status.ReplicateIgnoreDBs, ",")
+	}
 
 	lastIoErrorTimestamp := formatReplicaStatusTimestamp(status.LastIoErrorTimestamp)
 	lastSqlErrorTimestamp := formatReplicaStatusTimestamp(status.LastSqlErrorTimestamp)
@@ -833,8 +840,8 @@ func (b *BaseBuilder) buildShowReplicaStatus(ctx *sql.Context, n *plan.ShowRepli
 		"INVALID",                   // Relay_Source_Log_File
 		status.ReplicaIoRunning,     // Replica_IO_Running
 		status.ReplicaSqlRunning,    // Replica_SQL_Running
-		nil,                         // Replicate_Do_DB
-		nil,                         // Replicate_Ignore_DB
+		replicateDoDB,               // Replicate_Do_DB
+		replicateIgnoreDB,           // Replicate_Ignore_DB
 		replicateDoTables,           // Replicate_Do_Table
 		replicateIgnoreTables,       // Replicate_Ignore_Table
 		replicateWildDoTables,       // Replicate_Wild_Do_Table

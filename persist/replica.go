@@ -54,6 +54,8 @@ type replicaSource struct {
 	IgnoreTables []string `json:"ignore_tables,omitempty"`
 	WildDo       []string `json:"wild_do,omitempty"`
 	WildIgnore   []string `json:"wild_ignore,omitempty"`
+	DoDBs        []string `json:"do_dbs,omitempty"`
+	IgnoreDBs    []string `json:"ignore_dbs,omitempty"`
 	Password     string   `json:"-"`
 }
 
@@ -594,6 +596,12 @@ func (s *Store) SetReplicationFilterOptions(_ *sql.Context, options []binlogrepl
 			src.WildDo, err = optionStringList(option)
 		case "REPLICATE_WILD_IGNORE_TABLE":
 			src.WildIgnore, err = optionStringList(option)
+		case "REPLICATE_DO_DB":
+			src.DoDBs, err = optionStringList(option)
+		case "REPLICATE_IGNORE_DB":
+			src.IgnoreDBs, err = optionStringList(option)
+		case "REPLICATE_REWRITE_DB":
+			err = fmt.Errorf("persist: unsupported replication filter: %s", option.Name)
 		default:
 			err = fmt.Errorf("persist: unsupported replication filter: %s", option.Name)
 		}
@@ -748,6 +756,8 @@ func (s *Store) GetReplicaStatus(*sql.Context) (*binlogreplication.ReplicaStatus
 	status.ReplicateIgnoreTables = append([]string(nil), src.IgnoreTables...)
 	status.ReplicateWildDoTables = append([]string(nil), src.WildDo...)
 	status.ReplicateWildIgnoreTables = append([]string(nil), src.WildIgnore...)
+	status.ReplicateDoDBs = append([]string(nil), src.DoDBs...)
+	status.ReplicateIgnoreDBs = append([]string(nil), src.IgnoreDBs...)
 	if status.ReplicaIoRunning == "" {
 		status.ReplicaIoRunning = binlogreplication.ReplicaIoNotRunning
 	}
@@ -816,6 +826,12 @@ func optionStringList(option binlogreplication.ReplicationOption) ([]string, err
 }
 
 func (src replicaSource) allowsTable(db, table string) bool {
+	if len(src.DoDBs) > 0 && !listHasFold(src.DoDBs, db) {
+		return false
+	}
+	if listHasFold(src.IgnoreDBs, db) {
+		return false
+	}
 	name := db + "." + table
 	if len(src.DoTables) > 0 || len(src.WildDo) > 0 {
 		if !listHasFold(src.DoTables, name) && !wildHas(src.WildDo, name) {
@@ -1053,8 +1069,29 @@ func (a *binlogApply) event(s *Store, ev mysql.BinlogEvent) error {
 			return err
 		}
 		a.txn = nil
+	default:
+		if unsupportedRowsEvent(ev) {
+			return fmt.Errorf("persist: unsupported binlog rows event: %s", ev.TypeName())
+		}
 	}
 	return nil
+}
+
+// unsupportedRowsEvent reports row images this applier cannot apply.
+// Heartbeat, rotate, and previous-GTID events are ignored by the caller.
+func unsupportedRowsEvent(ev mysql.BinlogEvent) bool {
+	raw := ev.Bytes()
+	if len(raw) < 5 {
+		return false
+	}
+	switch raw[4] {
+	case 20, 21, 22: // v0 write, update, and delete rows
+		return true
+	case 39: // PARTIAL_UPDATE_ROWS_EVENT
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *replicaTxn) applyRows(s *Store, tm *mysql.TableMap, ev mysql.BinlogEvent, parsed mysql.Rows) error {

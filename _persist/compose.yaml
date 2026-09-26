@@ -22,6 +22,9 @@ x-env: &env
   GMS_BOOTSTRAP_PASSWORD: ${GMS_BOOTSTRAP_PASSWORD:-dev-only-change-me}
   GMS_TLS_CERT: /certs/server.crt
   GMS_TLS_KEY: /certs/server.key
+  GMS_RAFT_TLS_CERT: /certs/server.crt
+  GMS_RAFT_TLS_KEY: /certs/server.key
+  GMS_RAFT_TLS_CA: /certs/ca.crt
 
 services:
   n1:

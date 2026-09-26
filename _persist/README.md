@@ -46,11 +46,22 @@ Create a test certificate before the first `up`. It is not committed. The names 
 ```bash
 mkdir -p _persist/certs
 openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout _persist/certs/server.key \
-  -out _persist/certs/server.crt \
+  -keyout _persist/certs/ca.key \
+  -out _persist/certs/ca.crt \
   -days 365 \
-  -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,DNS:n1,DNS:n2,DNS:n3,IP:127.0.0.1,IP:10.116.0.2,IP:10.116.0.3,IP:10.116.0.4"
+  -subj "/CN=gms-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+openssl req -newkey rsa:2048 -nodes \
+  -keyout _persist/certs/server.key \
+  -out _persist/certs/server.csr \
+  -subj "/CN=gms" \
+  -addext "subjectAltName=DNS:localhost,DNS:n1,DNS:n2,DNS:n3,IP:127.0.0.1,IP:10.116.0.2,IP:10.116.0.3,IP:10.116.0.4" \
+  -addext "extendedKeyUsage=serverAuth,clientAuth"
+openssl x509 -req -in _persist/certs/server.csr \
+  -CA _persist/certs/ca.crt -CAkey _persist/certs/ca.key -CAcreateserial \
+  -out _persist/certs/server.crt -days 365 \
+  -copy_extensions copy
 docker compose -f _persist/compose.yaml up --build
 ```
 
@@ -64,22 +75,22 @@ Check the leader, then a follower:
 
 ```bash
 mysql --host=127.0.0.1 --port=3306 --user=root --password=dev-only-change-me \
-  --ssl-mode=REQUIRED --ssl-ca=_persist/certs/server.crt \
+  --ssl-mode=REQUIRED --ssl-ca=_persist/certs/ca.crt \
   mydb --execute="SELECT name, email FROM mytable;"
 mysql --host=127.0.0.1 --port=3307 --user=root --password=dev-only-change-me \
-  --ssl-mode=REQUIRED --ssl-ca=_persist/certs/server.crt \
+  --ssl-mode=REQUIRED --ssl-ca=_persist/certs/ca.crt \
   mydb --execute="SELECT name, email FROM mytable;"
 ```
 
 ## Three nodes
 
-Compose sets `GMS_BOOTSTRAP_PASSWORD` to `dev-only-change-me` unless you override it. That value is used only when a node has no accounts yet. TLS is required on the published MySQL ports. Each node binds Raft and MySQL to its address on the `vpc` network: `10.116.0.2`, `10.116.0.3`, and `10.116.0.4`. Raft on port 7001 is not published and is not wrapped in TLS.
+Compose sets `GMS_BOOTSTRAP_PASSWORD` to `dev-only-change-me` unless you override it. That value is used only when a node has no accounts yet. TLS is required on the published MySQL ports. Each node binds Raft and MySQL to its address on the `vpc` network: `10.116.0.2`, `10.116.0.3`, and `10.116.0.4`. Raft on port 7001 and the write-forward port 7002 stay on that network and require mutual TLS. The certificate above is the client certificate as well as the server certificate.
 
 A volume created before those addresses still has the old Raft peer list (`n1:7001` and so on). Remove it before the first start on this plan: `docker compose -f _persist/compose.yaml down -v`.
 
 The same addresses, with host networking and a Cloud Firewall, are what a DigitalOcean deployment uses. See [droplets/README.md](droplets/README.md).
 
-`n1` bootstraps the Raft group. `n2` and `n3` join it. Writes succeed on the leader. The other nodes are read-only until one of them is elected, and they can lag. A client that writes to a follower gets the read-only error. `FLUSH BINARY LOGS` on the leader rolls every node's binlog together. Any node can stream that binlog; the GTID stream is the same after a promotion.
+`n1` bootstraps the Raft group. `n2` and `n3` join it. Writes succeed on the leader. A follower forwards a write, or a whole explicit transaction, to the current leader, then waits until that commit is applied locally before the next read on the same connection. Other connections can still see an older copy. `FLUSH BINARY LOGS` on the leader rolls every node's binlog together. Any node can stream that binlog; the GTID stream is the same after a promotion.
 
 Raft stays on `10.116.0.0/24` and is not published to the host. Each node keeps `/data` in its own volume.
 
@@ -91,7 +102,7 @@ MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 \
 go run .
 ```
 
-The example clients trust `_persist/certs/server.crt` unless `MYSQL_TLS_CA` is set. `MYSQL_TLS_CA=off` connects without TLS. Leave `MYSQL_READ_ADDRS` unset to use only `localhost:3306`.
+The example clients trust `_persist/certs/ca.crt` unless `MYSQL_TLS_CA` is set. `MYSQL_TLS_CA=off` connects without TLS. Leave `MYSQL_READ_ADDRS` unset to use only `localhost:3306`.
 
 ## Environment
 
@@ -100,7 +111,11 @@ The example clients trust `_persist/certs/server.crt` unless `MYSQL_TLS_CA` is s
 | `GMS_DATA` | Badger directory. Default `data/gms`. |
 | `GMS_MYSQL_HOST` | MySQL bind address. Default `localhost`. Use `0.0.0.0` for one published container. The three-node compose file binds each node's private address. |
 | `GMS_MYSQL_PORT` | MySQL port. Default `3306`. |
-| `GMS_RAFT_ADDR` | Turns cluster mode on and sets the Raft bind address, such as `10.116.0.2:7001`. `0.0.0.0` listens on every interface. |
+| `GMS_RAFT_ADDR` | Turns cluster mode on and sets the Raft bind address, such as `10.116.0.2:7001`. `0.0.0.0` listens on every interface. A non-loopback address requires `GMS_RAFT_TLS_CERT`, `GMS_RAFT_TLS_KEY`, and `GMS_RAFT_TLS_CA`. |
+| `GMS_RAFT_TLS_CERT` | PEM certificate for Raft and the write-forward port. It needs `serverAuth` and `clientAuth`. |
+| `GMS_RAFT_TLS_KEY` | PEM private key for that certificate. |
+| `GMS_RAFT_TLS_CA` | PEM CA that signed the certificate. Peers present the certificate and verify it with this CA. |
+| `GMS_FORWARD_ADDR` | Write-forward listen address. The default is port 7002 on the Raft advertise host. |
 | `GMS_RAFT_ADVERTISE` | Address other nodes dial. Defaults to `GMS_RAFT_ADDR`. |
 | `GMS_NODE_ID` | Raft server id. Defaults to the bind address. |
 | `GMS_RAFT_PEERS` | `id=host:port` list, comma-separated. |

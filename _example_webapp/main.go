@@ -26,7 +26,7 @@
 //	MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 go run .
 //
 // Those nodes can lag the leader. Leave MYSQL_READ_ADDRS unset to read and
-// write the same server. Connections use TLS and trust ../_persist/certs/server.crt.
+// write the same server. Connections use TLS and trust ../_persist/certs/ca.crt.
 // Set MYSQL_TLS_CA to another PEM file, or to off for a plaintext server.
 package main
 
@@ -129,9 +129,9 @@ func tlsCAPath() (string, bool) {
 	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
-		return filepath.Join("..", "_persist", "certs", "server.crt"), true
+		return filepath.Join("..", "_persist", "certs", "ca.crt"), true
 	}
-	return filepath.Join(filepath.Dir(file), "..", "_persist", "certs", "server.crt"), true
+	return filepath.Join(filepath.Dir(file), "..", "_persist", "certs", "ca.crt"), true
 }
 
 // registerMySQLTLS trusts the server certificate signed by the PEM file at caPath.

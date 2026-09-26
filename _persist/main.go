@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dolthub/vitess/go/mysql"
 	"github.com/dolthub/vitess/go/vt/proto/query"
 
 	sqle "github.com/dolthub/go-mysql-server"
@@ -74,7 +76,13 @@ func main() {
 		path = "data/gms"
 	}
 	gate := &leadershipGate{}
-	store, err := openStore(path, gate.set)
+	var leader *leaderExec
+	store, err := openStore(path, func(isLeader bool) {
+		gate.set(isLeader)
+		if !isLeader && leader != nil {
+			leader.dropAll()
+		}
+	})
 	if err != nil {
 		log.Fatalf("open %s: %v", path, err)
 	}
@@ -106,6 +114,10 @@ func main() {
 		})
 	}
 	gate.bind(engine, store.Replicating(), store.IsLeader())
+	if store.Replicating() {
+		leader = newLeaderExec(engine, store)
+		store.SetForwardExec(leader.Exec)
+	}
 	if err := enableAuth(ctx, store, engine, accountFromEnv()); err != nil {
 		log.Fatalf("auth: %v", err)
 	}
@@ -122,7 +134,18 @@ func main() {
 		TLSConfig:              tlsConfig,
 		RequireSecureTransport: tlsConfig != nil,
 	}
-	s, err := server.NewServer(config, engine, sql.NewContext, persist.NewSessionBuilder(store), nil)
+	var s *server.Server
+	if store.Replicating() {
+		s, err = server.NewServerWithHandler(config, engine, sql.NewContext, persist.NewSessionBuilder(store), nil, func(h mysql.Handler) (mysql.Handler, error) {
+			inner, ok := h.(*server.Handler)
+			if !ok {
+				return nil, fmt.Errorf("persist: unexpected mysql handler %T", h)
+			}
+			return newForwardHandler(inner, store), nil
+		})
+	} else {
+		s, err = server.NewServer(config, engine, sql.NewContext, persist.NewSessionBuilder(store), nil)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -174,6 +197,13 @@ func openStore(path string, onLeadership func(bool)) (*persist.Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	var tlsConfig *tls.Config
+	if os.Getenv("GMS_RAFT_TLS_CERT") != "" || os.Getenv("GMS_RAFT_TLS_KEY") != "" || os.Getenv("GMS_RAFT_TLS_CA") != "" {
+		tlsConfig, err = persist.LoadRaftTLS(os.Getenv("GMS_RAFT_TLS_CERT"), os.Getenv("GMS_RAFT_TLS_KEY"), os.Getenv("GMS_RAFT_TLS_CA"))
+		if err != nil {
+			return nil, err
+		}
+	}
 	store, err := persist.OpenCluster(path, persist.ClusterOptions{
 		ID:             id,
 		Bind:           addr,
@@ -184,6 +214,8 @@ func openStore(path string, onLeadership func(bool)) (*persist.Store, error) {
 		ServerUUID:     os.Getenv("GMS_SERVER_UUID"),
 		BinlogMaxBytes: maxBytes,
 		OnLeadership:   onLeadership,
+		TLS:            tlsConfig,
+		ForwardAddr:    os.Getenv("GMS_FORWARD_ADDR"),
 	})
 	if err != nil {
 		return nil, err

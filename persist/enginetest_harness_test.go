@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/dolthub/go-mysql-server/enginetest"
-	"github.com/dolthub/go-mysql-server/enginetest/queries"
 	"github.com/dolthub/go-mysql-server/enginetest/scriptgen/setup"
 	"github.com/dolthub/go-mysql-server/memory"
 	"github.com/dolthub/go-mysql-server/sql"
@@ -133,16 +132,6 @@ func TestEngineTriggers(t *testing.T) {
 }
 
 func TestEngineStoredProcedures(t *testing.T) {
-	// TODO: the RowIter returned from a SELECT should not take future changes into
-	// account. The memory harness removes this test for the same reason.
-	kept := queries.ProcedureLogicTests[:0]
-	for _, test := range queries.ProcedureLogicTests {
-		if test.Name == "FETCH captures state at OPEN" {
-			continue
-		}
-		kept = append(kept, test)
-	}
-	queries.ProcedureLogicTests = kept
 	enginetest.TestStoredProcedures(t, newPersistHarness())
 }
 

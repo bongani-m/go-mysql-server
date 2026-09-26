@@ -147,6 +147,8 @@ type ReplicaStatus struct {
 	ReplicaSqlRunning         string
 	ReplicateDoTables         []string
 	ReplicateIgnoreTables     []string
+	ReplicateDoDBs            []string
+	ReplicateIgnoreDBs        []string
 	ReplicateWildDoTables     []string
 	ReplicateWildIgnoreTables []string
 	SourceRetryCount          uint64

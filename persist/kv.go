@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 
@@ -39,8 +40,55 @@ func openBadger(path string, syncWrites bool) (*badger.DB, error) {
 	}
 	opts := badger.DefaultOptions(path).
 		WithSyncWrites(syncWrites).
-		WithLoggingLevel(badger.WARNING)
+		WithLoggingLevel(badger.WARNING).
+		WithValueLogFileSize(valueLogFileSize)
 	return badger.Open(opts)
+}
+
+// valueLogFileSize is the Badger value-log file size. Badger mmaps each file
+// at twice this size, so 64 MiB keeps a fresh directory near 128 MiB instead
+// of the default 2 GiB.
+const valueLogFileSize int64 = 64 << 20
+
+func (s *Store) startValueLogGC() {
+	s.gcStop = make(chan struct{})
+	s.gcDone = make(chan struct{})
+	go func() {
+		defer close(s.gcDone)
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.gcStop:
+				return
+			case <-ticker.C:
+				s.rewriteValueLog()
+			}
+		}
+	}()
+}
+
+func (s *Store) stopValueLogGC() {
+	if s.gcStop == nil {
+		return
+	}
+	close(s.gcStop)
+	<-s.gcDone
+	s.gcStop = nil
+}
+
+// rewriteValueLog discards stale value-log files until Badger has nothing left to rewrite.
+func (s *Store) rewriteValueLog() {
+	db := s.badgerDB()
+	if db == nil {
+		return
+	}
+	for {
+		err := db.RunValueLogGC(0.5)
+		if err != nil {
+			return
+		}
+	}
 }
 
 // view runs fn in a read-only transaction.

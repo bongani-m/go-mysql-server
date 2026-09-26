@@ -14,7 +14,7 @@ the other nodes in ../_persist/compose.yaml:
     MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 python main.py
 
 Those nodes can lag the leader. Leave MYSQL_READ_ADDRS unset to read and
-write the same server. Connections use TLS and trust ../_persist/certs/server.crt.
+write the same server. Connections use TLS and trust ../_persist/certs/ca.crt.
 Set MYSQL_TLS_CA to another PEM file, or to off for a plaintext server.
 """
 
@@ -300,7 +300,7 @@ def tls_ca_path() -> str | None:
         if raw in ("", "off"):
             return None
         return raw
-    return str(Path(__file__).resolve().parent.parent / "_persist" / "certs" / "server.crt")
+    return str(Path(__file__).resolve().parent.parent / "_persist" / "certs" / "ca.crt")
 
 
 def mysql_from_env() -> MySQLStore:
