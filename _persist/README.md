@@ -143,8 +143,7 @@ The default workload is 8 clients for 20 seconds, 80% reads, after seeding 5000 
 | Target | Address |
 |--------|---------|
 | single | `127.0.0.1:3316` |
-| cluster writes | `127.0.0.1:3326` |
-| cluster reads | `127.0.0.1:3327`, `127.0.0.1:3328` |
+| cluster | `127.0.0.1:3326`, `3327`, `3328`. Writes go to the current leader. |
 | mysql | `127.0.0.1:3336` |
 | tidb | `127.0.0.1:3346` |
 

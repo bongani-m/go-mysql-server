@@ -21,7 +21,8 @@
 #
 #   docker compose -f _persist/stress/compose.yaml -p gms-stress down -v
 #
-# Ports: single 3316, cluster leader 3326, followers 3327 and 3328, MySQL 3336, TiDB 3346.
+# Ports: single 3316, cluster 3326 3327 3328, MySQL 3336, TiDB 3346.
+# The cluster client writes to whichever node is the Raft leader.
 # User root, password stress, database stress.
 # Every target serves TLS. The script creates _persist/stress/certs on first use.
 # TiDB setup uses plaintext on the Docker network, then the client connects with TLS.
@@ -248,7 +249,10 @@ run_target() {
 		run_client gms-single -write 127.0.0.1:3316 -tls-ca "$tls_ca" -json "$json" | tee -a "$log"
 		;;
 	cluster)
-		run_client gms-cluster -write 127.0.0.1:3326 -read 127.0.0.1:3327,127.0.0.1:3328 -tls-ca "$tls_ca" -json "$json" | tee -a "$log"
+		local leader_port read_csv
+		leader_port=$(cluster_leader_port)
+		read_csv=$(cluster_read_addrs "$leader_port")
+		run_client gms-cluster -write "127.0.0.1:$leader_port" -read "$read_csv" -tls-ca "$tls_ca" -json "$json" | tee -a "$log"
 		;;
 	mysql)
 		run_client mysql -write 127.0.0.1:3336 -tls-ca "$tls_ca" -json "$json" | tee -a "$log"
@@ -281,6 +285,37 @@ write_summary() {
 # now_ms is unix time in milliseconds.
 now_ms() {
 	python3 -c 'import time; print(int(time.time()*1000))'
+}
+
+# cluster_leader_port is the host port of the current Raft leader.
+# Writes through a follower prepare the statement locally and again on the
+# leader, which made a 5000-account seed take about 10s instead of about 2s.
+cluster_leader_port() {
+	local row leader_raft leader_port
+	row=$(raft_row 3326)
+	leader_raft=$(printf '%s\n' "$row" | awk -F'\t' 'NR==1 {print $2}')
+	read -r _ leader_port <<<"$(node_for "$leader_raft")"
+	if [[ -z "$leader_port" ]]; then
+		echo "could not map leader $leader_raft" >&2
+		return 1
+	fi
+	echo "$leader_port"
+}
+
+# cluster_read_addrs is the comma-separated list of nodes that are not port.
+cluster_read_addrs() {
+	local leader_port=$1
+	local port addrs=""
+	for port in 3326 3327 3328; do
+		if [[ "$port" == "$leader_port" ]]; then
+			continue
+		fi
+		if [[ -n "$addrs" ]]; then
+			addrs+=","
+		fi
+		addrs+="127.0.0.1:$port"
+	done
+	echo "$addrs"
 }
 
 # raft_row prints one SHOW RAFT STATUS line: role, leader, commit, applied, lag.

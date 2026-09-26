@@ -2,7 +2,7 @@
 # the example cluster in ../compose.yaml.
 #
 #   single    127.0.0.1:3316
-#   cluster   write 127.0.0.1:3326, read 127.0.0.1:3327 and 127.0.0.1:3328
+#   cluster   127.0.0.1:3326, 3327, and 3328. Writes go to the current leader.
 #   mysql     127.0.0.1:3336
 #   tidb      127.0.0.1:3346
 #
