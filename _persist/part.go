@@ -84,6 +84,23 @@ type partHandler struct {
 	cfg  *partConfig
 	mu   sync.Mutex
 	pins map[uint32]*partPin
+	// clients is one forward connection per MySQL session per remote address.
+	// A process-wide client would queue every session on one socket.
+	clients map[uint32]map[string]*fwdConn
+	places  placeCache
+}
+
+// fwdConn is a pooled forward connection and the node id used to close it.
+type fwdConn struct {
+	client *persist.ForwardClient
+	node   string
+}
+
+// placeCache is the placement list last read at a meta FSM index.
+type placeCache struct {
+	index uint64
+	list  []persist.TablePlacement
+	ok    bool
 }
 
 func newPartHandler(inner *forwardHandler, meta *persist.Store, cfg *partConfig) mysql.Handler {
@@ -92,21 +109,29 @@ func newPartHandler(inner *forwardHandler, meta *persist.Store, cfg *partConfig)
 		meta:           meta,
 		cfg:            cfg,
 		pins:           make(map[uint32]*partPin),
+		clients:        make(map[uint32]map[string]*fwdConn),
 	}
 }
 
 func (h *partHandler) ConnectionClosed(c *mysql.Conn) {
-	h.mu.Lock()
-	delete(h.pins, c.ConnectionID)
-	h.mu.Unlock()
+	h.dropSession(c.ConnectionID)
 	h.forwardHandler.ConnectionClosed(c)
 }
 
 func (h *partHandler) ComResetConnection(c *mysql.Conn) error {
-	h.mu.Lock()
-	delete(h.pins, c.ConnectionID)
-	h.mu.Unlock()
+	h.dropSession(c.ConnectionID)
 	return h.forwardHandler.ComResetConnection(c)
+}
+
+func (h *partHandler) dropSession(id uint32) {
+	h.mu.Lock()
+	delete(h.pins, id)
+	by := h.clients[id]
+	delete(h.clients, id)
+	h.mu.Unlock()
+	for _, conn := range by {
+		conn.client.Close(conn.node, uint64(id))
+	}
 }
 
 func (h *partHandler) ComQuery(ctx context.Context, c *mysql.Conn, query string, callback mysql.ResultSpoolFn) error {
@@ -154,7 +179,7 @@ func (h *partHandler) dispatch(ctx context.Context, c *mysql.Conn, query string,
 	}
 	switch route.Kind {
 	case RoutePlace:
-		if err := h.savePlacement(route.Place); err != nil {
+		if err := h.savePlacement(c, route.Place); err != nil {
 			return err
 		}
 		return callback(&sqltypes.Result{}, false)
@@ -209,14 +234,36 @@ func (h *partHandler) pin(c *mysql.Conn) *partPin {
 }
 
 func (h *partHandler) placements() ([]persist.TablePlacement, error) {
-	return h.meta.Placements()
+	index := h.meta.FSMApplied()
+	h.mu.Lock()
+	if h.places.ok && h.places.index == index {
+		list := append([]persist.TablePlacement(nil), h.places.list...)
+		h.mu.Unlock()
+		return list, nil
+	}
+	h.mu.Unlock()
+
+	list, err := h.meta.Placements()
+	if err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	if h.meta.FSMApplied() == index {
+		h.places = placeCache{
+			index: index,
+			list:  append([]persist.TablePlacement(nil), list...),
+			ok:    true,
+		}
+	}
+	h.mu.Unlock()
+	return list, nil
 }
 
-func (h *partHandler) savePlacement(p persist.TablePlacement) error {
+func (h *partHandler) savePlacement(c *mysql.Conn, p persist.TablePlacement) error {
 	if h.meta.IsLeader() {
 		return h.meta.SavePlacement(p)
 	}
-	reply, err := dialStore(h.meta, "", queryReq(h.meta, placementSQL(p), nil))
+	reply, err := h.call(c, h.meta, "", queryReq(h.meta, placementSQL(p), nil))
 	if err != nil {
 		return err
 	}
@@ -260,7 +307,7 @@ func (h *partHandler) broadcastDDL(c *mysql.Conn, query string) error {
 }
 
 func (h *partHandler) execMeta(c *mysql.Conn, query string) error {
-	reply, err := dialStore(h.meta, "", h.request(c, h.meta, query, nil))
+	reply, err := h.call(c, h.meta, "", h.request(c, h.meta, query, nil))
 	if err != nil {
 		return err
 	}
@@ -274,11 +321,11 @@ func (h *partHandler) execMeta(c *mysql.Conn, query string) error {
 }
 
 func (h *partHandler) execShard(c *mysql.Conn, shard int, query string, binds []persist.ForwardBind) (persist.ForwardReply, error) {
-	addr, err := h.leaderForward(h.cfg.Contacts[shard])
+	addr, err := h.leaderForward(c, h.cfg.Contacts[shard])
 	if err != nil {
 		return persist.ForwardReply{}, err
 	}
-	reply, err := dialStore(h.store, addr, h.request(c, h.store, query, binds))
+	reply, err := h.call(c, h.store, addr, h.request(c, h.store, query, binds))
 	if err != nil {
 		return persist.ForwardReply{}, err
 	}
@@ -289,42 +336,115 @@ func (h *partHandler) execShard(c *mysql.Conn, shard int, query string, binds []
 }
 
 func (h *partHandler) scatter(c *mysql.Conn, query string, binds []persist.ForwardBind) (persist.ForwardReply, error) {
-	var merged persist.ForwardReply
 	req := h.request(c, h.store, query, binds)
-	for shard := 0; shard < h.cfg.Count; shard++ {
-		reply, err := dialStore(h.store, h.cfg.Contacts[shard], req)
-		if err != nil {
-			return persist.ForwardReply{}, err
-		}
-		if reply.Err != "" {
-			return persist.ForwardReply{}, mysql.NewSQLError(mysql.ERUnknownError, "HY000", "%s", reply.Err)
-		}
-		merged = mergeReply(merged, reply)
+	return scatterCalls(h.cfg.Contacts, h.store.LocalForwardAddr(),
+		func(string) (persist.ForwardReply, error) {
+			return checkedReply(h.store.ExecForward(req))
+		},
+		func(addr string) (persist.ForwardReply, error) {
+			return checkedReply(h.execPooled(c, h.store, addr, req))
+		},
+	)
+}
+
+// checkBatch is how many unique values one scatter probes. A seed insert of
+// 100 rows fits in one query.
+const checkBatch = 200
+
+type checkQuery struct {
+	Column string
+	SQL    string
+}
+
+// checkQueries builds one lookup per column. A value repeated in this
+// statement is a duplicate before any shard is asked.
+func checkQueries(place persist.TablePlacement, checks []routedValue) ([]checkQuery, *routedValue) {
+	if len(checks) == 0 {
+		return nil, nil
 	}
-	return merged, nil
+	type group struct {
+		vals []routedValue
+		seen map[string]struct{}
+	}
+	var order []string
+	groups := make(map[string]*group)
+	for _, check := range checks {
+		g := groups[check.Column]
+		if g == nil {
+			g = &group{seen: make(map[string]struct{})}
+			groups[check.Column] = g
+			order = append(order, check.Column)
+		}
+		if _, ok := g.seen[check.Text]; ok {
+			dup := check
+			return nil, &dup
+		}
+		g.seen[check.Text] = struct{}{}
+		g.vals = append(g.vals, check)
+	}
+	var queries []checkQuery
+	for _, column := range order {
+		vals := groups[column].vals
+		for from := 0; from < len(vals); from += checkBatch {
+			to := from + checkBatch
+			if to > len(vals) {
+				to = len(vals)
+			}
+			var b strings.Builder
+			b.WriteString("SELECT ")
+			b.WriteString(column)
+			b.WriteString(" FROM ")
+			b.WriteString(place.DB)
+			b.WriteByte('.')
+			b.WriteString(place.Table)
+			b.WriteString(" WHERE ")
+			b.WriteString(column)
+			b.WriteString(" IN (")
+			for i, v := range vals[from:to] {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				b.WriteString(sqlLiteral(v))
+			}
+			b.WriteByte(')')
+			queries = append(queries, checkQuery{Column: column, SQL: b.String()})
+		}
+	}
+	return queries, nil
+}
+
+func sqlLiteral(v routedValue) string {
+	if !v.Quote {
+		return v.Text
+	}
+	return "'" + strings.ReplaceAll(v.Text, "'", "''") + "'"
 }
 
 func (h *partHandler) rejectDups(c *mysql.Conn, route Route) error {
-	for _, check := range route.Checks {
-		literal := check.Text
-		if check.Quote {
-			literal = "'" + strings.ReplaceAll(check.Text, "'", "''") + "'"
-		}
-		q := fmt.Sprintf("SELECT 1 FROM %s.%s WHERE %s = %s LIMIT 1", route.Place.DB, route.Place.Table, check.Column, literal)
-		reply, err := h.scatter(c, q, nil)
+	queries, dup := checkQueries(route.Place, route.Checks)
+	if dup != nil {
+		return dupEntry(dup.Text, dup.Column)
+	}
+	for _, q := range queries {
+		reply, err := h.scatter(c, q.SQL, nil)
 		if err != nil {
 			return err
 		}
-		if len(reply.Rows) > 0 {
-			return mysql.NewSQLError(mysql.ERDupEntry, "23000", "Duplicate entry '%s' for key '%s'", check.Text, check.Column)
+		if len(reply.Rows) == 0 || len(reply.Rows[0]) == 0 || reply.Rows[0][0].Null {
+			continue
 		}
+		return dupEntry(string(reply.Rows[0][0].Raw), q.Column)
 	}
 	return nil
 }
 
+func dupEntry(text, column string) error {
+	return mysql.NewSQLError(mysql.ERDupEntry, "23000", "Duplicate entry '%s' for key '%s'", text, column)
+}
+
 // leaderForward resolves the leader's forward address from one member of the group.
-func (h *partHandler) leaderForward(contact string) (string, error) {
-	reply, err := dialStore(h.store, contact, queryReq(h.store, "SHOW RAFT STATUS", nil))
+func (h *partHandler) leaderForward(c *mysql.Conn, contact string) (string, error) {
+	reply, err := h.call(c, h.store, contact, queryReq(h.store, "SHOW RAFT STATUS", nil))
 	if err != nil {
 		return "", err
 	}
@@ -346,19 +466,130 @@ func (h *partHandler) leaderForward(contact string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
-func dialStore(store *persist.Store, addr string, req persist.ForwardRequest) (persist.ForwardReply, error) {
-	var client *persist.ForwardClient
-	var err error
+// call runs req on addr. An empty addr is the store's current leader. The
+// local forward listener runs in-process. Any other address reuses the
+// session's pooled connection.
+func (h *partHandler) call(c *mysql.Conn, store *persist.Store, addr string, req persist.ForwardRequest) (persist.ForwardReply, error) {
 	if addr == "" {
-		client, err = store.DialForward()
-	} else {
-		client, err = store.DialForwardAddr(addr)
+		var err error
+		addr, err = store.LeaderForwardAddr()
+		if err != nil {
+			return persist.ForwardReply{}, err
+		}
 	}
+	if local := store.LocalForwardAddr(); local != "" && addr == local {
+		return store.ExecForward(req)
+	}
+	return h.execPooled(c, store, addr, req)
+}
+
+func (h *partHandler) execPooled(c *mysql.Conn, store *persist.Store, addr string, req persist.ForwardRequest) (persist.ForwardReply, error) {
+	id := uint32(0)
+	if c != nil {
+		id = c.ConnectionID
+	}
+	conn, err := h.clientFor(id, store, addr)
 	if err != nil {
 		return persist.ForwardReply{}, err
 	}
-	defer client.Close(req.Node, req.Session)
-	return client.Exec(req, store.ApplyTimeout())
+	reply, err := conn.client.Exec(req, store.ApplyTimeout())
+	if err != nil {
+		h.retire(id, addr)
+		return persist.ForwardReply{}, err
+	}
+	return reply, nil
+}
+
+func (h *partHandler) clientFor(id uint32, store *persist.Store, addr string) (*fwdConn, error) {
+	h.mu.Lock()
+	if by := h.clients[id]; by != nil {
+		if conn := by[addr]; conn != nil {
+			h.mu.Unlock()
+			return conn, nil
+		}
+	}
+	h.mu.Unlock()
+
+	client, err := store.DialForwardAddr(addr)
+	if err != nil {
+		return nil, err
+	}
+	conn := &fwdConn{client: client, node: store.NodeID()}
+
+	h.mu.Lock()
+	if h.clients[id] == nil {
+		h.clients[id] = make(map[string]*fwdConn)
+	}
+	if existing := h.clients[id][addr]; existing != nil {
+		h.mu.Unlock()
+		client.Close(conn.node, uint64(id))
+		return existing, nil
+	}
+	h.clients[id][addr] = conn
+	h.mu.Unlock()
+	return conn, nil
+}
+
+func (h *partHandler) retire(id uint32, addr string) {
+	h.mu.Lock()
+	by := h.clients[id]
+	var conn *fwdConn
+	if by != nil {
+		conn = by[addr]
+		delete(by, addr)
+	}
+	h.mu.Unlock()
+	if conn != nil {
+		conn.client.Close(conn.node, uint64(id))
+	}
+}
+
+func checkedReply(reply persist.ForwardReply, err error) (persist.ForwardReply, error) {
+	if err != nil {
+		return persist.ForwardReply{}, err
+	}
+	if reply.Err != "" {
+		return persist.ForwardReply{}, mysql.NewSQLError(mysql.ERUnknownError, "HY000", "%s", reply.Err)
+	}
+	return reply, nil
+}
+
+// scatterCalls runs one hop per addr at the same time. localAddr is executed
+// with local and is not passed to remote. Rows are merged in addr order.
+func scatterCalls(addrs []string, localAddr string, local, remote func(addr string) (persist.ForwardReply, error)) (persist.ForwardReply, error) {
+	return scatterFanout(addrs, func(addr string) (persist.ForwardReply, error) {
+		if localAddr != "" && addr == localAddr {
+			return local(addr)
+		}
+		return remote(addr)
+	})
+}
+
+func scatterFanout(addrs []string, call func(addr string) (persist.ForwardReply, error)) (persist.ForwardReply, error) {
+	replies := make([]persist.ForwardReply, len(addrs))
+	errs := make([]error, len(addrs))
+	var wg sync.WaitGroup
+	for i, addr := range addrs {
+		wg.Add(1)
+		go func(i int, addr string) {
+			defer wg.Done()
+			reply, err := call(addr)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			replies[i] = reply
+		}(i, addr)
+	}
+	wg.Wait()
+	var merged persist.ForwardReply
+	for i := range addrs {
+		if errs[i] != nil {
+			return persist.ForwardReply{}, errs[i]
+		}
+		merged = mergeReply(merged, replies[i])
+	}
+	return merged, nil
 }
 
 func queryReq(store *persist.Store, query string, binds []persist.ForwardBind) persist.ForwardRequest {

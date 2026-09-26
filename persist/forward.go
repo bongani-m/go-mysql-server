@@ -309,6 +309,23 @@ func (s *Store) DialForwardAddr(addr string) (*ForwardClient, error) {
 	return dialForward(addr, s.cluster.tls, timeout)
 }
 
+// LocalForwardAddr is the address this node's forward listener accepts.
+// An empty string means this process has no forward listener.
+func (s *Store) LocalForwardAddr() string {
+	if s.cluster == nil || s.cluster.forwardLn == nil {
+		return ""
+	}
+	return s.cluster.forwardLn.Addr().String()
+}
+
+// ExecForward runs req on this node's registered forward handler.
+func (s *Store) ExecForward(req ForwardRequest) (ForwardReply, error) {
+	if s.cluster == nil {
+		return ForwardReply{}, fmt.Errorf("persist: store is not replicating")
+	}
+	return s.cluster.forwardExec(req), nil
+}
+
 // SetForwardExec registers the leader's statement runner.
 func (s *Store) SetForwardExec(fn ForwardExec) {
 	if s.cluster == nil {

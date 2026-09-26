@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strconv"
 	"testing"
 
@@ -97,6 +98,37 @@ func TestRouteDDLAndPlacement(t *testing.T) {
 	require.Equal(t, RoutePlace, place.Kind)
 	require.Equal(t, "id", place.Place.Column)
 	require.Equal(t, []string{"email"}, place.Place.Check)
+}
+
+func TestCheckQueriesGroupsQuotesAndChunks(t *testing.T) {
+	place := persist.TablePlacement{DB: "stress", Table: "accounts"}
+	queries, dup := checkQueries(place, []routedValue{
+		{Column: "email", Text: "user1@example.com", Quote: true},
+		{Column: "email", Text: "o'reilly@b.c", Quote: true},
+	})
+	require.Nil(t, dup)
+	require.Equal(t, []checkQuery{{
+		Column: "email",
+		SQL:    "SELECT email FROM stress.accounts WHERE email IN ('user1@example.com','o''reilly@b.c')",
+	}}, queries)
+
+	_, dup = checkQueries(place, []routedValue{
+		{Column: "email", Text: "a@b.c", Quote: true},
+		{Column: "email", Text: "a@b.c", Quote: true},
+	})
+	require.NotNil(t, dup)
+	require.Equal(t, "a@b.c", dup.Text)
+	require.Equal(t, "email", dup.Column)
+
+	many := make([]routedValue, checkBatch+1)
+	for i := range many {
+		many[i] = routedValue{Column: "email", Text: fmt.Sprintf("u%d@b.c", i), Quote: true}
+	}
+	queries, dup = checkQueries(place, many)
+	require.Nil(t, dup)
+	require.Len(t, queries, 2)
+	require.Equal(t, "email", queries[0].Column)
+	require.Equal(t, "email", queries[1].Column)
 }
 
 func itoa(n int64) string {

@@ -592,13 +592,25 @@ func seedSharded(ctx context.Context, dbs []*sql.DB, n, batch int) error {
 		ids[shard] = append(ids[shard], id)
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
+	var wg sync.WaitGroup
+	errs := make(chan error, len(dbs))
 	for shard, list := range ids {
-		if err := insertAccountsSharded(ctx, dbs[shard], list, batch, now); err != nil {
-			return err
-		}
+		wg.Add(1)
+		go func(db *sql.DB, list []int) {
+			defer wg.Done()
+			if err := insertAccountsSharded(ctx, db, list, batch, now); err != nil {
+				errs <- err
+				return
+			}
+			if err := insertNotesSharded(ctx, db, list, batch, now); err != nil {
+				errs <- err
+			}
+		}(dbs[shard], list)
 	}
-	for shard, list := range ids {
-		if err := insertNotesSharded(ctx, dbs[shard], list, batch, now); err != nil {
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
 			return err
 		}
 	}

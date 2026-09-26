@@ -154,6 +154,12 @@ func (s *Store) syncData() error {
 	return db.Sync()
 }
 
+// FSMApplied is the newest Raft index written into Badger. Raft's AppliedIndex
+// moves earlier, when a batch is only queued, so readers use this one.
+func (s *Store) FSMApplied() uint64 {
+	return atomic.LoadUint64(&s.fsmApplied)
+}
+
 // noteFSMApplied records that the FSM finished applying index.
 func (s *Store) noteFSMApplied(index uint64) {
 	for {
