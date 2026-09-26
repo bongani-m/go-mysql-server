@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -55,6 +56,60 @@ func TestSigkillRestart(t *testing.T) {
 	require.Equal(t, "killed@example.com", email)
 }
 
+func TestSigtermRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "gms")
+	certFile, keyFile := writeTestCert(t, t.TempDir())
+	tlsName := strings.ReplaceAll(t.Name(), "/", "-")
+	require.NoError(t, mysql.RegisterTLSConfig(tlsName, trustCert(t, certFile)))
+	port := freePort(t)
+	cmd := startPersist(t, dir, port, certFile, keyFile)
+	db := openPersist(t, port, tlsName)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := db.ExecContext(ctx, "UPDATE mytable SET email = ? WHERE id = 1", "stopped@example.com")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+	waitErr := cmd.Wait()
+	require.NoError(t, waitErr)
+
+	cmd = startPersist(t, dir, port, certFile, keyFile)
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	db = openPersist(t, port, tlsName)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var email string
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT email FROM mytable WHERE id = 1").Scan(&email))
+	require.Equal(t, "stopped@example.com", email)
+}
+
+func TestShowRaftStatusStandalone(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "gms")
+	certFile, keyFile := writeTestCert(t, t.TempDir())
+	tlsName := strings.ReplaceAll(t.Name(), "/", "-")
+	require.NoError(t, mysql.RegisterTLSConfig(tlsName, trustCert(t, certFile)))
+	port := freePort(t)
+	cmd := startPersist(t, dir, port, certFile, keyFile)
+	defer func() {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = cmd.Wait()
+	}()
+	db := openPersist(t, port, tlsName)
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var role, leader, commit, applied, lag string
+	require.NoError(t, db.QueryRowContext(ctx, "SHOW RAFT STATUS").Scan(&role, &leader, &commit, &applied, &lag))
+	require.Equal(t, "standalone", role)
+	require.Equal(t, "0", commit)
+	require.Equal(t, "0", applied)
+	require.Equal(t, "0", lag)
+}
+
 func startPersist(t *testing.T, dir, port, certFile, keyFile string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
@@ -71,6 +126,7 @@ func startPersist(t *testing.T, dir, port, certFile, keyFile string) *exec.Cmd {
 		"GMS_MYSQL_HOST=127.0.0.1",
 		"GMS_MYSQL_PORT="+port,
 		"GMS_BOOTSTRAP_PASSWORD=secret",
+		"GMS_SEED_EXAMPLE=1",
 		"GMS_TLS_CERT="+certFile,
 		"GMS_TLS_KEY="+keyFile,
 	)

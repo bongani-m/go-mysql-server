@@ -23,6 +23,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,24 +33,43 @@ import (
 
 func main() {
 	var (
-		label       = flag.String("label", "server", "name printed on the report")
-		writeAddr   = flag.String("write", "127.0.0.1:3316", "host:port for writes and schema setup")
-		readAddrs   = flag.String("read", "", "comma-separated host:port for reads; defaults to -write")
-		user        = flag.String("user", "root", "MySQL user")
-		password    = flag.String("password", "stress", "MySQL password")
-		dbName      = flag.String("db", "stress", "database created for the run")
-		tlsCA       = flag.String("tls-ca", "", "PEM CA file; required when the server demands TLS")
-		concurrency = flag.Int("concurrency", 8, "simultaneous clients")
-		duration    = flag.Duration("duration", 20*time.Second, "measured run length")
-		warmup      = flag.Duration("warmup", 2*time.Second, "unmeasured run before the clock starts")
-		seedN       = flag.Int("seed", 5000, "accounts inserted before the run; each gets two notes")
-		batch       = flag.Int("batch", 100, "rows per seed INSERT")
-		readPct     = flag.Int("read-pct", 80, "percent of operations that are reads")
-		readyWait   = flag.Duration("ready-wait", 2*time.Minute, "how long to wait for the server to accept connections")
-		jsonPath    = flag.String("json", "", "write the report JSON to this path")
-		renderPath  = flag.String("render", "", "write a markdown summary from the JSON reports named as arguments, then exit")
+		label        = flag.String("label", "server", "name printed on the report")
+		writeAddr    = flag.String("write", "127.0.0.1:3316", "host:port for writes and schema setup")
+		readAddrs    = flag.String("read", "", "comma-separated host:port for reads; defaults to -write")
+		user         = flag.String("user", "root", "MySQL user")
+		password     = flag.String("password", "stress", "MySQL password")
+		dbName       = flag.String("db", "stress", "database created for the run")
+		tlsCA        = flag.String("tls-ca", "", "PEM CA file; required when the server demands TLS")
+		concurrency  = flag.Int("concurrency", 8, "simultaneous clients")
+		duration     = flag.Duration("duration", 20*time.Second, "measured run length")
+		warmup       = flag.Duration("warmup", 2*time.Second, "unmeasured run before the clock starts")
+		seedN        = flag.Int("seed", 5000, "accounts inserted before the run; each gets two notes")
+		batch        = flag.Int("batch", 100, "rows per seed INSERT")
+		readPct      = flag.Int("read-pct", 80, "percent of operations that are reads")
+		readyWait    = flag.Duration("ready-wait", 2*time.Minute, "how long to wait for the server to accept connections")
+		jsonPath     = flag.String("json", "", "write the report JSON to this path")
+		renderPath   = flag.String("render", "", "write a markdown summary from the JSON reports named as arguments, then exit")
+		execQuery    = flag.String("exec", "", "run one statement, print rows, and exit")
+		phaseFile    = flag.String("phase-file", "", "write this file when the measured run starts")
+		failoverMark = flag.String("failover-mark", "", "file with kill and ready timestamps, in unix milliseconds")
 	)
 	flag.Parse()
+
+	if *execQuery != "" {
+		if err := registerCA(*tlsCA); err != nil {
+			fatalf("tls: %v", err)
+		}
+		ctx := context.Background()
+		db, err := openDB(ctx, *writeAddr, *user, *password, "", 1, *readyWait, *tlsCA != "")
+		if err != nil {
+			fatalf("connect %s: %v", *writeAddr, err)
+		}
+		defer db.Close()
+		if err := runExec(ctx, db, *execQuery); err != nil {
+			fatalf("exec: %v", err)
+		}
+		return
+	}
 
 	if *renderPath != "" {
 		if flag.NArg() == 0 {
@@ -143,16 +163,70 @@ func main() {
 		fmt.Printf("warmup %s with %d clients\n", warmup.Round(time.Millisecond), *concurrency)
 		runPhase(ctx, workload, *concurrency, *warmup, false)
 	}
+	if *phaseFile != "" {
+		if err := os.WriteFile(*phaseFile, []byte("measuring\n"), 0o644); err != nil {
+			fatalf("phase: %v", err)
+		}
+	}
 	fmt.Printf("measuring %s\n", duration.Round(time.Millisecond))
 	stats := runPhase(ctx, workload, *concurrency, *duration, true)
 
 	rep := stats.report(*label, *writeAddr, reads, *seedN, seedTook, *concurrency, *duration, *readPct)
+	if *failoverMark != "" {
+		if err := applyFailoverMark(&rep, stats.errAt, *failoverMark); err != nil {
+			fatalf("failover: %v", err)
+		}
+	}
 	fmt.Print(rep.text())
 	if *jsonPath != "" {
 		if err := os.WriteFile(*jsonPath, rep.json(), 0o644); err != nil {
 			fatalf("json: %v", err)
 		}
 	}
+	if rep.Failover && rep.AfterErrors > 0 {
+		fatalf("failover: %d errors after the new leader", rep.AfterErrors)
+	}
+}
+
+func runExec(ctx context.Context, db *sql.DB, query string) error {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	if strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "SHOW") {
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		cols, err := rows.Columns()
+		if err != nil {
+			return err
+		}
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		for rows.Next() {
+			if err := rows.Scan(ptrs...); err != nil {
+				return err
+			}
+			for i, val := range vals {
+				if i > 0 {
+					fmt.Print("\t")
+				}
+				switch v := val.(type) {
+				case nil:
+				case []byte:
+					fmt.Print(string(v))
+				default:
+					fmt.Print(v)
+				}
+			}
+			fmt.Println()
+		}
+		return rows.Err()
+	}
+	_, err := db.ExecContext(ctx, query)
+	return err
 }
 
 func fatalf(format string, args ...any) {
@@ -512,9 +586,10 @@ func (w *workload) do(ctx context.Context, worker int, kind opKind, rng uint64) 
 }
 
 type samples struct {
-	lat  [][]time.Duration
-	errs []int
-	msg  []string
+	lat   [][]time.Duration
+	errs  []int
+	msg   []string
+	errAt []time.Time
 }
 
 func newSamples() *samples {
@@ -525,9 +600,10 @@ func newSamples() *samples {
 	}
 }
 
-func (s *samples) add(kind opKind, d time.Duration, err error) {
+func (s *samples) add(kind opKind, d time.Duration, err error, at time.Time) {
 	if err != nil {
 		s.errs[kind]++
+		s.errAt = append(s.errAt, at)
 		if s.msg[kind] == "" {
 			s.msg[kind] = err.Error()
 		}
@@ -544,6 +620,7 @@ func (s *samples) merge(other *samples) {
 			s.msg[k] = other.msg[k]
 		}
 	}
+	s.errAt = append(s.errAt, other.errAt...)
 }
 
 func runPhase(ctx context.Context, w *workload, concurrency int, d time.Duration, record bool) *samples {
@@ -606,7 +683,7 @@ func worker(ctx context.Context, w *workload, id int, record bool) *samples {
 			return s
 		}
 		if record {
-			s.add(kind, elapsed, err)
+			s.add(kind, elapsed, err, start)
 		}
 	}
 }
@@ -640,6 +717,9 @@ type report struct {
 	P50Ms           float64    `json:"p50_ms"`
 	P95Ms           float64    `json:"p95_ms"`
 	P99Ms           float64    `json:"p99_ms"`
+	Failover        bool       `json:"failover,omitempty"`
+	ElectionErrors  int        `json:"election_errors,omitempty"`
+	AfterErrors     int        `json:"after_errors,omitempty"`
 }
 
 func (s *samples) report(label, write string, reads []string, accounts int, seedTook time.Duration, concurrency int, duration time.Duration, readPct int) report {
@@ -735,9 +815,52 @@ func (r report) text() string {
 			fmt.Fprintf(&b, "  first error: %s\n", op.Error)
 		}
 	}
+	if r.Failover {
+		fmt.Fprintf(&b, "\nelection errors: %d\nafter errors:    %d\n", r.ElectionErrors, r.AfterErrors)
+	}
 	fmt.Fprintf(&b, "\nSUMMARY label=%s ops_s=%.2f errors=%d p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f seed_s=%.2f\n",
 		r.Label, r.OpsPerSec, r.Errors, r.P50Ms, r.P95Ms, r.P99Ms, r.SeedSeconds)
 	return b.String()
+}
+
+// applyFailoverMark splits error timestamps into the election window
+// [kill, ready) and the period after the new leader is serving.
+// times are when each failed statement started.
+func applyFailoverMark(rep *report, times []time.Time, path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var kill, ready time.Time
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		ms, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		stamp := time.UnixMilli(ms)
+		switch fields[0] {
+		case "kill":
+			kill = stamp
+		case "ready":
+			ready = stamp
+		}
+	}
+	if kill.IsZero() || ready.IsZero() || !ready.After(kill) {
+		return fmt.Errorf("%s needs kill and ready timestamps", path)
+	}
+	rep.Failover = true
+	for _, stamp := range times {
+		if !stamp.Before(kill) && stamp.Before(ready) {
+			rep.ElectionErrors++
+		} else if !stamp.Before(ready) {
+			rep.AfterErrors++
+		}
+	}
+	return nil
 }
 
 func fmtMs(v float64) string {

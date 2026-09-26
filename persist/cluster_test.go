@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -365,6 +367,101 @@ func TestClusterLeadershipTransfer(t *testing.T) {
 		rows := waitRows(t, store, 2)
 		require.Equal(t, "bea", rows[1][1])
 	}
+}
+
+func TestClusterRemoveServer(t *testing.T) {
+	stores, leader := startTrio(t)
+	ctx := sql.NewContext(context.Background())
+	_ = kvTable(t, ctx, leader)
+
+	var removed string
+	var keep []*Store
+	for i, store := range stores {
+		if store == leader {
+			keep = append(keep, store)
+			continue
+		}
+		if removed == "" {
+			removed = fmt.Sprintf("node-%d", i)
+			continue
+		}
+		keep = append(keep, store)
+	}
+	require.NotEmpty(t, removed)
+	require.NoError(t, leader.RemoveServer(removed))
+	require.NoError(t, insertRows(ctx, tableNamed(t, ctx, leader), sql.NewRow(int64(1), "ada")))
+	for _, store := range keep {
+		rows := waitRows(t, store, 1)
+		require.Equal(t, "ada", rows[0][1])
+	}
+}
+
+func TestBootstrapIgnoredWhenStateExists(t *testing.T) {
+	dir := t.TempDir()
+	data := filepath.Join(dir, "gms")
+	raftDir := filepath.Join(dir, "raft")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	opts := ClusterOptions{
+		ID:           "n1",
+		Bind:         addr,
+		Advertise:    addr,
+		RaftDir:      raftDir,
+		Bootstrap:    true,
+		ServerUUID:   testServerUUID,
+		Config:       testRaftConfig(),
+		ApplyTimeout: 10 * time.Second,
+	}
+	first, err := OpenCluster(data, opts)
+	require.NoError(t, err)
+	require.True(t, first.Bootstrapped())
+	require.NoError(t, first.WaitReady(10*time.Second))
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, first)
+	require.NoError(t, insertRows(ctx, table, sql.NewRow(int64(1), "ada")))
+	last, err := first.LastIndex()
+	require.NoError(t, err)
+	require.Greater(t, last, uint64(1))
+	require.NoError(t, first.Close())
+
+	second, err := OpenCluster(data, opts)
+	require.NoError(t, err)
+	require.False(t, second.Bootstrapped())
+	t.Cleanup(func() { _ = second.Close() })
+	require.NoError(t, second.WaitReady(10*time.Second))
+	again, err := second.LastIndex()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, again, last)
+	rows := waitRows(t, second, 1)
+	require.Equal(t, "ada", rows[0][1])
+	require.Equal(t, "leader", second.Status().Role)
+}
+
+func TestSnapshotDoesNotRetainBytes(t *testing.T) {
+	mem := newMemCluster(t, 1)
+	leader := mem.open(t, 0, true, nil)
+	require.NoError(t, leader.WaitReady(10*time.Second))
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, leader)
+	require.NoError(t, insertRows(ctx, table, sql.NewRow(int64(1), "ada")))
+
+	snap, err := (&storeFSM{store: leader}).Snapshot()
+	require.NoError(t, err)
+	ss := snap.(*storeSnapshot)
+	require.NotEmpty(t, ss.path)
+	info, err := os.Stat(ss.path)
+	require.NoError(t, err)
+	require.Greater(t, info.Size(), int64(8))
+	rt := reflect.TypeOf(*ss)
+	for i := 0; i < rt.NumField(); i++ {
+		require.NotEqualf(t, reflect.Slice, rt.Field(i).Type.Kind(), "field %s holds the backup", rt.Field(i).Name)
+	}
+	snap.Release()
+	_, err = os.Stat(ss.path)
+	require.True(t, os.IsNotExist(err))
 }
 
 func TestClusterSnapshotJoin(t *testing.T) {

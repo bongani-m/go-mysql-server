@@ -9,9 +9,11 @@ Run these commands from `go-mysql-server`. The example clients take `MYSQL_ADDRS
 Cluster mode stays off unless `GMS_RAFT_ADDR` is set.
 
 ```bash
-GMS_BOOTSTRAP_PASSWORD=secret go run ./_persist
+GMS_SEED_EXAMPLE=1 GMS_BOOTSTRAP_PASSWORD=secret go run ./_persist
 mysql --host=127.0.0.1 --port=3306 --user=root --password=secret mydb --execute="SELECT name, email FROM mytable;"
 ```
+
+`GMS_SEED_EXAMPLE=1` creates `mydb.mytable` on first boot. Leave it unset for an empty data directory.
 
 The first boot creates one `mysql_native_password` account. `GMS_BOOTSTRAP_PASSWORD` is required then and is not saved for later boots; the account lives in the data directory. The default user is `root` and the default host is `%`. A follower that has not received the account yet rejects every login.
 
@@ -114,7 +116,10 @@ _persist/stress/run.sh cluster
 _persist/stress/run.sh mysql
 _persist/stress/run.sh tidb
 _persist/stress/run.sh compare
+_persist/stress/run.sh failover
 ```
+
+`failover` is not part of `compare`. It runs the cluster for 60 seconds with writes aimed at a follower, kills the leader, waits for a new leader, and starts the killed node again. The report splits errors during that election from errors after the new leader is serving. A row inserted before the kill must be readable on every node afterward.
 
 `compare` runs single, cluster, MySQL, and TiDB one after another so they do not share the CPU. Each run also prints a text report and stores JSON, CPU samples, and disk usage under `_persist/stress/results/`.
 
@@ -157,6 +162,25 @@ Wipe stored data with:
 docker compose -f _persist/stress/compose.yaml -p gms-stress down -v
 ```
 
+## Operations
+
+`SIGTERM` and `SIGINT` stop the MySQL listener, wait up to `GMS_SHUTDOWN_TIMEOUT` (default 15s) for sessions to finish, then shut Raft down and sync Badger.
+
+`SHOW RAFT STATUS` returns one row: `role`, `leader`, `commit_index`, `applied_index`, and `lag`. A standalone process reports `standalone`. On a follower the statement runs locally, so `lag` is how far that node is behind the commit index. A read on another connection can still see an older copy.
+
+Membership changes are leader statements. A follower forwards them:
+
+```sql
+RAFT ADD VOTER 'n4' '10.116.0.5:7001';
+RAFT REMOVE SERVER 'n4';
+```
+
+`GMS_RAFT_BOOTSTRAP=1` bootstraps only when the Raft directory has no state. A later start with the flag still set logs that bootstrap is ignored, then catches up as a follower instead of waiting to become leader. A wiped volume with the flag left on still creates a second group.
+
+`SET GLOBAL max_connections` does not resize the listener. The cap is `GMS_MAX_CONNECTIONS`, read at start. The same is true of the net timeouts.
+
+Set `GMS_METRICS_ADDR` (for example `127.0.0.1:9090`) to serve `GET /healthz`, `GET /readyz`, and `GET /metrics`. Leave it unset and that port stays closed.
+
 ## Environment
 
 | Variable | Role |
@@ -172,7 +196,7 @@ docker compose -f _persist/stress/compose.yaml -p gms-stress down -v
 | `GMS_RAFT_ADVERTISE` | Address other nodes dial. Defaults to `GMS_RAFT_ADDR`. |
 | `GMS_NODE_ID` | Raft server id. Defaults to the bind address. |
 | `GMS_RAFT_PEERS` | `id=host:port` list, comma-separated. |
-| `GMS_RAFT_BOOTSTRAP` | `1` on exactly one node, the first time the group starts. |
+| `GMS_RAFT_BOOTSTRAP` | `1` on exactly one node, the first time the group starts. A restart that still has Raft state ignores the flag, logs that, and joins as a follower. |
 | `GMS_RAFT_DIR` | Raft log, snapshots, server UUID, and binlog. Default is beside the data directory. |
 | `GMS_SERVER_UUID` | Shared by every node. It is the GTID server id in the binlog. |
 | `GMS_BINLOG_MAX_SIZE` | Rolls the binlog after a transaction crosses this many bytes. Default is 1 GiB. `FLUSH BINARY LOGS` rolls it immediately. |
@@ -185,5 +209,12 @@ docker compose -f _persist/stress/compose.yaml -p gms-stress down -v
 | `GMS_BOOTSTRAP_HOST` | Host pattern for that account. Default `%`, so published Docker ports and other containers can connect. |
 | `GMS_TLS_CERT` | PEM certificate for the MySQL listener. Set together with `GMS_TLS_KEY` to require TLS. |
 | `GMS_TLS_KEY` | PEM private key for the MySQL listener. |
+| `GMS_MAX_CONNECTIONS` | Listener connection cap. Default `151`. |
+| `GMS_NET_READ_TIMEOUT` | Connection read timeout. Default `30s`. A bare number is seconds. |
+| `GMS_NET_WRITE_TIMEOUT` | Connection write timeout. Default `60s`. A bare number is seconds. |
+| `GMS_MAX_EXECUTION_TIME` | Per-statement deadline in milliseconds. Default `0`, which sets no deadline. |
+| `GMS_SHUTDOWN_TIMEOUT` | How long `SIGTERM` waits for sessions before closing the store. Default `15s`. |
+| `GMS_METRICS_ADDR` | Optional `host:port` for `/healthz`, `/readyz`, and `/metrics`. Unset means those routes are not served. |
+| `GMS_SEED_EXAMPLE` | `1` creates `mydb.mytable` and the example rows when they are missing. Default is off. |
 
 `CHANGE REPLICATION SOURCE TO`, `START REPLICA`, and `STOP REPLICA` configure that upstream job. The primary is the only node that connects. After a failover the new primary continues from the GTID stored with the applied rows. Replication filters are unsupported.

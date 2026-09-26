@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dolthub/vitess/go/mysql"
 	"github.com/dolthub/vitess/go/sqltypes"
@@ -91,9 +92,17 @@ func (h *forwardHandler) ComStmtExecute(ctx context.Context, c *mysql.Conn, prep
 }
 
 func (h *forwardHandler) dispatch(ctx context.Context, c *mysql.Conn, query string, binds []persist.ForwardBind, callback mysql.ResultSpoolFn) error {
+	if queryTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, queryTimeout)
+		defer cancel()
+	}
+	if cmd, ok := parseAdmin(query); ok {
+		return h.handleAdmin(c, query, cmd, callback)
+	}
 	st := h.state(c)
-	if h.store.IsLeader() {
-		if st.pinned {
+	if !h.store.Replicating() || h.store.IsLeader() {
+		if h.store.Replicating() && st.pinned {
 			h.dropState(c)
 			return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: leader changed during transaction")
 		}
@@ -144,6 +153,24 @@ func (h *forwardHandler) dispatch(ctx context.Context, c *mysql.Conn, query stri
 	}
 }
 
+func (h *forwardHandler) handleAdmin(c *mysql.Conn, query string, cmd adminCmd, callback mysql.ResultSpoolFn) error {
+	if cmd.kind == adminStatus || h.store.IsLeader() || !h.store.Replicating() {
+		if cmd.kind != adminStatus && !h.store.Replicating() {
+			return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: store is not replicating")
+		}
+		reply, err := runAdmin(h.store, cmd)
+		if err != nil {
+			return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "%s", err.Error())
+		}
+		return h.spool(reply, callback)
+	}
+	reply, err := h.forward(c, query, nil, false, false)
+	if err != nil {
+		return err
+	}
+	return h.spool(reply, callback)
+}
+
 func (h *forwardHandler) local(ctx context.Context, c *mysql.Conn, query string, binds []persist.ForwardBind, callback mysql.ResultSpoolFn) error {
 	if len(binds) == 0 {
 		return h.Handler.ComQuery(ctx, c, query, callback)
@@ -156,26 +183,7 @@ func (h *forwardHandler) local(ctx context.Context, c *mysql.Conn, query string,
 
 func (h *forwardHandler) forward(c *mysql.Conn, query string, binds []persist.ForwardBind, hold, release bool) (persist.ForwardReply, error) {
 	st := h.state(c)
-	leader, err := h.leaderAddr()
-	if err != nil {
-		return persist.ForwardReply{}, err
-	}
-	if st.pinned && st.leader != "" && st.leader != leader {
-		h.dropState(c)
-		return persist.ForwardReply{}, mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: leader changed during transaction")
-	}
-	if st.client == nil || st.leader != leader {
-		if st.client != nil {
-			st.client.Close(h.store.NodeID(), uint64(c.ConnectionID))
-			st.client = nil
-		}
-		client, err := h.store.DialForward()
-		if err != nil {
-			return persist.ForwardReply{}, err
-		}
-		st.client = client
-		st.leader = leader
-	}
+	deadline := time.Now().Add(h.store.ApplyTimeout())
 	req := persist.ForwardRequest{
 		Hold:     hold,
 		Release:  release,
@@ -188,16 +196,55 @@ func (h *forwardHandler) forward(c *mysql.Conn, query string, binds []persist.Fo
 		Vars:     userVars(h.Handler, c),
 		Binds:    binds,
 	}
-	reply, err := st.client.Exec(req, h.store.ApplyTimeout())
-	if err != nil {
-		st.client.Close(h.store.NodeID(), uint64(c.ConnectionID))
-		st.client = nil
-		return persist.ForwardReply{}, err
+	var last error
+	for {
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			if last == nil {
+				last = fmt.Errorf("persist: leader is unavailable")
+			}
+			return persist.ForwardReply{}, last
+		}
+		leader, err := h.leaderAddr()
+		if err != nil {
+			last = err
+		} else if st.pinned && st.leader != "" && st.leader != leader {
+			h.dropState(c)
+			return persist.ForwardReply{}, mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: leader changed during transaction")
+		} else {
+			if st.client == nil || st.leader != leader {
+				if st.client != nil {
+					st.client.Close(h.store.NodeID(), uint64(c.ConnectionID))
+					st.client = nil
+				}
+				client, err := h.store.DialForward()
+				if err != nil {
+					last = err
+				} else {
+					st.client = client
+					st.leader = leader
+				}
+			}
+			if st.client != nil {
+				// The request is encoded inside Exec. A failure after that
+				// must not be retried: the leader may already have applied it.
+				reply, err := st.client.Exec(req, remain)
+				if err != nil {
+					st.client.Close(h.store.NodeID(), uint64(c.ConnectionID))
+					st.client = nil
+					if errors.Is(err, io.EOF) {
+						err = mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: leader connection closed")
+					}
+					return persist.ForwardReply{}, err
+				}
+				if reply.Err != "" {
+					return persist.ForwardReply{}, mysql.NewSQLError(mysql.ERUnknownError, "HY000", "%s", reply.Err)
+				}
+				return reply, nil
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if reply.Err != "" {
-		return persist.ForwardReply{}, mysql.NewSQLError(mysql.ERUnknownError, "HY000", "%s", reply.Err)
-	}
-	return reply, nil
 }
 
 func (h *forwardHandler) leaderAddr() (string, error) {
@@ -511,22 +558,37 @@ func (l *leaderExec) run(held *heldSession, req persist.ForwardRequest) persist.
 			return persist.ForwardReply{Err: err.Error()}
 		}
 	}
+	if cmd, ok := parseAdmin(req.Query); ok {
+		reply, err := runAdmin(l.store, cmd)
+		if err != nil {
+			return persist.ForwardReply{Err: err.Error()}
+		}
+		return reply
+	}
+	qctx := held.ctx
+	if queryTimeout > 0 {
+		parent, cancel := context.WithTimeout(held.ctx, queryTimeout)
+		defer cancel()
+		copied := *held.ctx
+		copied.Context = parent
+		qctx = &copied
+	}
 	exprs, err := server.BindingsToExprs(bindMap(req.Binds))
 	if err != nil {
 		return persist.ForwardReply{Err: err.Error()}
 	}
-	schema, iter, _, err := l.engine.QueryWithBindings(held.ctx, req.Query, nil, exprs, nil)
+	schema, iter, _, err := l.engine.QueryWithBindings(qctx, req.Query, nil, exprs, nil)
 	if err != nil {
 		return persist.ForwardReply{Err: err.Error()}
 	}
 	var reply persist.ForwardReply
 	if len(schema) > 0 && !types.IsOkResultSchema(schema) {
-		reply.Fields = forwardFields(held.ctx, schema)
+		reply.Fields = forwardFields(qctx, schema)
 	}
 	for {
-		row, err := iter.Next(held.ctx)
+		row, err := iter.Next(qctx)
 		if err != nil {
-			_ = iter.Close(held.ctx)
+			_ = iter.Close(qctx)
 			if errors.Is(err, io.EOF) {
 				break
 			}
@@ -541,9 +603,9 @@ func (l *leaderExec) run(held *heldSession, req persist.ForwardRequest) persist.
 			}
 			continue
 		}
-		vals, err := server.RowToSQL(held.ctx, schema, row, nil, nil)
+		vals, err := server.RowToSQL(qctx, schema, row, nil, nil)
 		if err != nil {
-			_ = iter.Close(held.ctx)
+			_ = iter.Close(qctx)
 			return persist.ForwardReply{Err: err.Error()}
 		}
 		cells := make([]persist.ForwardCell, len(vals))

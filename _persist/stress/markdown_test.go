@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"testing"
+	"time"
+)
 
 func TestParseUsageSumsClusterSamples(t *testing.T) {
 	stats := "" +
@@ -26,5 +30,29 @@ func TestParseUsageSumsClusterSamples(t *testing.T) {
 	}
 	if shortContainer(got.Nodes[0].Name) != "n1" {
 		t.Fatalf("node name %s", got.Nodes[0].Name)
+	}
+}
+
+func TestApplyFailoverMarkSplitsErrors(t *testing.T) {
+	path := t.TempDir() + "/mark"
+	kill := time.UnixMilli(1_000_000)
+	ready := time.UnixMilli(1_005_000)
+	body := "kill 1000000\nready 1005000\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep := report{}
+	times := []time.Time{
+		kill.Add(-time.Second),
+		kill,
+		kill.Add(time.Second),
+		ready,
+		ready.Add(time.Second),
+	}
+	if err := applyFailoverMark(&rep, times, path); err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Failover || rep.ElectionErrors != 2 || rep.AfterErrors != 2 {
+		t.Fatalf("failover %v election %d after %d", rep.Failover, rep.ElectionErrors, rep.AfterErrors)
 	}
 }

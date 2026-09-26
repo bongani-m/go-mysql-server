@@ -91,6 +91,9 @@ func summaryMarkdown(reps []rendered) string {
 		rep := item.rep
 		fmt.Fprintf(&b, "## %s\n\n", rep.Label)
 		fmt.Fprintf(&b, "Writes `%s`. Reads `%s`.\n\n", rep.Write, strings.Join(rep.Read, "`, `"))
+		if rep.Failover {
+			fmt.Fprintf(&b, "Election-window errors: %d. Errors after the new leader: %d.\n\n", rep.ElectionErrors, rep.AfterErrors)
+		}
 		if item.hasUse && len(item.use.Nodes) > 1 {
 			b.WriteString("| node | CPU avg | CPU peak | mem avg | mem peak | disk |\n")
 			b.WriteString("| --- | ---: | ---: | ---: | ---: | ---: |\n")

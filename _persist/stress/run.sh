@@ -8,6 +8,7 @@
 #   _persist/stress/run.sh mysql
 #   _persist/stress/run.sh tidb
 #   _persist/stress/run.sh compare
+#   _persist/stress/run.sh failover
 #
 # Flags after -- are passed to the stress client:
 #
@@ -68,12 +69,12 @@ fi
 extra=("$@")
 
 usage() {
-	echo "usage: $0 single|cluster|mysql|tidb|compare [-- stress flags]" >&2
+	echo "usage: $0 single|cluster|mysql|tidb|compare|failover [-- stress flags]" >&2
 	exit 2
 }
 
 case "$target" in
-single | cluster | mysql | tidb | compare) ;;
+single | cluster | mysql | tidb | compare | failover) ;;
 *) usage ;;
 esac
 
@@ -164,7 +165,7 @@ run_client() {
 containers_for() {
 	case "$1" in
 	single) echo gms-stress-single-1 ;;
-	cluster) echo gms-stress-n1-1 gms-stress-n2-1 gms-stress-n3-1 ;;
+	cluster | failover) echo gms-stress-n1-1 gms-stress-n2-1 gms-stress-n3-1 ;;
 	mysql) echo gms-stress-mysql-1 ;;
 	tidb) echo gms-stress-pd-1 gms-stress-tikv1-1 gms-stress-tikv2-1 gms-stress-tikv3-1 gms-stress-tidb-1 ;;
 	*) return 1 ;;
@@ -277,6 +278,179 @@ write_summary() {
 	)
 }
 
+# now_ms is unix time in milliseconds.
+now_ms() {
+	python3 -c 'import time; print(int(time.time()*1000))'
+}
+
+# raft_row prints one SHOW RAFT STATUS line: role, leader, commit, applied, lag.
+raft_row() {
+	local port=$1
+	(
+		cd "$root"
+		go run ./_persist/stress -exec "SHOW RAFT STATUS" -write "127.0.0.1:$port" -password stress -tls-ca "$tls_ca" -ready-wait 15s
+	)
+}
+
+# stress_exec runs one statement against a published port.
+stress_exec() {
+	local port=$1
+	local query=$2
+	(
+		cd "$root"
+		go run ./_persist/stress -exec "$query" -write "127.0.0.1:$port" -password stress -tls-ca "$tls_ca" -ready-wait 15s
+	)
+}
+
+# node_for maps a Raft advertise address to the container and the host MySQL port.
+node_for() {
+	case "$1" in
+	10.117.0.2:7001) echo gms-stress-n1-1 3326 ;;
+	10.117.0.3:7001) echo gms-stress-n2-1 3327 ;;
+	10.117.0.4:7001) echo gms-stress-n3-1 3328 ;;
+	*) return 1 ;;
+	esac
+}
+
+run_failover() {
+	up cluster
+	local row leader_raft
+	row=$(raft_row 3326)
+	leader_raft=$(printf '%s\n' "$row" | awk -F'\t' 'NR==1 {print $2}')
+	local leader_container leader_port
+	read -r leader_container leader_port <<<"$(node_for "$leader_raft")"
+	if [[ -z "$leader_container" ]]; then
+		echo "could not map leader $leader_raft" >&2
+		exit 1
+	fi
+	local write_port read_port
+	for port in 3326 3327 3328; do
+		if [[ "$port" == "$leader_port" ]]; then
+			continue
+		fi
+		if [[ -z "$write_port" ]]; then
+			write_port=$port
+			continue
+		fi
+		read_port=$port
+	done
+
+	local phase=$results/failover.phase
+	local mark=$results/failover.mark
+	local json=$results/failover.json
+	rm -f "$phase" "$mark"
+	local log=/dev/stdout
+	if [[ -n "$summary" ]]; then
+		log=$summary
+	fi
+	start_sampler failover
+	set +e
+	run_client gms-failover \
+		-write "127.0.0.1:$write_port" \
+		-read "127.0.0.1:$read_port" \
+		-tls-ca "$tls_ca" \
+		-duration 60s \
+		-phase-file "$phase" \
+		-failover-mark "$mark" \
+		-json "$json" > >(tee -a "$log") &
+	local client_pid=$!
+	local deadline=$((SECONDS + 180))
+	while [[ ! -f "$phase" ]]; do
+		if ! kill -0 "$client_pid" 2>/dev/null; then
+			wait "$client_pid"
+			echo "stress client exited before the measured run" >&2
+			set -e
+			stop_sampler
+			exit 1
+		fi
+		if (( SECONDS > deadline )); then
+			kill "$client_pid" 2>/dev/null || true
+			echo "timed out waiting for the measured run" >&2
+			set -e
+			stop_sampler
+			exit 1
+		fi
+		sleep 0.2
+	done
+	sleep 2
+	if ! stress_exec "$write_port" "INSERT INTO stress.accounts (email, name, status, created_at) VALUES ('failover-marker@example.com', 'failover', 1, NOW(6))"; then
+		echo "marker insert failed" >&2
+		kill "$client_pid" 2>/dev/null || true
+		set -e
+		stop_sampler
+		exit 1
+	fi
+	local kill_ms ready_ms
+	kill_ms=$(now_ms)
+	docker kill "$leader_container"
+	deadline=$((SECONDS + 45))
+	local new_leader=""
+	while (( SECONDS < deadline )); do
+		row=$(raft_row "$write_port" || true)
+		new_leader=$(printf '%s\n' "$row" | awk -F'\t' 'NR==1 {print $2}')
+		if [[ -n "$new_leader" && "$new_leader" != "$leader_raft" ]]; then
+			break
+		fi
+		new_leader=""
+		sleep 0.5
+	done
+	if [[ -z "$new_leader" ]]; then
+		echo "no new leader after killing $leader_container" >&2
+		kill "$client_pid" 2>/dev/null || true
+		set -e
+		stop_sampler
+		exit 1
+	fi
+	docker start "$leader_container"
+	# ready is the first successful write after the new leader is visible and
+	# the killed node has been started. In-flight failures stay in the election
+	# window; later failures are after the cluster is serving writes again.
+	local probe_deadline=$((SECONDS + 30)) probe_ok=0
+	while (( SECONDS < probe_deadline )); do
+		if stress_exec "$write_port" "UPDATE stress.accounts SET name = 'failover' WHERE email = 'failover-marker@example.com'"; then
+			probe_ok=1
+			break
+		fi
+		sleep 0.3
+	done
+	if [[ $probe_ok -ne 1 ]]; then
+		echo "writes did not recover after killing $leader_container" >&2
+		kill "$client_pid" 2>/dev/null || true
+		set -e
+		stop_sampler
+		exit 1
+	fi
+	ready_ms=$(now_ms)
+	printf 'kill %s\nready %s\n' "$kill_ms" "$ready_ms" >"$mark"
+	wait "$client_pid"
+	local client_status=$?
+	set -e
+	stop_sampler
+	if [[ $client_status -ne 0 ]]; then
+		exit "$client_status"
+	fi
+	local port
+	for port in 3326 3327 3328; do
+		local seen=""
+		local until=$((SECONDS + 60))
+		while (( SECONDS < until )); do
+			if seen=$(stress_exec "$port" "SELECT email FROM stress.accounts WHERE email = 'failover-marker@example.com'" 2>/dev/null); then
+				if [[ "$seen" == *failover-marker@example.com* ]]; then
+					break
+				fi
+			fi
+			seen=""
+			sleep 1
+		done
+		if [[ "$seen" != *failover-marker@example.com* ]]; then
+			echo "marker row missing on port $port" >&2
+			exit 1
+		fi
+	done
+	write_disk failover
+	json_files+=("$json")
+}
+
 if [[ "$target" == compare ]]; then
 	summary=$dir/last-compare.txt
 	: >"$summary"
@@ -289,6 +463,12 @@ if [[ "$target" == compare ]]; then
 	echo "comparison"
 	grep '^SUMMARY ' "$summary" || true
 	echo "full output: $summary"
+	exit 0
+fi
+
+if [[ "$target" == failover ]]; then
+	run_failover
+	write_summary
 	exit 0
 fi
 

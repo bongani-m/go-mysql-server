@@ -200,6 +200,9 @@ type cluster struct {
 	// gate, if set, runs on the proposer before each group is sent to Raft.
 	// Tests hold it to observe a commit that is recorded but not yet applied.
 	gate func()
+	// bootstrapped is true only when this process created the Raft group.
+	// A restart that already has state leaves it false.
+	bootstrapped bool
 }
 
 func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
@@ -260,6 +263,7 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		return nil, err
 	}
 
+	bootstrapped := false
 	if opts.Bootstrap {
 		has, err := raft.HasExistingState(wal, bolt, snaps)
 		if err != nil {
@@ -268,7 +272,9 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 			closeTransport(transport)
 			return nil, err
 		}
-		if !has {
+		if has {
+			log.Printf("persist: GMS_RAFT_BOOTSTRAP is set and this node already has Raft state; ignoring bootstrap")
+		} else {
 			err = raft.BootstrapCluster(cfg, wal, bolt, snaps, transport, raft.Configuration{
 				Servers: opts.servers(),
 			})
@@ -278,6 +284,7 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 				closeTransport(transport)
 				return nil, err
 			}
+			bootstrapped = true
 		}
 	}
 
@@ -289,17 +296,18 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		return nil, err
 	}
 	c := &cluster{
-		store:      store,
-		id:         raft.ServerID(opts.ID),
-		raft:       r,
-		wal:        wal,
-		bolt:       bolt,
-		transport:  transport,
-		timeout:    opts.ApplyTimeout,
-		tls:        opts.TLS,
-		forwardDir: opts.ForwardDir,
-		exited:     make(chan struct{}),
-		nextID:     newBatchEpoch(),
+		store:        store,
+		id:           raft.ServerID(opts.ID),
+		raft:         r,
+		wal:          wal,
+		bolt:         bolt,
+		transport:    transport,
+		timeout:      opts.ApplyTimeout,
+		tls:          opts.TLS,
+		forwardDir:   opts.ForwardDir,
+		exited:       make(chan struct{}),
+		nextID:       newBatchEpoch(),
+		bootstrapped: bootstrapped,
 	}
 	if err := c.listenForward(opts); err != nil {
 		r.Shutdown()
@@ -790,6 +798,70 @@ func (s *Store) AddVoter(id, addr string) error {
 		return fmt.Errorf("persist: store is not replicating")
 	}
 	return s.cluster.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), 0, s.cluster.timeout).Error()
+}
+
+// RemoveServer drops a voter from the group. id is the Raft server id.
+func (s *Store) RemoveServer(id string) error {
+	if s.cluster == nil {
+		return fmt.Errorf("persist: store is not replicating")
+	}
+	if id == "" {
+		return fmt.Errorf("persist: server id is empty")
+	}
+	return s.cluster.raft.RemoveServer(raft.ServerID(id), 0, s.cluster.timeout).Error()
+}
+
+// RaftStatus is this process's view of the group. A standalone store reports
+// role "standalone" and zero indexes.
+type RaftStatus struct {
+	Role    string
+	Leader  string
+	Commit  uint64
+	Applied uint64
+	Lag     uint64
+}
+
+// Status returns the current Raft role and how far this node has applied.
+func (s *Store) Status() RaftStatus {
+	if s.cluster == nil || s.cluster.raft == nil {
+		return RaftStatus{Role: "standalone"}
+	}
+	commit := s.cluster.raft.CommitIndex()
+	applied := atomic.LoadUint64(&s.fsmApplied)
+	lag := uint64(0)
+	if commit > applied {
+		lag = commit - applied
+	}
+	return RaftStatus{
+		Role:    strings.ToLower(s.cluster.raft.State().String()),
+		Leader:  string(s.cluster.raft.Leader()),
+		Commit:  commit,
+		Applied: applied,
+		Lag:     lag,
+	}
+}
+
+// Ready reports that the store is open and, on a cluster node, that this
+// process has applied the commit index.
+func (s *Store) Ready() bool {
+	if s.badgerDB() == nil {
+		return false
+	}
+	if s.cluster == nil || s.cluster.raft == nil {
+		return true
+	}
+	commit := s.cluster.raft.CommitIndex()
+	if commit == 0 {
+		return false
+	}
+	return s.caughtUpTo(commit)
+}
+
+// Bootstrapped reports whether this process created a new Raft group.
+// A restart that ignores GMS_RAFT_BOOTSTRAP returns false: that node joins
+// the existing group and must not wait to become leader.
+func (s *Store) Bootstrapped() bool {
+	return s.cluster != nil && s.cluster.bootstrapped
 }
 
 // Snapshot asks Raft to compact the log into a Badger backup. A replica that

@@ -23,6 +23,7 @@ x-env: &env
   GMS_RAFT_DIR: /data/raft
   GMS_DATA: /data/gms
   GMS_BOOTSTRAP_PASSWORD: ${GMS_BOOTSTRAP_PASSWORD:-dev-only-change-me}
+  GMS_SEED_EXAMPLE: "1"
   GMS_TLS_CERT: /certs/server.crt
   GMS_TLS_KEY: /certs/server.key
   GMS_RAFT_TLS_CERT: /certs/server.crt

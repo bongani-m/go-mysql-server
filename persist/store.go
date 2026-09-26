@@ -101,6 +101,9 @@ func Open(path string) (*Store, error) {
 
 // OpenWithOptions opens or creates the Badger directory at path.
 func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
+	if err := recoverRestoreDirs(path); err != nil {
+		return nil, err
+	}
 	syncWrites := !opts.BulkLoad && !opts.NoSync
 	db, err := openBadger(path, syncWrites)
 	if err != nil {

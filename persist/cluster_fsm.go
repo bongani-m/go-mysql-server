@@ -1,7 +1,6 @@
 package persist
 
 import (
-	"bytes"
 	"encoding/binary"
 	"io"
 	"os"
@@ -77,19 +76,42 @@ func (f *storeFSM) Snapshot() (raft.FSMSnapshot, error) {
 	if err := f.store.syncData(); err != nil {
 		return nil, err
 	}
-	var body bytes.Buffer
-	version, err := f.store.badgerDB().Backup(&body, 0)
+	dir := f.store.raftDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	file, err := os.CreateTemp(dir, "snap-")
 	if err != nil {
 		return nil, err
 	}
-	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.LittleEndian, version); err != nil {
+	path := file.Name()
+	fail := func(err error) (raft.FSMSnapshot, error) {
+		_ = file.Close()
+		_ = os.Remove(path)
 		return nil, err
 	}
-	if _, err := buf.Write(body.Bytes()); err != nil {
+	// Leave room for the version prefix, then write it once Backup returns it.
+	if _, err := file.Seek(8, io.SeekStart); err != nil {
+		return fail(err)
+	}
+	version, err := f.store.badgerDB().Backup(file, 0)
+	if err != nil {
+		return fail(err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return fail(err)
+	}
+	if err := binary.Write(file, binary.LittleEndian, version); err != nil {
+		return fail(err)
+	}
+	if err := file.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
 		return nil, err
 	}
-	return &storeSnapshot{store: f.store, data: buf.Bytes()}, nil
+	return &storeSnapshot{path: path}, nil
 }
 
 func (f *storeFSM) Restore(rc io.ReadCloser) error {
@@ -104,51 +126,130 @@ func (f *storeFSM) Restore(rc io.ReadCloser) error {
 }
 
 type storeSnapshot struct {
-	store *Store
-	data  []byte
+	path string
 }
 
 func (s *storeSnapshot) Persist(sink raft.SnapshotSink) error {
-	if s.store != nil {
-		if err := s.store.syncData(); err != nil {
-			_ = sink.Cancel()
-			return err
-		}
+	file, err := os.Open(s.path)
+	if err != nil {
+		_ = sink.Cancel()
+		return err
 	}
-	if _, err := sink.Write(s.data); err != nil {
+	defer file.Close()
+	if _, err := io.Copy(sink, file); err != nil {
 		_ = sink.Cancel()
 		return err
 	}
 	return sink.Close()
 }
 
-func (s *storeSnapshot) Release() {}
+func (s *storeSnapshot) Release() {
+	if s.path != "" {
+		_ = os.Remove(s.path)
+		s.path = ""
+	}
+}
 
 // installBackup replaces the open Badger directory with the keys in a full
 // backup. Load merges into whatever is already open, so the replacement
-// starts from an empty directory.
+// starts from an empty sibling directory and is renamed into place only
+// after Load succeeds.
 func (s *Store) installBackup(r io.Reader) error {
 	var version uint64
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return err
 	}
-	s.dbMu.Lock()
-	defer s.dbMu.Unlock()
-	old := s.db
-	if err := old.Close(); err != nil {
+	restorePath := s.path + ".restore"
+	if err := os.RemoveAll(restorePath); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(s.path); err != nil {
-		return err
-	}
-	db, err := openBadger(s.path, s.syncWrites)
+	loaded, err := openBadger(restorePath, s.syncWrites)
 	if err != nil {
 		return err
 	}
-	if err := db.Load(r, 256); err != nil {
-		db.Close()
+	if err := loaded.Load(r, 256); err != nil {
+		loaded.Close()
+		_ = os.RemoveAll(restorePath)
 		return err
 	}
-	s.db = db
+	if err := loaded.Close(); err != nil {
+		_ = os.RemoveAll(restorePath)
+		return err
+	}
+
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+	if err := s.db.Close(); err != nil {
+		if reopened, oerr := openBadger(s.path, s.syncWrites); oerr == nil {
+			s.db = reopened
+		}
+		_ = os.RemoveAll(restorePath)
+		return err
+	}
+	oldPath := s.path + ".old"
+	_ = os.RemoveAll(oldPath)
+	if err := os.Rename(s.path, oldPath); err != nil {
+		if reopened, oerr := openBadger(s.path, s.syncWrites); oerr == nil {
+			s.db = reopened
+		}
+		_ = os.RemoveAll(restorePath)
+		return err
+	}
+	if err := os.Rename(restorePath, s.path); err != nil {
+		_ = os.Rename(oldPath, s.path)
+		if reopened, oerr := openBadger(s.path, s.syncWrites); oerr == nil {
+			s.db = reopened
+		}
+		return err
+	}
+	reopened, err := openBadger(s.path, s.syncWrites)
+	if err != nil {
+		return err
+	}
+	s.db = reopened
+	_ = os.RemoveAll(oldPath)
 	return nil
+}
+
+// recoverRestoreDirs finishes or discards a snapshot install that stopped
+// between the two renames. A sibling is kept only when the live directory
+// was already moved aside, which happens after Load has succeeded.
+func recoverRestoreDirs(path string) error {
+	old := path + ".old"
+	restore := path + ".restore"
+	live := pathExists(path)
+	hasOld := pathExists(old)
+	hasRestore := pathExists(restore)
+	if !live && hasOld && hasRestore {
+		if err := os.Rename(restore, path); err != nil {
+			return err
+		}
+		live = true
+		if err := os.RemoveAll(old); err != nil {
+			return err
+		}
+		hasOld = false
+	} else if !live && hasOld {
+		if err := os.Rename(old, path); err != nil {
+			return err
+		}
+		live = true
+		hasOld = false
+	}
+	if live && hasRestore {
+		if err := os.RemoveAll(restore); err != nil {
+			return err
+		}
+	}
+	if live && hasOld {
+		if err := os.RemoveAll(old); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

@@ -75,6 +75,7 @@ GMS_RAFT_DIR=/data/raft
 GMS_DATA=/data/gms
 GMS_MYSQL_HOST=10.116.0.2
 GMS_BOOTSTRAP_PASSWORD=replace-me
+GMS_SEED_EXAMPLE=1
 GMS_TLS_CERT=/data/certs/server.crt
 GMS_TLS_KEY=/data/certs/server.key
 GMS_RAFT_TLS_CERT=/data/certs/server.crt
@@ -84,7 +85,9 @@ GMS_RAFT_TLS_CA=/data/certs/ca.crt
 
 n2 and n3 use the same peers, the same `GMS_SERVER_UUID`, and the same password and certificate paths. Change `GMS_NODE_ID`, `GMS_RAFT_ADDR`, `GMS_RAFT_ADVERTISE`, and `GMS_MYSQL_HOST` to that droplet's VPC address. Leave `GMS_RAFT_BOOTSTRAP` unset on n2 and n3.
 
-After n1 has joined the other two nodes, remove `GMS_RAFT_BOOTSTRAP` from n1 before the next restart. A new empty volume with bootstrap left on would create a second group.
+After n1 has joined the other two nodes, remove `GMS_RAFT_BOOTSTRAP` from n1 before the next restart. A restart that still has Raft state ignores the flag, logs that, and joins as a follower. A new empty volume with bootstrap left on still creates a second group.
+
+`SHOW RAFT STATUS` on any node reports the role, the leader address, and how far that node has applied. Add or remove a voter with `RAFT ADD VOTER '<id>' '<host:port>'` and `RAFT REMOVE SERVER '<id>'`. A follower forwards those two statements to the leader.
 
 ## Start
 

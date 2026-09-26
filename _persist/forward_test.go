@@ -238,6 +238,55 @@ func execSQL(t *testing.T, conn *sql.Conn, query string) {
 	require.NoError(t, err)
 }
 
+func TestRaftStatusAndRemove(t *testing.T) {
+	nodes := startForwardCluster(t, 3)
+	var leader, follower, other *forwardNode
+	for _, node := range nodes {
+		if node.store.IsLeader() {
+			leader = node
+			break
+		}
+	}
+	require.NotNil(t, leader)
+	for _, node := range nodes {
+		if node == leader {
+			continue
+		}
+		if follower == nil {
+			follower = node
+			continue
+		}
+		other = node
+	}
+	require.NotNil(t, follower)
+	require.NotNil(t, other)
+
+	conn := openMySQL(t, follower.addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var role, leaderAddr, commit, applied, lag string
+	require.NoError(t, conn.QueryRowContext(ctx, "SHOW RAFT STATUS").Scan(&role, &leaderAddr, &commit, &applied, &lag))
+	require.Equal(t, "follower", role)
+	require.NotEmpty(t, leaderAddr)
+
+	execSQL(t, conn, "RAFT REMOVE SERVER '"+other.store.NodeID()+"'")
+	execSQL(t, openMySQL(t, leader.addr), "CREATE DATABASE IF NOT EXISTS mydb")
+	execSQL(t, openMySQL(t, leader.addr), "CREATE TABLE IF NOT EXISTS mydb.kept (id bigint primary key, name varchar(32))")
+	execSQL(t, openMySQL(t, follower.addr), "INSERT INTO mydb.kept VALUES (1, 'ada')")
+	got := queryKept(t, openMySQL(t, leader.addr))
+	require.Equal(t, "ada", got)
+}
+
+func queryKept(t *testing.T, conn *sql.Conn) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var name string
+	err := conn.QueryRowContext(ctx, "SELECT name FROM mydb.kept WHERE id = 1").Scan(&name)
+	require.NoError(t, err)
+	return name
+}
+
 func queryName(t *testing.T, conn *sql.Conn, id int) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

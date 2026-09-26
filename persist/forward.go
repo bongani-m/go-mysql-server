@@ -199,6 +199,11 @@ type ForwardClient struct {
 	closed bool
 }
 
+// forwardDialTimeout bounds one TCP connect. A dead leader used to hold the
+// dial for the whole apply timeout, so a statement started during an election
+// failed long after the new leader was serving.
+const forwardDialTimeout = 250 * time.Millisecond
+
 func dialForward(addr string, cfg *tls.Config, timeout time.Duration) (*ForwardClient, error) {
 	dialer := &net.Dialer{Timeout: timeout}
 	var conn net.Conn
@@ -289,7 +294,10 @@ func (s *Store) DialForward() (*ForwardClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	timeout := s.ApplyTimeout()
+	timeout := forwardDialTimeout
+	if s.ApplyTimeout() < timeout {
+		timeout = s.ApplyTimeout()
+	}
 	return dialForward(addr, s.cluster.tls, timeout)
 }
 

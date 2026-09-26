@@ -5,10 +5,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dolthub/vitess/go/mysql"
@@ -25,7 +28,7 @@ import (
 // Persistent MySQL server for the example people table. Rows live in a Badger
 // directory and are still there after this process exits.
 //
-//	GMS_BOOTSTRAP_PASSWORD=secret go run ./_persist
+//	GMS_SEED_EXAMPLE=1 GMS_BOOTSTRAP_PASSWORD=secret go run ./_persist
 //	mysql --host=127.0.0.1 --port=3306 --user=root --password=secret mydb --execute="SELECT name, email FROM mytable;"
 //
 // The HTTP API in _example_webapp connects to this server unchanged.
@@ -61,6 +64,11 @@ var (
 )
 
 func main() {
+	limits, err := loadLimits()
+	if err != nil {
+		log.Fatal(err)
+	}
+	queryTimeout = limits.exec
 	if host := os.Getenv("GMS_MYSQL_HOST"); host != "" {
 		address = host
 	}
@@ -89,13 +97,14 @@ func main() {
 	defer store.Close()
 
 	ctx := sql.NewContext(context.Background())
-	if !store.Replicating() || store.IsLeader() {
+	if seedExample() && (!store.Replicating() || store.IsLeader()) {
 		if err := ensureExample(ctx, store); err != nil {
 			log.Fatalf("seed %s.%s: %v", dbName, tableName, err)
 		}
 	}
 
 	engine := sqle.NewDefault(store)
+	defer func() { _ = engine.Close() }()
 	if err := engine.InitializeEventScheduler(func() (*sql.Context, error) {
 		return sql.NewContext(context.Background(), sql.WithSession(persist.NewSession(sql.NewBaseSession(), store))), nil
 	}, eventscheduler.SchedulerOn, 0); err != nil {
@@ -128,30 +137,77 @@ func main() {
 	if err != nil {
 		log.Fatalf("tls: %v", err)
 	}
+	queries := &countingMetric{}
+	queryErrs := &countingMetric{}
 	config := server.Config{
 		Protocol:               "tcp",
 		Address:                fmt.Sprintf("%s:%d", address, port),
 		TLSConfig:              tlsConfig,
 		RequireSecureTransport: tlsConfig != nil,
+		MaxConnections:         limits.maxConns,
+		ConnReadTimeout:        limits.read,
+		ConnWriteTimeout:       limits.write,
+		QueryCounter:           queries,
+		QueryErrorCounter:      queryErrs,
 	}
-	var s *server.Server
-	if store.Replicating() {
-		s, err = server.NewServerWithHandler(config, engine, sql.NewContext, persist.NewSessionBuilder(store), nil, func(h mysql.Handler) (mysql.Handler, error) {
-			inner, ok := h.(*server.Handler)
-			if !ok {
-				return nil, fmt.Errorf("persist: unexpected mysql handler %T", h)
-			}
-			return newForwardHandler(inner, store), nil
-		})
-	} else {
-		s, err = server.NewServer(config, engine, sql.NewContext, persist.NewSessionBuilder(store), nil)
+	var metricsSrv *http.Server
+	if addr := strings.TrimSpace(os.Getenv("GMS_METRICS_ADDR")); addr != "" {
+		metricsSrv, err = startMetrics(addr, store, queries, queryErrs)
+		if err != nil {
+			log.Fatalf("metrics: %v", err)
+		}
+		log.Printf("metrics listening on %s", addr)
 	}
+	s, err := server.NewServerWithHandler(config, engine, sql.NewContext, persist.NewSessionBuilder(store), nil, func(h mysql.Handler) (mysql.Handler, error) {
+		inner, ok := h.(*server.Handler)
+		if !ok {
+			return nil, fmt.Errorf("persist: unexpected mysql handler %T", h)
+		}
+		return newForwardHandler(inner, store), nil
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sig
+		log.Printf("shutting down")
+		if metricsSrv != nil {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = metricsSrv.Shutdown(stopCtx)
+			cancel()
+		}
+		if err := s.Close(); err != nil {
+			log.Printf("close listener: %v", err)
+		}
+	}()
 	log.Printf("persistent MySQL listening on %s, data file %s", config.Address, path)
 	if err = s.Start(); err != nil {
-		log.Fatal(err)
+		log.Printf("server: %v", err)
+	}
+	waitSessions(engine, limits.shutdown)
+}
+
+// queryTimeout is the per-statement deadline. Zero means no deadline.
+var queryTimeout time.Duration
+
+// waitSessions blocks until the process list is empty or the timeout passes.
+func waitSessions(engine *sqle.Engine, timeout time.Duration) {
+	if engine == nil || engine.ProcessList == nil || timeout <= 0 {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		n := len(engine.ProcessList.Processes())
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("shutdown: %d sessions still open", n)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -220,7 +276,10 @@ func openStore(path string, onLeadership func(bool)) (*persist.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bootstrap {
+	// WaitReady only after this process created the group. A restart with
+	// GMS_RAFT_BOOTSTRAP still set joins as a follower; waiting to become
+	// leader times out and exits the node.
+	if store.Bootstrapped() {
 		if err := store.WaitReady(30 * time.Second); err != nil {
 			store.Close()
 			return nil, err
