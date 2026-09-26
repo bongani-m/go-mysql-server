@@ -319,6 +319,13 @@ func (s *Store) appendBinlog(index uint64, batch replBatch) error {
 }
 
 func (b *binlog) append(index uint64, batch replBatch) error {
+	gtid := mysql.Mysql56GTID{Server: b.sid, Sequence: int64(index)}
+	b.lock()
+	if b.executed.ContainsGTID(gtid) {
+		b.unlock()
+		return nil
+	}
+	b.unlock()
 	events, err := b.build(index, batch)
 	if err != nil {
 		return err
@@ -328,6 +335,9 @@ func (b *binlog) append(index uint64, batch replBatch) error {
 	}
 	b.lock()
 	defer b.unlock()
+	if b.executed.ContainsGTID(gtid) {
+		return nil
+	}
 	for _, ev := range events {
 		if err := b.writeEventLocked(ev); err != nil {
 			return err
@@ -349,42 +359,81 @@ func (b *binlog) append(index uint64, batch replBatch) error {
 }
 
 func (b *binlog) build(index uint64, batch replBatch) ([]mysql.BinlogEvent, error) {
-	if len(batch.Rows) == 0 && batch.Statement == "" {
+	rows := batchRowChanges(batch)
+	if len(rows) == 0 && batch.Statement == "" {
 		return nil, nil
 	}
 	meta := mysql.BinlogEventMetadata{ServerID: 1, Timestamp: batch.Unix}
 	gtid := mysql.Mysql56GTID{Server: b.sid, Sequence: int64(index)}
 	events := []mysql.BinlogEvent{
-		mysql.NewMySQLGTIDEvent(b.format, meta, gtid, len(batch.Rows) > 0),
+		mysql.NewMySQLGTIDEvent(b.format, meta, gtid, len(rows) > 0),
 	}
-	if len(batch.Rows) == 0 {
+	if len(rows) == 0 {
 		events = append(events, mysql.NewQueryEvent(b.format, meta, mysql.Query{SQL: batch.Statement}))
 		return events, nil
 	}
-	database := batch.Rows[0].Database
 	events = append(events, mysql.NewQueryEvent(b.format, meta, mysql.Query{
-		Database: database,
+		Database: rows[0].Database,
 		SQL:      "BEGIN",
 	}))
 	var tableID uint64
-	for _, change := range batch.Rows {
+	schemas := map[string][]byte{}
+	for i := 0; i < len(rows); {
+		filled, err := fillRowSchema(schemas, rows[i])
+		if err != nil {
+			return nil, err
+		}
+		group := []rowChange{filled}
+		j := i + 1
+		for j < len(rows) {
+			next, err := fillRowSchema(schemas, rows[j])
+			if err != nil {
+				return nil, err
+			}
+			if next.Database != filled.Database || next.Table != filled.Table || next.Op != filled.Op {
+				break
+			}
+			group = append(group, next)
+			j++
+		}
 		tableID++
-		rowEvents, err := b.rowEvents(tableID, change, meta)
+		rowEvents, err := b.rowGroupEvents(tableID, group, meta)
 		if err != nil {
 			return nil, err
 		}
 		events = append(events, rowEvents...)
+		i = j
 	}
 	events = append(events, mysql.NewXIDEvent(b.format, meta))
 	return events, nil
 }
 
-func (b *binlog) rowEvents(tableID uint64, change rowChange, meta mysql.BinlogEventMetadata) ([]mysql.BinlogEvent, error) {
-	tableMeta, err := decodeSchema(change.Schema, change.Database, change.Table)
+// fillRowSchema keeps the first schema stored for a table in this batch and
+// copies it onto later rows that omit it. Older log entries carry the schema
+// on every row.
+func fillRowSchema(schemas map[string][]byte, change rowChange) (rowChange, error) {
+	key := change.Database + "\x00" + change.Table
+	if len(change.Schema) > 0 {
+		schemas[key] = change.Schema
+		return change, nil
+	}
+	schema, ok := schemas[key]
+	if !ok {
+		return change, fmt.Errorf("persist: missing schema for %s.%s", change.Database, change.Table)
+	}
+	change.Schema = schema
+	return change, nil
+}
+
+// rowGroupEvents emits one table map and one rows event for consecutive
+// edits of the same table and operation.
+func (b *binlog) rowGroupEvents(tableID uint64, group []rowChange, meta mysql.BinlogEventMetadata) ([]mysql.BinlogEvent, error) {
+	head := group[0]
+	tableMeta, err := decodeSchema(head.Schema, head.Database, head.Table)
 	if err != nil {
 		return nil, err
 	}
-	tableMap, err := tableMapFor(change.Database, change.Table, tableMeta.schema)
+	tableMap, err := tableMapFor(head.Database, head.Table, tableMeta.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -393,49 +442,51 @@ func (b *binlog) rowEvents(tableID uint64, change rowChange, meta mysql.BinlogEv
 		return nil, err
 	}
 	n := len(tableMeta.schema)
-	switch change.Op {
+	switch head.Op {
 	case int(opInsert):
-		data, nulls, err := encodeBinlogRow(tableMeta.schema, change.After)
-		if err != nil {
-			return nil, err
-		}
-		rows := mysql.Rows{
-			DataColumns: presentColumns(n),
-			Rows:        []mysql.Row{{NullColumns: nulls, Data: data}},
+		rows := mysql.Rows{DataColumns: presentColumns(n)}
+		for _, change := range group {
+			data, nulls, err := encodeBinlogRow(tableMeta.schema, change.After)
+			if err != nil {
+				return nil, err
+			}
+			rows.Rows = append(rows.Rows, mysql.Row{NullColumns: nulls, Data: data})
 		}
 		return []mysql.BinlogEvent{mapEvent, mysql.NewWriteRowsEvent(b.format, meta, tableID, rows)}, nil
 	case int(opDelete):
-		data, nulls, err := encodeBinlogRow(tableMeta.schema, change.Before)
-		if err != nil {
-			return nil, err
-		}
-		rows := mysql.Rows{
-			IdentifyColumns: presentColumns(n),
-			Rows:            []mysql.Row{{NullIdentifyColumns: nulls, Identify: data}},
+		rows := mysql.Rows{IdentifyColumns: presentColumns(n)}
+		for _, change := range group {
+			data, nulls, err := encodeBinlogRow(tableMeta.schema, change.Before)
+			if err != nil {
+				return nil, err
+			}
+			rows.Rows = append(rows.Rows, mysql.Row{NullIdentifyColumns: nulls, Identify: data})
 		}
 		return []mysql.BinlogEvent{mapEvent, mysql.NewDeleteRowsEvent(b.format, meta, tableID, rows)}, nil
 	case int(opUpdate):
-		before, beforeNulls, err := encodeBinlogRow(tableMeta.schema, change.Before)
-		if err != nil {
-			return nil, err
-		}
-		after, afterNulls, err := encodeBinlogRow(tableMeta.schema, change.After)
-		if err != nil {
-			return nil, err
-		}
 		rows := mysql.Rows{
 			IdentifyColumns: presentColumns(n),
 			DataColumns:     presentColumns(n),
-			Rows: []mysql.Row{{
+		}
+		for _, change := range group {
+			before, beforeNulls, err := encodeBinlogRow(tableMeta.schema, change.Before)
+			if err != nil {
+				return nil, err
+			}
+			after, afterNulls, err := encodeBinlogRow(tableMeta.schema, change.After)
+			if err != nil {
+				return nil, err
+			}
+			rows.Rows = append(rows.Rows, mysql.Row{
 				NullIdentifyColumns: beforeNulls,
 				Identify:            before,
 				NullColumns:         afterNulls,
 				Data:                after,
-			}},
+			})
 		}
 		return []mysql.BinlogEvent{mapEvent, mysql.NewUpdateRowsEvent(b.format, meta, tableID, rows)}, nil
 	default:
-		return nil, fmt.Errorf("persist: binlog row op %d", change.Op)
+		return nil, fmt.Errorf("persist: binlog row op %d", head.Op)
 	}
 }
 

@@ -226,6 +226,10 @@ func openStore(path string, onLeadership func(bool)) (*persist.Store, error) {
 			return nil, err
 		}
 	}
+	if err := store.WaitCaughtUp(30 * time.Second); err != nil {
+		store.Close()
+		return nil, err
+	}
 	return store, nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v4"
 
@@ -36,6 +37,7 @@ var (
 	keyDataBytes     = []byte("dataBytes")
 	bucketIndex      = []byte("index")
 	keySourceGTID    = []byte("sourceGtid")
+	keyRaftApplied   = []byte("raftApplied")
 	keyRetrievedGTID = []byte("retrievedGtid")
 	keyReplicaSource = []byte("replicaSource")
 )
@@ -67,6 +69,9 @@ type Store struct {
 	rowLock  *lockTable
 	gcStop   chan struct{}
 	gcDone   chan struct{}
+	// fsmApplied is the newest Raft index the FSM has finished. It lags
+	// Raft's AppliedIndex, which moves when a batch is queued.
+	fsmApplied uint64
 }
 
 var _ sql.DatabaseProvider = (*Store)(nil)
@@ -77,6 +82,9 @@ type OpenOptions struct {
 	// BulkLoad turns fsync off for the life of the store. Normal commits keep
 	// SyncWrites on, matching InnoDB with flush at commit.
 	BulkLoad bool
+	// NoSync turns fsync off. OpenCluster sets it: the Raft log is the commit
+	// record. Badger is fsynced on snapshot and shutdown.
+	NoSync bool
 }
 
 // Open opens or creates the Badger directory at path.
@@ -88,7 +96,7 @@ func Open(path string) (*Store, error) {
 
 // OpenWithOptions opens or creates the Badger directory at path.
 func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
-	syncWrites := !opts.BulkLoad
+	syncWrites := !opts.BulkLoad && !opts.NoSync
 	db, err := openBadger(path, syncWrites)
 	if err != nil {
 		return nil, err
@@ -117,9 +125,57 @@ func (s *Store) Close() error {
 	if s.bin != nil {
 		s.bin.close()
 	}
+	if err := s.syncData(); err != nil {
+		return err
+	}
 	s.dbMu.Lock()
 	defer s.dbMu.Unlock()
 	return s.db.Close()
+}
+
+// syncData fsyncs Badger when commits themselves do not. A single-node store
+// already fsyncs each commit.
+func (s *Store) syncData() error {
+	if s.syncWrites {
+		return nil
+	}
+	db := s.badgerDB()
+	if db == nil {
+		return nil
+	}
+	return db.Sync()
+}
+
+// noteFSMApplied records that the FSM finished applying index.
+func (s *Store) noteFSMApplied(index uint64) {
+	for {
+		cur := atomic.LoadUint64(&s.fsmApplied)
+		if index <= cur || atomic.CompareAndSwapUint64(&s.fsmApplied, cur, index) {
+			return
+		}
+	}
+}
+
+// readRaftApplied reads the applied index stored with the last Badger commit.
+func (s *Store) readRaftApplied() uint64 {
+	db := s.badgerDB()
+	if db == nil {
+		return 0
+	}
+	var idx uint64
+	_ = db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(entryKey(nil, keyRaftApplied, kindValue))
+		if err != nil {
+			return nil
+		}
+		return item.Value(func(val []byte) error {
+			if len(val) == 8 {
+				idx = binary.BigEndian.Uint64(val)
+			}
+			return nil
+		})
+	})
+	return idx
 }
 
 // Path returns the Badger directory path.
@@ -623,9 +679,6 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 			if err := rows.PutRaw(ed.key, ed.raw); err != nil {
 				return err
 			}
-			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, ed.row, ed.key); err != nil {
-				return err
-			}
 			tx.noteRow(rowChange{
 				Database: ref.db,
 				Table:    ref.name,
@@ -633,6 +686,9 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 				Op:       int(opInsert),
 				After:    ed.raw,
 			})
+			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, ed.row, ed.key); err != nil {
+				return err
+			}
 			count++
 			nbytes += uint64(len(ed.raw))
 		case opUpdate:
@@ -666,9 +722,6 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 			if err := rows.PutRaw(ed.key, ed.raw); err != nil {
 				return err
 			}
-			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, ed.row, ed.key); err != nil {
-				return err
-			}
 			tx.noteRow(rowChange{
 				Database: ref.db,
 				Table:    ref.name,
@@ -677,6 +730,9 @@ func applyEdits(tx *kvTx, ref tableRef, edits []edit) error {
 				Before:   old,
 				After:    ed.raw,
 			})
+			if err := putIndexEntries(ctx, bucket, meta.schema, indexes, ed.row, ed.key); err != nil {
+				return err
+			}
 			count++
 			nbytes += uint64(len(ed.raw))
 		default:

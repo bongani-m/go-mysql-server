@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -107,10 +108,12 @@ func OpenCluster(path string, opts ClusterOptions) (*Store, error) {
 	}
 	opts.ServerUUID = serverUUID
 
-	store, err := Open(path)
+	// The Raft log is the commit record. Badger is fsynced on snapshot and shutdown.
+	store, err := OpenWithOptions(path, OpenOptions{NoSync: true})
 	if err != nil {
 		return nil, err
 	}
+	store.noteFSMApplied(store.readRaftApplied())
 	bin, err := openBinlog(filepath.Join(opts.RaftDir, "binlog"), opts.ServerUUID, opts.BinlogMaxBytes)
 	if err != nil {
 		store.Close()
@@ -127,6 +130,10 @@ func OpenCluster(path string, opts ClusterOptions) (*Store, error) {
 		return nil, err
 	}
 	store.cluster = c
+	// A snapshot index can sit on a configuration entry, which does not write
+	// the Badger applied key. Count that index as finished so startup does not
+	// wait for a log Raft will not replay.
+	store.noteFSMApplied(store.AppliedIndex())
 	go c.watchLeadership(opts.OnLeadership)
 	return store, nil
 }
@@ -159,13 +166,18 @@ type queuedCommit struct {
 	id    uint64
 	batch replBatch
 	done  chan error
+	// proposed is set when the batch leaves the queue for Raft. abandonFrom
+	// leaves a proposed batch for the waiter that called Apply, and still
+	// fails batches that are only recorded.
+	proposed bool
 }
 
 type cluster struct {
 	store     *Store
 	id        raft.ServerID
 	raft      *raft.Raft
-	log       *raftboltdb.BoltStore
+	wal       *raftWAL
+	bolt      *raftboltdb.BoltStore
 	transport raft.Transport
 	timeout   time.Duration
 	tls       *tls.Config
@@ -197,6 +209,12 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		cfg.LogLevel = "ERROR"
 	}
 	cfg.LocalID = raft.ServerID(opts.ID)
+	// Buffer applyCh so the leader can fsync and replicate a group in one
+	// AppendEntries. The apply timeout still bounds how long Apply waits for a
+	// free slot. A restart keeps the Badger directory; the snapshot index is
+	// still recorded, and a joining replica installs a snapshot over RPC.
+	cfg.BatchApplyCh = true
+	cfg.NoSnapshotRestoreOnStart = true
 
 	transport := opts.Transport
 	var err error
@@ -228,25 +246,34 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		closeTransport(transport)
 		return nil, err
 	}
+	wal, err := openRaftWAL(opts.RaftDir, bolt)
+	if err != nil {
+		bolt.Close()
+		closeTransport(transport)
+		return nil, err
+	}
 	snaps, err := raft.NewFileSnapshotStore(opts.RaftDir, 2, os.Stderr)
 	if err != nil {
+		wal.Close()
 		bolt.Close()
 		closeTransport(transport)
 		return nil, err
 	}
 
 	if opts.Bootstrap {
-		has, err := raft.HasExistingState(bolt, bolt, snaps)
+		has, err := raft.HasExistingState(wal, bolt, snaps)
 		if err != nil {
+			wal.Close()
 			bolt.Close()
 			closeTransport(transport)
 			return nil, err
 		}
 		if !has {
-			err = raft.BootstrapCluster(cfg, bolt, bolt, snaps, transport, raft.Configuration{
+			err = raft.BootstrapCluster(cfg, wal, bolt, snaps, transport, raft.Configuration{
 				Servers: opts.servers(),
 			})
 			if err != nil {
+				wal.Close()
 				bolt.Close()
 				closeTransport(transport)
 				return nil, err
@@ -254,8 +281,9 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		}
 	}
 
-	r, err := raft.NewRaft(cfg, &storeFSM{store: store}, bolt, bolt, snaps, transport)
+	r, err := raft.NewRaft(cfg, &storeFSM{store: store}, wal, bolt, snaps, transport)
 	if err != nil {
+		wal.Close()
 		bolt.Close()
 		closeTransport(transport)
 		return nil, err
@@ -264,7 +292,8 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		store:      store,
 		id:         raft.ServerID(opts.ID),
 		raft:       r,
-		log:        bolt,
+		wal:        wal,
+		bolt:       bolt,
 		transport:  transport,
 		timeout:    opts.ApplyTimeout,
 		tls:        opts.TLS,
@@ -275,6 +304,7 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 	if err := c.listenForward(opts); err != nil {
 		r.Shutdown()
 		closeTransport(transport)
+		wal.Close()
 		bolt.Close()
 		return nil, err
 	}
@@ -449,8 +479,10 @@ func (c *cluster) enqueue(batch replBatch) (chan error, error) {
 	return q.done, nil
 }
 
-// proposeLoop sends each recorded group to Raft in record order, and only then
-// waits. Raft coalesces those entries into one AppendEntries round trip.
+// proposeLoop hands each recorded group to Raft once the previous group's
+// Apply calls have been accepted. A goroutine waits on those futures, so the
+// next group can join the same quorum flush. Raft coalesces the entries
+// already in applyCh into one AppendEntries round trip.
 func (c *cluster) proposeLoop() {
 	defer close(c.exited)
 	for {
@@ -458,7 +490,7 @@ func (c *cluster) proposeLoop() {
 		if group == nil {
 			return
 		}
-		c.proposeGroup(group)
+		c.submitGroup(group)
 	}
 }
 
@@ -477,11 +509,16 @@ func (c *cluster) takeQueue() []*queuedCommit {
 	}
 	group := c.queue
 	c.queue = nil
+	for _, q := range group {
+		q.proposed = true
+	}
 	c.store.mu.Unlock()
 	return group
 }
 
-func (c *cluster) proposeGroup(group []*queuedCommit) {
+// submitGroup encodes the group and waits for Raft in the background.
+// The caller returns to the queue as soon as every Apply has been accepted.
+func (c *cluster) submitGroup(group []*queuedCommit) {
 	if c.gate != nil {
 		c.gate()
 	}
@@ -489,12 +526,12 @@ func (c *cluster) proposeGroup(group []*queuedCommit) {
 	for i, q := range group {
 		payload, err := encodeBatch(q.batch)
 		if err != nil {
-			c.finishProposed(group, futures, i, err)
+			go c.finishProposed(group, futures, i, err)
 			return
 		}
 		futures[i] = c.raft.Apply(payload, c.timeout)
 	}
-	c.finishProposed(group, futures, len(group), nil)
+	go c.finishProposed(group, futures, len(group), nil)
 }
 
 // finishProposed waits for futures that were sent. A Raft error from index
@@ -552,11 +589,17 @@ func (c *cluster) abandonFrom(id uint64, err error, alreadyNotified map[uint64]b
 		if q.id == id {
 			drop = true
 		}
-		if drop {
-			dropped = append(dropped, q)
+		if !drop {
+			kept = append(kept, q)
 			continue
 		}
-		kept = append(kept, q)
+		// A later group already accepted by Apply reports its own Raft result.
+		// This group, and anything still only recorded, is failed here.
+		if q.proposed && !alreadyNotified[q.id] {
+			kept = append(kept, q)
+			continue
+		}
+		dropped = append(dropped, q)
 	}
 	if drop {
 		c.inflight = kept
@@ -647,8 +690,13 @@ func (c *cluster) shutdown() error {
 	}
 	<-c.exited
 	closeTransport(c.transport)
-	if c.log != nil {
-		if cerr := c.log.Close(); err == nil {
+	if c.wal != nil {
+		if cerr := c.wal.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if c.bolt != nil {
+		if cerr := c.bolt.Close(); err == nil {
 			err = cerr
 		}
 	}
@@ -688,6 +736,52 @@ func (s *Store) WaitReady(timeout time.Duration) error {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return fmt.Errorf("persist: timed out waiting for leadership")
+}
+
+// WaitCaughtUp waits until this node has applied every committed Raft entry.
+// CommitIndex stays 0 until a quorum entry arrives (the leader's noop, or a
+// follower's first AppendEntries). An uncommitted log tail is left unapplied.
+func (s *Store) WaitCaughtUp(timeout time.Duration) error {
+	if s.cluster == nil {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		commit := s.cluster.raft.CommitIndex()
+		if commit > 0 && s.caughtUpTo(commit) {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("persist: timed out waiting for raft apply")
+}
+
+// caughtUpTo reports that index is committed on this node and the FSM has
+// finished it. Raft's AppliedIndex moves when a batch is queued, which is
+// before privileges and rows are visible.
+func (s *Store) caughtUpTo(index uint64) bool {
+	if s.cluster == nil {
+		return true
+	}
+	if index == 0 || s.cluster.raft.AppliedIndex() < index {
+		return false
+	}
+	return atomic.LoadUint64(&s.fsmApplied) >= s.cluster.fsmTarget(index)
+}
+
+// fsmTarget is the newest index at or before index that the FSM observes.
+// A noop is not delivered to Apply.
+func (c *cluster) fsmTarget(index uint64) uint64 {
+	for idx := index; idx > 0; idx-- {
+		var lg raft.Log
+		if err := c.wal.GetLog(idx, &lg); err != nil {
+			return index
+		}
+		if lg.Type != raft.LogNoop {
+			return idx
+		}
+	}
+	return 0
 }
 
 // AddVoter adds a replica that is already running at addr.

@@ -111,7 +111,7 @@ func waitCaughtUp(t *testing.T, leader, follower *Store) {
 	for time.Now().Before(deadline) {
 		last, err := leader.LastIndex()
 		require.NoError(t, err)
-		if last > 0 && follower.AppliedIndex() >= last {
+		if last > 0 && follower.caughtUpTo(last) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -166,6 +166,106 @@ func waitRows(t *testing.T, store *Store, n int) []sql.Row {
 	}
 	t.Fatalf("got %d rows, want %d", len(rows), n)
 	return nil
+}
+
+func TestClusterRestartServesWrites(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *Store {
+		t.Helper()
+		_, trans := raft.NewInmemTransportWithTimeout(raft.ServerAddress("node-0"), 2*time.Second)
+		store, err := OpenCluster(filepath.Join(dir, "gms"), ClusterOptions{
+			ID:           "node-0",
+			Advertise:    "node-0",
+			RaftDir:      filepath.Join(dir, "raft"),
+			Bootstrap:    true,
+			ServerUUID:   testServerUUID,
+			Transport:    trans,
+			Config:       testRaftConfig(),
+			ApplyTimeout: 10 * time.Second,
+		})
+		require.NoError(t, err)
+		require.False(t, store.syncWrites)
+		return store
+	}
+
+	store := open()
+	require.NoError(t, store.WaitReady(10*time.Second))
+	require.NoError(t, store.WaitCaughtUp(10*time.Second))
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, store)
+
+	const n = 4
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c := sql.NewContext(context.Background())
+			errs[i] = insertRows(c, table, sql.NewRow(int64(i+1), fmt.Sprintf("n%d", i)))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoErrorf(t, err, "insert %d", i)
+	}
+	require.NoError(t, store.Close())
+
+	reopened := open()
+	t.Cleanup(func() { _ = reopened.Close() })
+	require.NoError(t, reopened.WaitReady(10*time.Second))
+	require.NoError(t, reopened.WaitCaughtUp(10*time.Second))
+	rows := waitRows(t, reopened, n)
+	got := map[int64]string{}
+	for _, row := range rows {
+		got[row[0].(int64)] = row[1].(string)
+	}
+	for i := 0; i < n; i++ {
+		require.Equal(t, fmt.Sprintf("n%d", i), got[int64(i+1)])
+	}
+}
+
+func TestClusterReplaysLogAfterBadgerLoss(t *testing.T) {
+	dir := t.TempDir()
+	gms := filepath.Join(dir, "gms")
+	open := func() *Store {
+		t.Helper()
+		_, trans := raft.NewInmemTransportWithTimeout(raft.ServerAddress("node-0"), 2*time.Second)
+		store, err := OpenCluster(gms, ClusterOptions{
+			ID:           "node-0",
+			Advertise:    "node-0",
+			RaftDir:      filepath.Join(dir, "raft"),
+			Bootstrap:    true,
+			ServerUUID:   testServerUUID,
+			Transport:    trans,
+			Config:       testRaftConfig(),
+			ApplyTimeout: 10 * time.Second,
+		})
+		require.NoError(t, err)
+		require.False(t, store.syncWrites)
+		return store
+	}
+
+	store := open()
+	require.NoError(t, store.WaitReady(10*time.Second))
+	require.NoError(t, store.WaitCaughtUp(10*time.Second))
+	ctx := sql.NewContext(context.Background())
+	table := kvTable(t, ctx, store)
+	require.NoError(t, insertRows(ctx, table, sql.NewRow(int64(1), "ada")))
+	require.NoError(t, store.WaitCaughtUp(10*time.Second))
+	require.NoError(t, store.Close())
+
+	// The Raft log is the commit record. Dropping Badger simulates a crash
+	// before that directory was fsynced.
+	require.NoError(t, os.RemoveAll(gms))
+
+	reopened := open()
+	t.Cleanup(func() { _ = reopened.Close() })
+	require.NoError(t, reopened.WaitReady(10*time.Second))
+	require.NoError(t, reopened.WaitCaughtUp(10*time.Second))
+	rows := waitRows(t, reopened, 1)
+	require.Equal(t, int64(1), rows[0][0])
+	require.Equal(t, "ada", rows[0][1])
 }
 
 func TestClusterReplicatesInsert(t *testing.T) {

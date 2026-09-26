@@ -2,6 +2,7 @@ package persist
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"errors"
 	"time"
@@ -16,10 +17,20 @@ var errReplicate = errors.New("persist: replicate batch")
 
 // kvOp is one recorded Badger write. Delete is set instead of an empty value
 // so a stored empty value stays distinct from a removal.
+// Row marks the table row this op writes. Index ops leave it false.
+// Schema is set on the first row op for that table in the batch.
+// Before is the previous row image for an update or delete. The new image
+// is Value, so the log does not store the row twice.
 type kvOp struct {
-	Key    []byte
-	Value  []byte
-	Delete bool
+	Key      []byte
+	Value    []byte
+	Delete   bool
+	Row      bool
+	Database string
+	Table    string
+	Schema   []byte
+	Op       int
+	Before   []byte
 }
 
 // rowChange is the before/after image of one row edit, used to build a
@@ -33,8 +44,10 @@ type rowChange struct {
 	After    []byte
 }
 
-// replBatch is one Raft log entry: the key/value writes, row images for DML,
-// and the statement text for a catalog change that has no row images.
+// replBatch is one Raft log entry: the key/value writes, and the statement
+// text for a catalog change that has no row images.
+// Rows is set on entries written before row ops were tagged. New entries
+// leave it empty and the binlog is built from the row ops.
 // ID is set by the leader that proposed the batch and is zero on entries
 // restored from an older log. The leader uses it to drop that batch from
 // its in-flight list; followers do not.
@@ -52,8 +65,7 @@ type replBatch struct {
 // runs, so the batch matches what this commit would have written.
 type recordingTxn struct {
 	*badger.Txn
-	ops  []kvOp
-	rows []rowChange
+	ops []kvOp
 }
 
 func (t *recordingTxn) Set(key, val []byte) error {
@@ -72,15 +84,58 @@ func (t *recordingTxn) Delete(key []byte) error {
 	return t.Txn.Delete(key)
 }
 
+// noteRow tags the key/value op just recorded as the table row. The caller
+// records that row op immediately before this.
 func (tx *kvTx) noteRow(ch rowChange) {
 	rec, ok := tx.txn.(*recordingTxn)
-	if !ok || rec == nil {
+	if !ok || rec == nil || len(rec.ops) == 0 {
 		return
 	}
-	ch.Schema = append([]byte(nil), ch.Schema...)
-	ch.Before = append([]byte(nil), ch.Before...)
-	ch.After = append([]byte(nil), ch.After...)
-	rec.rows = append(rec.rows, ch)
+	op := &rec.ops[len(rec.ops)-1]
+	op.Row = true
+	op.Database = ch.Database
+	op.Table = ch.Table
+	op.Op = ch.Op
+	if !opSchemaNoted(rec.ops[:len(rec.ops)-1], ch.Database, ch.Table) {
+		op.Schema = append([]byte(nil), ch.Schema...)
+	}
+	if len(ch.Before) > 0 {
+		op.Before = append([]byte(nil), ch.Before...)
+	}
+}
+
+// opSchemaNoted reports that this batch already stored the schema for the table.
+// Later row ops leave Schema empty; the binlog builder reuses the first copy.
+func opSchemaNoted(ops []kvOp, database, table string) bool {
+	for _, op := range ops {
+		if op.Row && op.Database == database && op.Table == table && len(op.Schema) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// batchRowChanges returns the row images for a log entry. Older entries
+// stored them in Rows. Newer entries tag the row ops and leave Rows empty.
+func batchRowChanges(batch replBatch) []rowChange {
+	if len(batch.Rows) > 0 {
+		return batch.Rows
+	}
+	var rows []rowChange
+	for _, op := range batch.Ops {
+		if !op.Row {
+			continue
+		}
+		rows = append(rows, rowChange{
+			Database: op.Database,
+			Table:    op.Table,
+			Schema:   op.Schema,
+			Op:       op.Op,
+			Before:   op.Before,
+			After:    op.Value,
+		})
+	}
+	return rows
 }
 
 // commit runs fn as the single writer. Without a cluster it commits directly.
@@ -165,7 +220,6 @@ func (c *cluster) commitGTID(statement, gtid string, fn func(tx *kvTx) error) er
 	}
 	done, err := c.enqueue(replBatch{
 		Ops:       rec.ops,
-		Rows:      rec.rows,
 		Statement: statement,
 		Unix:      uint32(time.Now().Unix()),
 		Rotate:    rotate,
@@ -209,12 +263,10 @@ func decodeBatch(raw []byte) (replBatch, error) {
 	return batch, err
 }
 
-// applyOps writes a committed batch into the local Badger. Puts and deletes
-// are applied in order and are safe to repeat for the same Raft index.
-func (s *Store) applyOps(ops []kvOp) error {
-	if len(ops) == 0 {
-		return nil
-	}
+// applyOpsAt writes a committed batch into the local Badger and records index
+// in that same transaction. Puts and deletes are applied in order and are
+// safe to repeat for the same Raft index.
+func (s *Store) applyOpsAt(index uint64, ops []kvOp) error {
 	return s.badgerDB().Update(func(txn *badger.Txn) error {
 		for _, op := range ops {
 			if op.Delete {
@@ -227,6 +279,11 @@ func (s *Store) applyOps(ops []kvOp) error {
 				return err
 			}
 		}
-		return nil
+		if index == 0 {
+			return nil
+		}
+		var raw [8]byte
+		binary.BigEndian.PutUint64(raw[:], index)
+		return txn.Set(entryKey(nil, keyRaftApplied, kindValue), raw[:])
 	})
 }
