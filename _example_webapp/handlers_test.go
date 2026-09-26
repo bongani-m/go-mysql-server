@@ -18,7 +18,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -26,6 +28,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 func TestListPagination(t *testing.T) {
@@ -183,20 +187,79 @@ func TestBadInput(t *testing.T) {
 	}
 }
 
-func TestReadReplicasRoundRobin(t *testing.T) {
-	primary := unusedDB(t)
+func TestNodesRoundRobin(t *testing.T) {
 	first := unusedDB(t)
 	second := unusedDB(t)
-	store := NewMySQLStore(primary, first, second).(*mysqlStore)
-	if store.reader() != first || store.reader() != second || store.reader() != first {
-		t.Fatal("reads did not alternate across replicas")
+	store := NewMySQLStore(first, second).(*mysqlStore)
+	var got []*sql.DB
+	for i := 0; i < 3; i++ {
+		err := store.call(func(db *sql.DB) error {
+			got = append(got, db)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	if NewMySQLStore(primary).(*mysqlStore).reader() != primary {
-		t.Fatal("reads should use the primary when no replicas are configured")
+	if got[0] != first || got[1] != second || got[2] != first {
+		t.Fatal("statements did not alternate across nodes")
 	}
 }
 
-func TestSplitReadAddrs(t *testing.T) {
+func TestCallUsesNextNodeAfterBrokenConnection(t *testing.T) {
+	down := unusedDB(t)
+	up := unusedDB(t)
+	store := NewMySQLStore(down, up).(*mysqlStore)
+	var seen []*sql.DB
+	err := store.call(func(db *sql.DB) error {
+		seen = append(seen, db)
+		if db == down {
+			return &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 || seen[0] != down || seen[1] != up {
+		t.Fatalf("tried %#v", seen)
+	}
+}
+
+func TestCallDoesNotRetrySQLError(t *testing.T) {
+	first := unusedDB(t)
+	second := unusedDB(t)
+	store := NewMySQLStore(first, second).(*mysqlStore)
+	n := 0
+	err := store.call(func(db *sql.DB) error {
+		n++
+		return &mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}
+	})
+	if n != 1 {
+		t.Fatalf("tries %d", n)
+	}
+	var me *mysql.MySQLError
+	if !errors.As(err, &me) || me.Number != 1062 {
+		t.Fatal(err)
+	}
+}
+
+func TestMySQLAddrs(t *testing.T) {
+	t.Setenv("MYSQL_ADDRS", "")
+	t.Setenv("MYSQL_HOST", "db.internal")
+	t.Setenv("MYSQL_PORT", "3306")
+	got := mysqlAddrs()
+	if len(got) != 1 || got[0] != "db.internal:3306" {
+		t.Fatalf("default %#v", got)
+	}
+	t.Setenv("MYSQL_ADDRS", " 127.0.0.1:3306, ,127.0.0.1:3307 ")
+	got = mysqlAddrs()
+	if len(got) != 2 || got[0] != "127.0.0.1:3306" || got[1] != "127.0.0.1:3307" {
+		t.Fatalf("list %#v", got)
+	}
+}
+
+func TestSplitAddrs(t *testing.T) {
 	if splitAddrs("") != nil {
 		t.Fatal("empty list")
 	}

@@ -17,8 +17,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -69,69 +72,86 @@ type Store interface {
 }
 
 type mysqlStore struct {
-	write *sql.DB
-	reads []*sql.DB
+	nodes []*sql.DB
 	next  atomic.Uint64
 }
 
-// NewMySQLStore talks to the example MySQL server. Writes use primary. When
-// replicas is non-empty, List and Get round-robin across those servers.
-func NewMySQLStore(primary *sql.DB, replicas ...*sql.DB) Store {
-	return &mysqlStore{write: primary, reads: replicas}
+// NewMySQLStore talks to every address. Reads and writes round-robin across
+// the nodes. A broken connection tries the next node.
+func NewMySQLStore(nodes ...*sql.DB) Store {
+	return &mysqlStore{nodes: nodes}
 }
 
-// reader is the server for one read. With no replicas that is the primary.
-func (s *mysqlStore) reader() *sql.DB {
-	if len(s.reads) == 0 {
-		return s.write
+// call runs fn on the next node. A broken connection tries each other node once.
+func (s *mysqlStore) call(fn func(*sql.DB) error) error {
+	n := len(s.nodes)
+	start := int(s.next.Add(1) - 1)
+	var last error
+	for i := 0; i < n; i++ {
+		err := fn(s.nodes[(start+i)%n])
+		if err == nil || !connErr(err) {
+			return err
+		}
+		last = err
 	}
-	i := s.next.Add(1) - 1
-	return s.reads[i%uint64(len(s.reads))]
+	return last
 }
 
 func (s *mysqlStore) List(ctx context.Context, f Filter, page, size int) (ListResult, error) {
-	db := s.reader()
-	where, args := f.where()
-	var total int
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+peopleTable+where, args...).Scan(&total); err != nil {
-		return ListResult{}, err
-	}
-
-	offset := (page - 1) * size
-	listArgs := append(append([]any{}, args...), size, offset)
-	rows, err := db.QueryContext(ctx,
-		"SELECT id, name, email, phone_numbers, created_at FROM "+peopleTable+where+" ORDER BY name, email LIMIT ? OFFSET ?",
-		listArgs...,
-	)
-	if err != nil {
-		return ListResult{}, err
-	}
-	defer rows.Close()
-
-	people := make([]Person, 0)
-	for rows.Next() {
-		p, err := scanPerson(rows)
-		if err != nil {
-			return ListResult{}, err
+	var out ListResult
+	err := s.call(func(db *sql.DB) error {
+		where, args := f.where()
+		var total int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+peopleTable+where, args...).Scan(&total); err != nil {
+			return err
 		}
-		people = append(people, p)
-	}
-	if err := rows.Err(); err != nil {
-		return ListResult{}, err
-	}
-	return ListResult{People: people, Total: total}, nil
+
+		offset := (page - 1) * size
+		listArgs := append(append([]any{}, args...), size, offset)
+		rows, err := db.QueryContext(ctx,
+			"SELECT id, name, email, phone_numbers, created_at FROM "+peopleTable+where+" ORDER BY name, email LIMIT ? OFFSET ?",
+			listArgs...,
+		)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		people := make([]Person, 0)
+		for rows.Next() {
+			p, err := scanPerson(rows)
+			if err != nil {
+				return err
+			}
+			people = append(people, p)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		out = ListResult{People: people, Total: total}
+		return nil
+	})
+	return out, err
 }
 
 func (s *mysqlStore) Get(ctx context.Context, id int64) (Person, error) {
-	row := s.reader().QueryRowContext(ctx,
-		"SELECT id, name, email, phone_numbers, created_at FROM "+peopleTable+" WHERE id = ?",
-		id,
-	)
-	p, err := scanPerson(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Person{}, ErrNotFound
-	}
-	return p, err
+	var out Person
+	err := s.call(func(db *sql.DB) error {
+		row := db.QueryRowContext(ctx,
+			"SELECT id, name, email, phone_numbers, created_at FROM "+peopleTable+" WHERE id = ?",
+			id,
+		)
+		p, err := scanPerson(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		out = p
+		return nil
+	})
+	return out, err
 }
 
 func (s *mysqlStore) Insert(ctx context.Context, p Person) (Person, error) {
@@ -139,19 +159,25 @@ func (s *mysqlStore) Insert(ctx context.Context, p Person) (Person, error) {
 	if err != nil {
 		return Person{}, err
 	}
-	res, err := s.write.ExecContext(ctx,
-		"INSERT INTO "+peopleTable+" (name, email, phone_numbers, created_at) VALUES (?, ?, ?, ?)",
-		p.Name, p.Email, phones, p.CreatedAt.UTC(),
-	)
-	if err != nil {
-		return Person{}, mapSQL(err)
-	}
-	p.ID, err = res.LastInsertId()
-	if err != nil {
-		return Person{}, err
-	}
-	p.PhoneNumbers = normalizePhones(p.PhoneNumbers)
-	return p, nil
+	var out Person
+	err = s.call(func(db *sql.DB) error {
+		res, err := db.ExecContext(ctx,
+			"INSERT INTO "+peopleTable+" (name, email, phone_numbers, created_at) VALUES (?, ?, ?, ?)",
+			p.Name, p.Email, phones, p.CreatedAt.UTC(),
+		)
+		if err != nil {
+			return mapSQL(err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		out = p
+		out.ID = id
+		out.PhoneNumbers = normalizePhones(p.PhoneNumbers)
+		return nil
+	})
+	return out, err
 }
 
 func (s *mysqlStore) Update(ctx context.Context, p Person) error {
@@ -159,39 +185,65 @@ func (s *mysqlStore) Update(ctx context.Context, p Person) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.write.ExecContext(ctx,
-		"UPDATE "+peopleTable+" SET name = ?, email = ?, phone_numbers = ?, created_at = ? WHERE id = ?",
-		p.Name, p.Email, phones, p.CreatedAt.UTC(), p.ID,
-	)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.call(func(db *sql.DB) error {
+		res, err := db.ExecContext(ctx,
+			"UPDATE "+peopleTable+" SET name = ?, email = ?, phone_numbers = ?, created_at = ? WHERE id = ?",
+			p.Name, p.Email, phones, p.CreatedAt.UTC(), p.ID,
+		)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 func (s *mysqlStore) Delete(ctx context.Context, id int64) error {
-	res, err := s.write.ExecContext(ctx,
-		"DELETE FROM "+peopleTable+" WHERE id = ?",
-		id,
-	)
-	if err != nil {
-		return err
+	return s.call(func(db *sql.DB) error {
+		res, err := db.ExecContext(ctx,
+			"DELETE FROM "+peopleTable+" WHERE id = ?",
+			id,
+		)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// connErr reports a failure to reach the node. A SQL result is not a broken connection.
+func connErr(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, sql.ErrConnDone) {
+		return true
 	}
-	if n == 0 {
-		return ErrNotFound
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
 	}
-	return nil
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		switch me.Number {
+		case 2002, 2003, 2006, 2013:
+			return true
+		}
+	}
+	return false
 }
 
 type rowScanner interface {

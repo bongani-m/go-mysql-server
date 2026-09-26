@@ -1,16 +1,23 @@
-# Writes go to the Raft leader (compose service n1). Reads round-robin across
-# n2 and n3. Those nodes can lag the leader.
+# Every address accepts reads and writes. MYSQL_ADDRS is a comma-separated
+# host:port list. Leave it unset to use MYSQL_HOST and MYSQL_PORT.
 #
-#   MYSQL_HOST=127.0.0.1 MYSQL_PORT=3306
-#   MYSQL_REPLICA_N2_PORT=3307 MYSQL_REPLICA_N3_PORT=3308
+#   MYSQL_ADDRS=127.0.0.1:3306,127.0.0.1:3307,127.0.0.1:3308
 #
+<%
+  raw = ENV.fetch("MYSQL_ADDRS", "")
+  mysql_addrs = raw.split(",").map(&:strip).reject(&:empty?)
+  if mysql_addrs.empty?
+    mysql_addrs = [ "#{ENV.fetch("MYSQL_HOST", "127.0.0.1")}:#{ENV.fetch("MYSQL_PORT", "3306")}" ]
+  end
+%>
 default: &default
   adapter: mysql2
   encoding: utf8mb4
+  connect_timeout: 2
+  connection_retries: 0
   max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
   username: <%= ENV.fetch("MYSQL_USER", "root") %>
   password: <%= ENV.fetch("MYSQL_PASSWORD", "dev-only-change-me") %>
-  host: <%= ENV.fetch("MYSQL_HOST", "127.0.0.1") %>
   database: <%= ENV.fetch("MYSQL_DB", "mydb") %>
   <%# Default trusts the _persist dev certificate. MYSQL_TLS_CA=off uses plaintext. %>
   <% tls_ca = ENV.fetch("MYSQL_TLS_CA") { Rails.root.join("../_persist/certs/ca.crt").to_s } %>
@@ -21,26 +28,20 @@ default: &default
   # The cluster already created mydb.mytable. Do not create, drop, or migrate it.
   database_tasks: false
 
-cluster: &cluster
+<% %w[development test production].each do |env_name| %>
+<%= env_name %>:
   primary:
     <<: *default
-    port: <%= ENV.fetch("MYSQL_PORT", 3306) %>
-  replica_n2:
+<% host, sep, port = mysql_addrs.fetch(0).rpartition(":") %>
+<% raise ArgumentError, "address must be host:port" if sep.empty? || host.empty? %>
+    host: <%= host %>
+    port: <%= port %>
+<% mysql_addrs.drop(1).each_with_index do |addr, index| %>
+<% host, sep, port = addr.rpartition(":") %>
+<% raise ArgumentError, "address must be host:port, got #{addr.inspect}" if sep.empty? || host.empty? %>
+  node_<%= index + 1 %>:
     <<: *default
-    host: <%= ENV.fetch("MYSQL_REPLICA_N2_HOST", ENV.fetch("MYSQL_HOST", "127.0.0.1")) %>
-    port: <%= ENV.fetch("MYSQL_REPLICA_N2_PORT", 3307) %>
-    replica: true
-  replica_n3:
-    <<: *default
-    host: <%= ENV.fetch("MYSQL_REPLICA_N3_HOST", ENV.fetch("MYSQL_HOST", "127.0.0.1")) %>
-    port: <%= ENV.fetch("MYSQL_REPLICA_N3_PORT", 3308) %>
-    replica: true
-
-development:
-  <<: *cluster
-
-test:
-  <<: *cluster
-
-production:
-  <<: *cluster
+    host: <%= host %>
+    port: <%= port %>
+<% end %>
+<% end %>

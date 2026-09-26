@@ -20,14 +20,17 @@
 //	curl -s localhost:8080/people?size=2
 //	curl -s 'localhost:8080/people?name=Jane'
 //
-// Writes use MYSQL_HOST and MYSQL_PORT (default localhost:3306). The password
-// matches the compose cluster default. To read from the other nodes:
+// MYSQL_ADDRS is every MySQL address, comma-separated. Reads and writes use
+// any of them. A broken connection tries the next address. Leave it unset to
+// use MYSQL_HOST and MYSQL_PORT (default localhost:3306):
 //
-//	MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 go run .
+//	MYSQL_ADDRS=127.0.0.1:3306,127.0.0.1:3307,127.0.0.1:3308 go run .
 //
-// Those nodes can lag the leader. Leave MYSQL_READ_ADDRS unset to read and
-// write the same server. Connections use TLS and trust ../_persist/certs/ca.crt.
-// Set MYSQL_TLS_CA to another PEM file, or to off for a plaintext server.
+// Another connection can still see an older copy. A write whose connection
+// breaks before a result comes back is sent to the next address. Connections
+// use TLS and trust ../_persist/certs/ca.crt. Set MYSQL_TLS_CA to another PEM
+// file, or to off for a plaintext server. The password matches the compose
+// cluster default.
 package main
 
 import (
@@ -55,50 +58,68 @@ func main() {
 		}
 		log.Printf("MySQL TLS CA %s", ca)
 	}
-	primaryAddr := net.JoinHostPort(env("MYSQL_HOST", "localhost"), env("MYSQL_PORT", "3306"))
-	primary, err := openMySQL(primaryAddr)
+	addrs := mysqlAddrs()
+	nodes, err := openMySQL(addrs)
 	if err != nil {
-		log.Fatalf("connect to %s: %v", primaryAddr, err)
+		log.Fatal(err)
 	}
-	defer primary.Close()
-
-	var replicas []*sql.DB
-	replicaAddrs := splitAddrs(os.Getenv("MYSQL_READ_ADDRS"))
-	for _, addr := range replicaAddrs {
-		db, err := openMySQL(addr)
-		if err != nil {
-			log.Fatalf("connect to read replica %s: %v", addr, err)
+	defer func() {
+		for _, db := range nodes {
+			db.Close()
 		}
-		defer db.Close()
-		replicas = append(replicas, db)
-	}
-	if len(replicaAddrs) == 0 {
-		log.Printf("MySQL %s", primaryAddr)
-	} else {
-		log.Printf("MySQL writes %s, reads %s", primaryAddr, strings.Join(replicaAddrs, ", "))
-	}
+	}()
+	log.Printf("MySQL %s", strings.Join(addrs, ", "))
 
 	addr := env("HTTP_ADDR", ":8080")
 	log.Printf("API listening on %s", addr)
-	if err := http.ListenAndServe(addr, NewHandler(NewMySQLStore(primary, replicas...))); err != nil {
+	if err := http.ListenAndServe(addr, NewHandler(NewMySQLStore(nodes...))); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func openMySQL(addr string) (*sql.DB, error) {
-	db, err := sql.Open("mysql", mysqlDSN(addr))
-	if err != nil {
-		return nil, err
+// mysqlAddrs is every node. MYSQL_ADDRS overrides MYSQL_HOST and MYSQL_PORT.
+func mysqlAddrs() []string {
+	if addrs := splitAddrs(os.Getenv("MYSQL_ADDRS")); len(addrs) > 0 {
+		return addrs
 	}
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(2)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
+	return []string{net.JoinHostPort(env("MYSQL_HOST", "localhost"), env("MYSQL_PORT", "3306"))}
+}
+
+// openMySQL opens a pool for each address. One live node is enough to start.
+func openMySQL(addrs []string) ([]*sql.DB, error) {
+	nodes := make([]*sql.DB, 0, len(addrs))
+	alive := 0
+	var last error
+	for _, addr := range addrs {
+		db, err := sql.Open("mysql", mysqlDSN(addr))
+		if err != nil {
+			closeDBs(nodes)
+			return nil, err
+		}
+		db.SetMaxOpenConns(10)
+		db.SetMaxIdleConns(2)
+		nodes = append(nodes, db)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err = db.PingContext(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("MySQL %s is down: %v", addr, err)
+			last = err
+			continue
+		}
+		alive++
+	}
+	if alive == 0 {
+		closeDBs(nodes)
+		return nil, fmt.Errorf("no MySQL node accepted a connection: %w", last)
+	}
+	return nodes, nil
+}
+
+func closeDBs(nodes []*sql.DB) {
+	for _, db := range nodes {
 		db.Close()
-		return nil, err
 	}
-	return db, nil
 }
 
 func mysqlDSN(addr string) string {
@@ -111,6 +132,7 @@ func mysqlDSN(addr string) string {
 		ParseTime:            true,
 		Loc:                  time.UTC,
 		AllowNativePasswords: true,
+		Timeout:              2 * time.Second,
 	}
 	if _, ok := tlsCAPath(); ok {
 		cfg.TLSConfig = "gms"
@@ -150,7 +172,7 @@ func registerMySQLTLS(caPath string) error {
 	})
 }
 
-// splitAddrs parses a comma-separated host:port list. Empty input is no replicas.
+// splitAddrs parses a comma-separated host:port list. Empty input is no addresses.
 func splitAddrs(raw string) []string {
 	if raw == "" {
 		return nil

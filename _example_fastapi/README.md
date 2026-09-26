@@ -2,7 +2,7 @@
 
 A JSON CRUD API for `mydb.mytable` on the MySQL server in `../_persist`. Same routes as `../_example_webapp`.
 
-Writes go to `MYSQL_HOST`:`MYSQL_PORT` (default `localhost:3306`). When `MYSQL_READ_ADDRS` is set, list and get round-robin across those addresses. The other nodes can lag the leader.
+`MYSQL_ADDRS` lists every MySQL address. Reads and writes use any of them. A broken connection tries the next address. Another connection can still see an older copy. Leave `MYSQL_ADDRS` unset to use `MYSQL_HOST`:`MYSQL_PORT`.
 
 ## Run
 
@@ -19,7 +19,7 @@ cd _example_fastapi
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 \
+MYSQL_ADDRS=127.0.0.1:3306,127.0.0.1:3307,127.0.0.1:3308 \
 python main.py
 ```
 
@@ -34,9 +34,9 @@ curl -s -X POST localhost:8080/people \
 
 | Variable | Default |
 |----------|---------|
+| `MYSQL_ADDRS` | unset. Uses `MYSQL_HOST`:`MYSQL_PORT` |
 | `MYSQL_HOST` | `localhost` |
-| `MYSQL_PORT` | `3306` (writes) |
-| `MYSQL_READ_ADDRS` | empty (read the write server) |
+| `MYSQL_PORT` | `3306` |
 | `MYSQL_USER` | `root` |
 | `MYSQL_PASSWORD` | `dev-only-change-me` |
 | `MYSQL_TLS_CA` | `../_persist/certs/ca.crt`. Set to `off` for a plaintext server. |

@@ -8,14 +8,16 @@ Start that server first, then:
     curl -s localhost:8080/people?size=2
     curl -s 'localhost:8080/people?name=Jane'
 
-Writes use MYSQL_HOST and MYSQL_PORT (default localhost:3306). To read from
-the other nodes in ../_persist/compose.yaml:
+MYSQL_ADDRS is every MySQL address, comma-separated. Reads and writes use
+any of them. A broken connection tries the next address. Leave it unset to
+use MYSQL_HOST and MYSQL_PORT (default localhost:3306):
 
-    MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 python main.py
+    MYSQL_ADDRS=127.0.0.1:3306,127.0.0.1:3307,127.0.0.1:3308 python main.py
 
-Those nodes can lag the leader. Leave MYSQL_READ_ADDRS unset to read and
-write the same server. Connections use TLS and trust ../_persist/certs/ca.crt.
-Set MYSQL_TLS_CA to another PEM file, or to off for a plaintext server.
+Another connection can still see an older copy. A write whose connection
+breaks before a result comes back is sent to the next address. Connections
+use TLS and trust ../_persist/certs/ca.crt. Set MYSQL_TLS_CA to another PEM
+file, or to off for a plaintext server.
 """
 
 from __future__ import annotations
@@ -303,24 +305,27 @@ def tls_ca_path() -> str | None:
     return str(Path(__file__).resolve().parent.parent / "_persist" / "certs" / "ca.crt")
 
 
+def mysql_addrs() -> list[str]:
+    """Every node. MYSQL_ADDRS overrides MYSQL_HOST and MYSQL_PORT."""
+    addrs = split_addrs(os.environ.get("MYSQL_ADDRS", ""))
+    if addrs:
+        return addrs
+    return [f"{env('MYSQL_HOST', 'localhost')}:{env('MYSQL_PORT', '3306')}"]
+
+
 def mysql_from_env() -> MySQLStore:
-    primary = f"{env('MYSQL_HOST', 'localhost')}:{env('MYSQL_PORT', '3306')}"
-    replicas = split_addrs(os.environ.get("MYSQL_READ_ADDRS", ""))
+    addrs = mysql_addrs()
     ca = tls_ca_path()
     if ca:
         log.info("MySQL TLS CA %s", ca)
     store = MySQLStore(
-        primary,
-        replicas,
+        addrs,
         user=env("MYSQL_USER", "root"),
         password=env("MYSQL_PASSWORD", "dev-only-change-me"),
         database=env("MYSQL_DB", "mydb"),
-        ssl_ca=tls_ca_path(),
+        ssl_ca=ca,
     )
-    if replicas:
-        log.info("MySQL writes %s, reads %s", primary, ", ".join(replicas))
-    else:
-        log.info("MySQL %s", primary)
+    log.info("MySQL %s", ", ".join(addrs))
     return store
 
 

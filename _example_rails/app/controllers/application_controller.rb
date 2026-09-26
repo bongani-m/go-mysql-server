@@ -3,15 +3,34 @@ class ApplicationController < ActionController::Base
 
   private
 
-  # GET/HEAD read from n2 and n3, except the request right after a write.
-  # That request still has a flash, and the replicas can lag the leader.
+  # Reads and writes use one node for this session. A broken connection
+  # moves the session to the next address.
   def route_cluster
-    role = if request.get? || request.head?
-      flash.empty? ? Cluster.next_read_role : :writing
-    else
-      :writing
+    roles = Cluster.roles
+    start = session_index(roles)
+    failure = nil
+    roles.each_index do |offset|
+      role = roles[(start + offset) % roles.size]
+      begin
+        Current.node = Cluster.label(role)
+        result = nil
+        ActiveRecord::Base.connected_to(role: role) { result = yield }
+        session[:mysql_role] = role.to_s
+        return result
+      rescue StandardError => error
+        failure = error
+        raise unless Cluster.connection_error?(error)
+        raise if offset == roles.size - 1
+      end
     end
-    Current.node = Cluster::LABELS.fetch(role)
-    ActiveRecord::Base.connected_to(role: role) { yield }
+    raise failure
+  end
+
+  def session_index(roles)
+    if (name = session[:mysql_role])
+      index = roles.index(name.to_sym)
+      return index if index
+    end
+    Cluster.next_index
   end
 end

@@ -2,7 +2,7 @@
 
 A MySQL server backed by one Badger directory. Rows are still there after the process exits.
 
-Run these commands from `go-mysql-server`. The example web app in `_example_webapp` uses this server for writes. Set `MYSQL_READ_ADDRS` there to read from the other compose nodes.
+Run these commands from `go-mysql-server`. The example clients take `MYSQL_ADDRS` and send reads and writes to any of those nodes.
 
 ## One process
 
@@ -94,15 +94,15 @@ The same addresses, with host networking and a Cloud Firewall, are what a Digita
 
 Raft stays on `10.116.0.0/24` and is not published to the host. Each node keeps `/data` in its own volume.
 
-The example API sends writes to `n1` and reads to `n2` and `n3`:
+The example API uses every published address. A broken connection tries the next one:
 
 ```bash
 cd _example_webapp
-MYSQL_READ_ADDRS=127.0.0.1:3307,127.0.0.1:3308 \
+MYSQL_ADDRS=127.0.0.1:3306,127.0.0.1:3307,127.0.0.1:3308 \
 go run .
 ```
 
-The example clients trust `_persist/certs/ca.crt` unless `MYSQL_TLS_CA` is set. `MYSQL_TLS_CA=off` connects without TLS. Leave `MYSQL_READ_ADDRS` unset to use only `localhost:3306`.
+The example clients trust `_persist/certs/ca.crt` unless `MYSQL_TLS_CA` is set. `MYSQL_TLS_CA=off` connects without TLS. Leave `MYSQL_ADDRS` unset to use only `localhost:3306`.
 
 ## Environment
 

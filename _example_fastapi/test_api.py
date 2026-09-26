@@ -1,11 +1,14 @@
 """Handler tests with an in-memory store. They do not need MySQL."""
 
+import threading
 from datetime import datetime, timezone
 
+import pymysql
+import pytest
 from fastapi.testclient import TestClient
 
-from main import create_app
-from store import Conflict, Filter, NotFound, Page, Person
+from main import create_app, mysql_addrs
+from store import Conflict, Filter, MySQLStore, NotFound, Page, Person
 
 CREATED = datetime.fromisoformat("2022-11-01T12:00:00.000001+00:00")
 
@@ -174,3 +177,54 @@ def test_conflict(monkeypatch) -> None:
         res = http.post("/people", json={"name": "A", "email": "a@b.c"})
     assert res.status_code == 409
     assert res.json() == {"error": "person already exists"}
+
+
+def _store(addrs: list[str]) -> MySQLStore:
+    store = MySQLStore.__new__(MySQLStore)
+    store._addrs = addrs
+    store._next = 0
+    store._lock = threading.Lock()
+    return store
+
+
+def test_run_round_robin() -> None:
+    store = _store(["a", "b"])
+    assert store._run(lambda addr: addr) == "a"
+    assert store._run(lambda addr: addr) == "b"
+    assert store._run(lambda addr: addr) == "a"
+
+
+def test_run_skips_broken_connection() -> None:
+    store = _store(["down", "up"])
+    seen: list[str] = []
+
+    def attempt(addr: str) -> str:
+        seen.append(addr)
+        if addr == "down":
+            raise pymysql.err.OperationalError(2003, "Can't connect")
+        return addr
+
+    assert store._run(attempt) == "up"
+    assert seen == ["down", "up"]
+
+
+def test_run_does_not_retry_sql_error() -> None:
+    store = _store(["a", "b"])
+    seen: list[str] = []
+
+    def attempt(addr: str) -> str:
+        seen.append(addr)
+        raise pymysql.err.IntegrityError(1062, "Duplicate")
+
+    with pytest.raises(pymysql.err.IntegrityError):
+        store._run(attempt)
+    assert seen == ["a"]
+
+
+def test_mysql_addrs(monkeypatch) -> None:
+    monkeypatch.delenv("MYSQL_ADDRS", raising=False)
+    monkeypatch.setenv("MYSQL_HOST", "db.internal")
+    monkeypatch.setenv("MYSQL_PORT", "3306")
+    assert mysql_addrs() == ["db.internal:3306"]
+    monkeypatch.setenv("MYSQL_ADDRS", " 127.0.0.1:3306, ,127.0.0.1:3307 ")
+    assert mysql_addrs() == ["127.0.0.1:3306", "127.0.0.1:3307"]

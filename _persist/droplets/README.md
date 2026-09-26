@@ -112,4 +112,8 @@ mysql --host=10.116.0.2 --port=3306 --user=root --password=replace-me \
   mydb --execute="SELECT name, email FROM mytable;"
 ```
 
-Use `.3` and `.4` for reads. A write to any node is forwarded to the current leader.
+A write to any node is forwarded to the current leader. Example apps take every address and try the next one when a connection breaks:
+
+```bash
+MYSQL_ADDRS=10.116.0.2:3306,10.116.0.3:3306,10.116.0.4:3306
+```
