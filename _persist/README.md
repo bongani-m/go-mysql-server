@@ -104,6 +104,59 @@ go run .
 
 The example clients trust `_persist/certs/ca.crt` unless `MYSQL_TLS_CA` is set. `MYSQL_TLS_CA=off` connects without TLS. Leave `MYSQL_ADDRS` unset to use only `localhost:3306`.
 
+## Stress test
+
+`_persist/stress/run.sh` starts one target in Docker, loads the same workload, and writes `_persist/stress/summary.md`. Run it from `go-mysql-server`. Docker has to be running. The first start creates `_persist/stress/certs` with `openssl`. These ports stay off 3306–3308, so the stress stack can run beside the example cluster.
+
+```bash
+_persist/stress/run.sh single
+_persist/stress/run.sh cluster
+_persist/stress/run.sh mysql
+_persist/stress/run.sh tidb
+_persist/stress/run.sh compare
+```
+
+`compare` runs single, cluster, MySQL, and TiDB one after another so they do not share the CPU. Each run also prints a text report and stores JSON, CPU samples, and disk usage under `_persist/stress/results/`.
+
+Flags after `--` go to the client:
+
+```bash
+_persist/stress/run.sh cluster -- -duration 60s -concurrency 32 -seed 20000
+```
+
+| Flag | Default | Role |
+|------|---------|------|
+| `-duration` | `20s` | Measured run length. |
+| `-concurrency` | `8` | Simultaneous clients. |
+| `-seed` | `5000` | Accounts inserted before the run. Each account gets two notes. |
+| `-read-pct` | `80` | Percent of operations that are reads. |
+| `-warmup` | `2s` | Unmeasured run before the clock starts. |
+| `-batch` | `100` | Rows per seed `INSERT`. |
+
+The default workload is 8 clients for 20 seconds, 80% reads, after seeding 5000 accounts and 10000 notes. Cluster writes go to the leader and reads go to the followers. MySQL flushes the redo log and the binlog on commit. The single node fsyncs each commit. The cluster also waits for a Raft quorum. TiDB reads and writes go through one SQL server to three TiKV nodes, and a commit waits for two Raft quorums.
+
+| Target | Address |
+|--------|---------|
+| single | `127.0.0.1:3316` |
+| cluster writes | `127.0.0.1:3326` |
+| cluster reads | `127.0.0.1:3327`, `127.0.0.1:3328` |
+| mysql | `127.0.0.1:3336` |
+| tidb | `127.0.0.1:3346` |
+
+The account is `root` / `stress`, database `stress`. Every target requires TLS. The script creates the CA and server certificate on first use.
+
+`KEEP=1` leaves the containers up after the run:
+
+```bash
+KEEP=1 _persist/stress/run.sh cluster
+```
+
+Wipe stored data with:
+
+```bash
+docker compose -f _persist/stress/compose.yaml -p gms-stress down -v
+```
+
 ## Environment
 
 | Variable | Role |
