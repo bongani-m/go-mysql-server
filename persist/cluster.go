@@ -57,6 +57,9 @@ type ClusterOptions struct {
 	// TLS is the mutual TLS config for Raft and the forward listener.
 	// A non-loopback bind without TLS is refused.
 	TLS *tls.Config
+	// Nonvoters replicate the log and do not vote. A bootstrap configuration
+	// includes them with raft.Nonvoter so the quorum stays the voters.
+	Nonvoters []Peer
 	// ForwardAddr is this node's write-forward listener. Empty uses port 7002
 	// on the advertise host when this process opens its own TCP transport.
 	ForwardAddr string
@@ -409,9 +412,13 @@ func newBatchEpoch() uint64 {
 }
 
 func (o ClusterOptions) servers() []raft.Server {
+	nonvoter := map[string]bool{}
+	for _, peer := range o.Nonvoters {
+		nonvoter[peer.ID] = true
+	}
 	seen := map[string]bool{}
 	var out []raft.Server
-	add := func(id, addr string) {
+	add := func(id, addr string, suffrage raft.ServerSuffrage) {
 		if id == "" || addr == "" || seen[id] {
 			return
 		}
@@ -419,12 +426,23 @@ func (o ClusterOptions) servers() []raft.Server {
 		out = append(out, raft.Server{
 			ID:       raft.ServerID(id),
 			Address:  raft.ServerAddress(addr),
-			Suffrage: raft.Voter,
+			Suffrage: suffrage,
 		})
 	}
-	add(o.ID, o.Advertise)
+	self := raft.Voter
+	if nonvoter[o.ID] {
+		self = raft.Nonvoter
+	}
+	add(o.ID, o.Advertise, self)
 	for _, peer := range o.Peers {
-		add(peer.ID, peer.Address)
+		suf := raft.Voter
+		if nonvoter[peer.ID] {
+			suf = raft.Nonvoter
+		}
+		add(peer.ID, peer.Address, suf)
+	}
+	for _, peer := range o.Nonvoters {
+		add(peer.ID, peer.Address, raft.Nonvoter)
 	}
 	return out
 }
@@ -798,6 +816,14 @@ func (s *Store) AddVoter(id, addr string) error {
 		return fmt.Errorf("persist: store is not replicating")
 	}
 	return s.cluster.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), 0, s.cluster.timeout).Error()
+}
+
+// AddNonvoter adds a replica that replicates the log and does not vote.
+func (s *Store) AddNonvoter(id, addr string) error {
+	if s.cluster == nil {
+		return fmt.Errorf("persist: store is not replicating")
+	}
+	return s.cluster.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(addr), 0, s.cluster.timeout).Error()
 }
 
 // RemoveServer drops a voter from the group. id is the Raft server id.

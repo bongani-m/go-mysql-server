@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/dolthub/go-mysql-server/persist"
 )
 
 func main() {
@@ -52,6 +54,8 @@ func main() {
 		execQuery    = flag.String("exec", "", "run one statement, print rows, and exit")
 		phaseFile    = flag.String("phase-file", "", "write this file when the measured run starts")
 		failoverMark = flag.String("failover-mark", "", "file with kill and ready timestamps, in unix milliseconds")
+		shardWrite   = flag.String("shard-write", "", "comma-separated leader host:port, one per shard")
+		shardRead    = flag.String("shard-read", "", "per shard, follower host:ports separated by '|', shards separated by ','")
 	)
 	flag.Parse()
 
@@ -102,11 +106,26 @@ func main() {
 	if len(reads) == 0 {
 		reads = []string{*writeAddr}
 	}
+	shardWrites := splitAddrs(*shardWrite)
+	shardReads, err := parseShardReads(*shardRead, len(shardWrites))
+	if err != nil {
+		fatalf("shard-read: %v", err)
+	}
 	if err := registerCA(*tlsCA); err != nil {
 		fatalf("tls: %v", err)
 	}
 
 	ctx := context.Background()
+	if len(shardWrites) > 1 {
+		runSharded(ctx, shardedRun{
+			label: *label, dbName: *dbName, user: *user, password: *password,
+			tls: *tlsCA != "", ready: *readyWait, writes: shardWrites, reads: shardReads,
+			concurrency: *concurrency, duration: *duration, warmup: *warmup,
+			seedN: *seedN, batch: *batch, readPct: *readPct,
+			jsonPath: *jsonPath, phaseFile: *phaseFile,
+		})
+		return
+	}
 	fmt.Printf("waiting for %s\n", *writeAddr)
 	admin, err := openDB(ctx, *writeAddr, *user, *password, "", 1, *readyWait, *tlsCA != "")
 	if err != nil {
@@ -420,6 +439,231 @@ func insertNotes(ctx context.Context, db *sql.DB, from, to int, now time.Time) e
 	return err
 }
 
+type shardedRun struct {
+	label       string
+	dbName      string
+	user        string
+	password    string
+	tls         bool
+	ready       time.Duration
+	writes      []string
+	reads       [][]string
+	concurrency int
+	duration    time.Duration
+	warmup      time.Duration
+	seedN       int
+	batch       int
+	readPct     int
+	jsonPath    string
+	phaseFile   string
+}
+
+func parseShardReads(raw string, n int) ([][]string, error) {
+	if n == 0 {
+		return nil, nil
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("empty")
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) != n {
+		return nil, fmt.Errorf("got %d shards, want %d", len(parts), n)
+	}
+	out := make([][]string, n)
+	for i, part := range parts {
+		var addrs []string
+		for _, addr := range strings.Split(part, "|") {
+			addr = strings.TrimSpace(addr)
+			if addr != "" {
+				addrs = append(addrs, addr)
+			}
+		}
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("shard %d has no read address", i)
+		}
+		out[i] = addrs
+	}
+	return out, nil
+}
+
+func runSharded(ctx context.Context, r shardedRun) {
+	fmt.Printf("waiting for %s\n", r.writes[0])
+	admin, err := openDB(ctx, r.writes[0], r.user, r.password, "", 1, r.ready, r.tls)
+	if err != nil {
+		fatalf("connect %s: %v", r.writes[0], err)
+	}
+	fmt.Printf("preparing database %s\n", r.dbName)
+	if err := setup(ctx, admin, r.dbName); err != nil {
+		admin.Close()
+		fatalf("schema: %v", err)
+	}
+	if err := placeShards(ctx, admin, r.dbName); err != nil {
+		admin.Close()
+		fatalf("placement: %v", err)
+	}
+	admin.Close()
+
+	writeDBs := make([]*sql.DB, len(r.writes))
+	for i, addr := range r.writes {
+		db, err := openDB(ctx, addr, r.user, r.password, r.dbName, r.concurrency, r.ready, r.tls)
+		if err != nil {
+			fatalf("connect %s: %v", addr, err)
+		}
+		defer db.Close()
+		writeDBs[i] = db
+	}
+	fmt.Printf("seeding %d accounts across %d shards\n", r.seedN, len(r.writes))
+	seedStart := time.Now()
+	if err := seedSharded(ctx, writeDBs, r.seedN, r.batch); err != nil {
+		fatalf("seed: %v", err)
+	}
+	seedTook := time.Since(seedStart)
+	fmt.Printf("seed finished in %s\n", seedTook.Round(time.Millisecond))
+
+	readDBs := make([][]*sql.DB, len(r.reads))
+	var flat []string
+	for s, addrs := range r.reads {
+		readDBs[s] = make([]*sql.DB, len(addrs))
+		for i, addr := range addrs {
+			flat = append(flat, addr)
+			if addr == r.writes[s] {
+				readDBs[s][i] = writeDBs[s]
+				continue
+			}
+			db, err := openDB(ctx, addr, r.user, r.password, r.dbName, r.concurrency, r.ready, r.tls)
+			if err != nil {
+				fatalf("connect read %s: %v", addr, err)
+			}
+			defer db.Close()
+			readDBs[s][i] = db
+		}
+	}
+	for s, dbs := range readDBs {
+		id := shardSample(r.seedN, len(r.writes), s)
+		fmt.Printf("waiting until shard %d reads have account %d\n", s, id)
+		if err := waitForSeed(ctx, dbs, id, r.ready); err != nil {
+			fatalf("replicas: %v", err)
+		}
+	}
+
+	scatter := writeDBs[0]
+	if len(readDBs) > 0 && len(readDBs[0]) > 0 {
+		scatter = readDBs[0][0]
+	}
+	work := &workload{
+		shardW:   writeDBs,
+		shardR:   readDBs,
+		scatter:  scatter,
+		accounts: r.seedN,
+		ops:      buildOps(r.readPct),
+	}
+	if r.warmup > 0 {
+		fmt.Printf("warmup %s with %d clients\n", r.warmup.Round(time.Millisecond), r.concurrency)
+		runPhase(ctx, work, r.concurrency, r.warmup, false)
+	}
+	if r.phaseFile != "" {
+		if err := os.WriteFile(r.phaseFile, []byte("measuring\n"), 0o644); err != nil {
+			fatalf("phase: %v", err)
+		}
+	}
+	fmt.Printf("measuring %s\n", r.duration.Round(time.Millisecond))
+	stats := runPhase(ctx, work, r.concurrency, r.duration, true)
+	rep := stats.report(r.label, strings.Join(r.writes, ","), flat, r.seedN, seedTook, r.concurrency, r.duration, r.readPct)
+	fmt.Print(rep.text())
+	if r.jsonPath != "" {
+		if err := os.WriteFile(r.jsonPath, rep.json(), 0o644); err != nil {
+			fatalf("json: %v", err)
+		}
+	}
+}
+
+func placeShards(ctx context.Context, db *sql.DB, name string) error {
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("SHARD TABLE %s.accounts BY id CHECK email", name)); err != nil {
+		return err
+	}
+	_, err := db.ExecContext(ctx, fmt.Sprintf("SHARD TABLE %s.notes BY account_id", name))
+	return err
+}
+
+func seedSharded(ctx context.Context, dbs []*sql.DB, n, batch int) error {
+	ids := make([][]int, len(dbs))
+	for id := 1; id <= n; id++ {
+		shard := persist.ShardIndex(int64(id), len(dbs))
+		ids[shard] = append(ids[shard], id)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	for shard, list := range ids {
+		if err := insertAccountsSharded(ctx, dbs[shard], list, batch, now); err != nil {
+			return err
+		}
+	}
+	for shard, list := range ids {
+		if err := insertNotesSharded(ctx, dbs[shard], list, batch, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func insertAccountsSharded(ctx context.Context, db *sql.DB, ids []int, batch int, now time.Time) error {
+	for from := 0; from < len(ids); from += batch {
+		to := from + batch
+		if to > len(ids) {
+			to = len(ids)
+		}
+		var b strings.Builder
+		b.WriteString("INSERT INTO accounts (id, email, name, status, created_at) VALUES ")
+		args := make([]any, 0, (to-from)*5)
+		for i, id := range ids[from:to] {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString("(?,?,?,?,?)")
+			args = append(args, id, fmt.Sprintf("user%d@example.com", id), fmt.Sprintf("User %d", id), id%3, now)
+		}
+		if _, err := db.ExecContext(ctx, b.String(), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func insertNotesSharded(ctx context.Context, db *sql.DB, ids []int, batch int, now time.Time) error {
+	for from := 0; from < len(ids); from += batch {
+		to := from + batch
+		if to > len(ids) {
+			to = len(ids)
+		}
+		var b strings.Builder
+		b.WriteString("INSERT INTO notes (account_id, body, created_at) VALUES ")
+		args := make([]any, 0, (to-from)*2*3)
+		first := true
+		for _, id := range ids[from:to] {
+			for _, body := range []string{"hello", "follow-up"} {
+				if !first {
+					b.WriteByte(',')
+				}
+				first = false
+				b.WriteString("(?,?,?)")
+				args = append(args, id, body, now)
+			}
+		}
+		if _, err := db.ExecContext(ctx, b.String(), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func shardSample(n, shards, shard int) int {
+	for id := n; id >= 1; id-- {
+		if persist.ShardIndex(int64(id), shards) == shard {
+			return id
+		}
+	}
+	return 1
+}
+
 func waitForSeed(ctx context.Context, dbs []*sql.DB, n int, wait time.Duration) error {
 	want := fmt.Sprintf("user%d@example.com", n)
 	deadline := time.Now().Add(wait)
@@ -508,12 +752,36 @@ func buildOps(readPct int) []weightedOp {
 type workload struct {
 	writeDB  *sql.DB
 	readDBs  []*sql.DB
+	shardW   []*sql.DB
+	shardR   [][]*sql.DB
+	scatter  *sql.DB
 	accounts int
 	ops      []weightedOp
 }
 
 func (w *workload) readDB(worker int) *sql.DB {
+	if len(w.readDBs) == 0 {
+		if w.scatter != nil {
+			return w.scatter
+		}
+		return w.writeDB
+	}
 	return w.readDBs[worker%len(w.readDBs)]
+}
+
+func (w *workload) readFor(id, worker int) *sql.DB {
+	if len(w.shardR) == 0 {
+		return w.readDB(worker)
+	}
+	dbs := w.shardR[persist.ShardIndex(int64(id), len(w.shardR))]
+	return dbs[worker%len(dbs)]
+}
+
+func (w *workload) writeFor(id int) *sql.DB {
+	if len(w.shardW) == 0 {
+		return w.writeDB
+	}
+	return w.shardW[persist.ShardIndex(int64(id), len(w.shardW))]
 }
 
 func (w *workload) do(ctx context.Context, worker int, kind opKind, rng uint64) error {
@@ -522,17 +790,21 @@ func (w *workload) do(ctx context.Context, worker int, kind opKind, rng uint64) 
 	case opPointRead:
 		var email string
 		var status int
-		err := w.readDB(worker).QueryRowContext(ctx,
+		err := w.readFor(id, worker).QueryRowContext(ctx,
 			"SELECT email, status FROM accounts WHERE id = ?", id).Scan(&email, &status)
 		return err
 	case opEmailRead:
+		db := w.scatter
+		if db == nil {
+			db = w.readDB(worker)
+		}
 		var got int
-		err := w.readDB(worker).QueryRowContext(ctx,
+		err := db.QueryRowContext(ctx,
 			"SELECT id FROM accounts WHERE email = ?",
 			fmt.Sprintf("user%d@example.com", id)).Scan(&got)
 		return err
 	case opNotesRead:
-		rows, err := w.readDB(worker).QueryContext(ctx,
+		rows, err := w.readFor(id, worker).QueryContext(ctx,
 			"SELECT id, body FROM notes WHERE account_id = ? ORDER BY id DESC LIMIT 5", id)
 		if err != nil {
 			return err
@@ -555,16 +827,16 @@ func (w *workload) do(ctx context.Context, worker int, kind opKind, rng uint64) 
 		}
 		return nil
 	case opInsert:
-		_, err := w.writeDB.ExecContext(ctx,
+		_, err := w.writeFor(id).ExecContext(ctx,
 			"INSERT INTO notes (account_id, body, created_at) VALUES (?, ?, ?)",
 			id, "live", time.Now().UTC())
 		return err
 	case opUpdate:
-		_, err := w.writeDB.ExecContext(ctx,
+		_, err := w.writeFor(id).ExecContext(ctx,
 			"UPDATE accounts SET status = ? WHERE id = ?", id%3, id)
 		return err
 	case opTx:
-		tx, err := w.writeDB.BeginTx(ctx, nil)
+		tx, err := w.writeFor(id).BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}

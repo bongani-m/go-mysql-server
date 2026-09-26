@@ -47,7 +47,7 @@ type fwdState struct {
 	leader string
 }
 
-func newForwardHandler(inner *server.Handler, store *persist.Store) mysql.Handler {
+func newForwardHandler(inner *server.Handler, store *persist.Store) *forwardHandler {
 	return &forwardHandler{
 		Handler: inner,
 		store:   store,
@@ -350,6 +350,15 @@ func (h *forwardHandler) dropClient(c *mysql.Conn, st *fwdState) {
 	st.leader = ""
 }
 
+func isReadQuery(query string) bool {
+	stmt, err := sqlparser.Parse(query)
+	if err != nil {
+		return false
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	return ok && !hasLock(sel.Lock) && sel.Into == nil
+}
+
 func classify(query string, pinned bool) forwardAction {
 	stmt, err := sqlparser.Parse(query)
 	if err != nil {
@@ -535,7 +544,16 @@ func (l *leaderExec) Exec(req persist.ForwardRequest) persist.ForwardReply {
 		l.drop(req)
 		return persist.ForwardReply{}
 	}
-	if !l.store.IsLeader() {
+	// Status and plain reads are served from the local copy. A follower has
+	// the log. Writes still require the leader.
+	if cmd, ok := parseAdmin(req.Query); ok && cmd.kind == adminStatus {
+		reply, err := runAdmin(l.store, cmd)
+		if err != nil {
+			return persist.ForwardReply{Err: err.Error()}
+		}
+		return reply
+	}
+	if !l.store.IsLeader() && !isReadQuery(req.Query) {
 		return persist.ForwardReply{Err: "persist: not the leader"}
 	}
 	key := req.Node + "/" + fmt.Sprint(req.Session)
@@ -579,6 +597,12 @@ func (l *leaderExec) run(held *heldSession, req persist.ForwardRequest) persist.
 			return persist.ForwardReply{Err: err.Error()}
 		}
 		return reply
+	}
+	if p, ok := parseShardStmt(req.Query); ok {
+		if err := l.store.SavePlacement(p); err != nil {
+			return persist.ForwardReply{Err: err.Error()}
+		}
+		return persist.ForwardReply{}
 	}
 	qctx := held.ctx
 	if queryTimeout > 0 {

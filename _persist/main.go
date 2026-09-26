@@ -83,9 +83,36 @@ func main() {
 	if path == "" {
 		path = "data/gms"
 	}
+	part, err := loadPartConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
 	gate := &leadershipGate{}
 	var leader *leaderExec
+	var metaExec *leaderExec
+	var meta *persist.Store
+	if part != nil {
+		metaPath := os.Getenv("GMS_META_DATA")
+		if metaPath == "" {
+			metaPath = "data/meta"
+		}
+		meta, err = openMeta(metaPath, func(isLeader bool) {
+			if !isLeader && metaExec != nil {
+				metaExec.dropAll()
+			}
+		})
+		if err != nil {
+			log.Fatalf("open meta %s: %v", metaPath, err)
+		}
+		defer meta.Close()
+	}
 	store, err := openStore(path, func(isLeader bool) {
+		if part != nil {
+			if !isLeader && leader != nil {
+				leader.dropAll()
+			}
+			return
+		}
 		gate.set(isLeader)
 		if !isLeader && leader != nil {
 			leader.dropAll()
@@ -122,12 +149,22 @@ func main() {
 			return err
 		})
 	}
-	gate.bind(engine, store.Replicating(), store.IsLeader())
+	if part == nil {
+		gate.bind(engine, store.Replicating(), store.IsLeader())
+	}
 	if store.Replicating() {
 		leader = newLeaderExec(engine, store)
 		store.SetForwardExec(leader.Exec)
 	}
-	if err := enableAuth(ctx, store, engine, accountFromEnv()); err != nil {
+	authStore := store
+	if meta != nil {
+		metaEngine := sqle.NewDefault(meta)
+		defer func() { _ = metaEngine.Close() }()
+		metaExec = newLeaderExec(metaEngine, meta)
+		meta.SetForwardExec(metaExec.Exec)
+		authStore = meta
+	}
+	if err := enableAuth(ctx, authStore, engine, accountFromEnv()); err != nil {
 		log.Fatalf("auth: %v", err)
 	}
 	if err := enableUpstream(store); err != nil {
@@ -166,6 +203,9 @@ func main() {
 		// Followers forward writes. A standalone process only intercepts
 		// Raft admin statements, and leaves every other statement on the
 		// engine handler.
+		if part != nil {
+			return newPartHandler(newForwardHandler(inner, store), meta, part), nil
+		}
 		if store.Replicating() {
 			return newForwardHandler(inner, store), nil
 		}
@@ -248,6 +288,72 @@ func (g *leadershipGate) bind(engine *sqle.Engine, replicating, leader bool) {
 	}
 }
 
+func openMeta(path string, onLeadership func(bool)) (*persist.Store, error) {
+	peers, err := persist.ParsePeers(os.Getenv("GMS_META_PEERS"))
+	if err != nil {
+		return nil, err
+	}
+	nonvoters, err := persist.ParsePeers(os.Getenv("GMS_META_NONVOTERS"))
+	if err != nil {
+		return nil, err
+	}
+	addr := os.Getenv("GMS_META_ADDR")
+	if addr == "" {
+		return nil, fmt.Errorf("GMS_META_ADDR is empty")
+	}
+	id := os.Getenv("GMS_NODE_ID")
+	if id == "" {
+		id = addr
+	}
+	advertise := os.Getenv("GMS_META_ADVERTISE")
+	if advertise == "" {
+		advertise = addr
+	}
+	raftDir := os.Getenv("GMS_META_DIR")
+	if raftDir == "" {
+		raftDir = "data/meta-raft"
+	}
+	bootstrap := os.Getenv("GMS_META_BOOTSTRAP") == "1" || strings.EqualFold(os.Getenv("GMS_META_BOOTSTRAP"), "true")
+	tlsConfig, err := raftTLSFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	store, err := persist.OpenCluster(path, persist.ClusterOptions{
+		ID:           id,
+		Bind:         addr,
+		Advertise:    advertise,
+		RaftDir:      raftDir,
+		Peers:        peers,
+		Nonvoters:    nonvoters,
+		Bootstrap:    bootstrap,
+		ServerUUID:   os.Getenv("GMS_META_UUID"),
+		OnLeadership: onLeadership,
+		TLS:          tlsConfig,
+		ForwardAddr:  os.Getenv("GMS_META_FORWARD"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if store.Bootstrapped() {
+		if err := store.WaitReady(30 * time.Second); err != nil {
+			store.Close()
+			return nil, err
+		}
+	}
+	if err := store.WaitCaughtUp(30 * time.Second); err != nil {
+		store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func raftTLSFromEnv() (*tls.Config, error) {
+	if os.Getenv("GMS_RAFT_TLS_CERT") == "" && os.Getenv("GMS_RAFT_TLS_KEY") == "" && os.Getenv("GMS_RAFT_TLS_CA") == "" {
+		return nil, nil
+	}
+	return persist.LoadRaftTLS(os.Getenv("GMS_RAFT_TLS_CERT"), os.Getenv("GMS_RAFT_TLS_KEY"), os.Getenv("GMS_RAFT_TLS_CA"))
+}
+
 func openStore(path string, onLeadership func(bool)) (*persist.Store, error) {
 	addr := os.Getenv("GMS_RAFT_ADDR")
 	if addr == "" {
@@ -266,12 +372,9 @@ func openStore(path string, onLeadership func(bool)) (*persist.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	var tlsConfig *tls.Config
-	if os.Getenv("GMS_RAFT_TLS_CERT") != "" || os.Getenv("GMS_RAFT_TLS_KEY") != "" || os.Getenv("GMS_RAFT_TLS_CA") != "" {
-		tlsConfig, err = persist.LoadRaftTLS(os.Getenv("GMS_RAFT_TLS_CERT"), os.Getenv("GMS_RAFT_TLS_KEY"), os.Getenv("GMS_RAFT_TLS_CA"))
-		if err != nil {
-			return nil, err
-		}
+	tlsConfig, err := raftTLSFromEnv()
+	if err != nil {
+		return nil, err
 	}
 	store, err := persist.OpenCluster(path, persist.ClusterOptions{
 		ID:             id,

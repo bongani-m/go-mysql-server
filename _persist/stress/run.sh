@@ -7,6 +7,7 @@
 #   _persist/stress/run.sh cluster
 #   _persist/stress/run.sh mysql
 #   _persist/stress/run.sh tidb
+#   _persist/stress/run.sh partitioned
 #   _persist/stress/run.sh compare
 #   _persist/stress/run.sh failover
 #
@@ -21,7 +22,7 @@
 #
 #   docker compose -f _persist/stress/compose.yaml -p gms-stress down -v
 #
-# Ports: single 3316, cluster 3326 3327 3328, MySQL 3336, TiDB 3346.
+# Ports: single 3316, cluster 3326 3327 3328, MySQL 3336, TiDB 3346, partitioned 3356-3361.
 # The cluster client writes to whichever node is the Raft leader.
 # User root, password stress, database stress.
 # Every target serves TLS. The script creates _persist/stress/certs on first use.
@@ -40,6 +41,10 @@ mkdir -p "$results"
 
 # caching_sha2_password is refused without TLS, so every target uses this cert.
 # The CA also authenticates Raft between the cluster nodes.
+# An existing certificate without the partitioned addresses cannot authenticate Raft.
+if [[ -f "$dir/certs/server.crt" ]] && ! openssl x509 -in "$dir/certs/server.crt" -noout -ext subjectAltName 2>/dev/null | grep -q '10.118.0.2'; then
+	rm -f "$dir/certs/server.crt" "$dir/certs/server.key" "$dir/certs/server.csr"
+fi
 if [[ ! -f "$tls_ca" || ! -f "$dir/certs/server.crt" || ! -f "$dir/certs/server.key" ]]; then
 	mkdir -p "$dir/certs"
 	openssl req -x509 -newkey rsa:2048 -nodes \
@@ -53,7 +58,7 @@ if [[ ! -f "$tls_ca" || ! -f "$dir/certs/server.crt" || ! -f "$dir/certs/server.
 		-keyout "$dir/certs/server.key" \
 		-out "$dir/certs/server.csr" \
 		-subj "/CN=gms-stress" \
-		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:10.117.0.2,IP:10.117.0.3,IP:10.117.0.4" \
+		-addext "subjectAltName=DNS:localhost,DNS:p1,DNS:p2,DNS:p3,DNS:p4,DNS:p5,DNS:p6,IP:127.0.0.1,IP:10.117.0.2,IP:10.117.0.3,IP:10.117.0.4,IP:10.118.0.2,IP:10.118.0.3,IP:10.118.0.4,IP:10.118.0.5,IP:10.118.0.6,IP:10.118.0.7" \
 		-addext "extendedKeyUsage=serverAuth,clientAuth"
 	openssl x509 -req -in "$dir/certs/server.csr" \
 		-CA "$tls_ca" -CAkey "$dir/certs/ca.key" -CAcreateserial \
@@ -70,12 +75,12 @@ fi
 extra=("$@")
 
 usage() {
-	echo "usage: $0 single|cluster|mysql|tidb|compare|failover [-- stress flags]" >&2
+	echo "usage: $0 single|cluster|mysql|tidb|partitioned|compare|failover [-- stress flags]" >&2
 	exit 2
 }
 
 case "$target" in
-single | cluster | mysql | tidb | compare | failover) ;;
+single | cluster | mysql | tidb | partitioned | compare | failover) ;;
 *) usage ;;
 esac
 
@@ -167,6 +172,7 @@ containers_for() {
 	case "$1" in
 	single) echo gms-stress-single-1 ;;
 	cluster | failover) echo gms-stress-n1-1 gms-stress-n2-1 gms-stress-n3-1 ;;
+	partitioned) echo gms-stress-p1-1 gms-stress-p2-1 gms-stress-p3-1 gms-stress-p4-1 gms-stress-p5-1 gms-stress-p6-1 ;;
 	mysql) echo gms-stress-mysql-1 ;;
 	tidb) echo gms-stress-pd-1 gms-stress-tikv1-1 gms-stress-tikv2-1 gms-stress-tikv3-1 gms-stress-tidb-1 ;;
 	*) return 1 ;;
@@ -260,6 +266,17 @@ run_target() {
 	tidb)
 		run_client tidb -write 127.0.0.1:3346 -tls-ca "$tls_ca" -json "$json" | tee -a "$log"
 		;;
+	partitioned)
+		local w0 w1 r0 r1
+		w0=$(shard_leader_port 3356 3357 3358)
+		w1=$(shard_leader_port 3359 3360 3361)
+		r0=$(shard_read_addrs "$w0" 3356 3357 3358)
+		r1=$(shard_read_addrs "$w1" 3359 3360 3361)
+		run_client gms-partitioned \
+			-shard-write "127.0.0.1:$w0,127.0.0.1:$w1" \
+			-shard-read "$r0,$r1" \
+			-tls-ca "$tls_ca" -json "$json" | tee -a "$log"
+		;;
 	esac
 	local client_status=${PIPESTATUS[0]}
 	set -e
@@ -321,10 +338,46 @@ cluster_read_addrs() {
 # raft_row prints one SHOW RAFT STATUS line: role, leader, commit, applied, lag.
 raft_row() {
 	local port=$1
+	local wait=${2:-15s}
 	(
 		cd "$root"
-		go run ./_persist/stress -exec "SHOW RAFT STATUS" -write "127.0.0.1:$port" -password stress -tls-ca "$tls_ca" -ready-wait 15s
+		go run ./_persist/stress -exec "SHOW RAFT STATUS" -write "127.0.0.1:$port" -password stress -tls-ca "$tls_ca" -ready-wait "$wait"
 	)
+}
+
+# shard_leader_port prints the host MySQL port of the leader for one shard.
+# The first argument that answers is enough; every node in the shard shares the group.
+shard_leader_port() {
+	local port row leader_raft leader_port
+	for port in "$@"; do
+		if row=$(raft_row "$port" 60s); then
+			leader_raft=$(printf '%s\n' "$row" | awk -F'\t' 'NR==1 {print $2}')
+			read -r _ leader_port <<<"$(node_for "$leader_raft")"
+			if [[ -n "$leader_port" ]]; then
+				echo "$leader_port"
+				return 0
+			fi
+		fi
+	done
+	echo "could not find a shard leader among $*" >&2
+	return 1
+}
+
+# shard_read_addrs joins the shard ports other than the leader with '|'.
+shard_read_addrs() {
+	local leader_port=$1
+	shift
+	local port addrs=""
+	for port in "$@"; do
+		if [[ "$port" == "$leader_port" ]]; then
+			continue
+		fi
+		if [[ -n "$addrs" ]]; then
+			addrs+="|"
+		fi
+		addrs+="127.0.0.1:$port"
+	done
+	echo "$addrs"
 }
 
 # stress_exec runs one statement against a published port.
@@ -343,6 +396,12 @@ node_for() {
 	10.117.0.2:7001) echo gms-stress-n1-1 3326 ;;
 	10.117.0.3:7001) echo gms-stress-n2-1 3327 ;;
 	10.117.0.4:7001) echo gms-stress-n3-1 3328 ;;
+	10.118.0.2:7101) echo gms-stress-p1-1 3356 ;;
+	10.118.0.3:7101) echo gms-stress-p2-1 3357 ;;
+	10.118.0.4:7101) echo gms-stress-p3-1 3358 ;;
+	10.118.0.5:7101) echo gms-stress-p4-1 3359 ;;
+	10.118.0.6:7101) echo gms-stress-p5-1 3360 ;;
+	10.118.0.7:7101) echo gms-stress-p6-1 3361 ;;
 	*) return 1 ;;
 	esac
 }
@@ -489,7 +548,7 @@ run_failover() {
 if [[ "$target" == compare ]]; then
 	summary=$dir/last-compare.txt
 	: >"$summary"
-	for name in single cluster mysql tidb; do
+	for name in single cluster mysql tidb partitioned; do
 		echo "======== $name ========" | tee -a "$summary"
 		run_target "$name"
 	done

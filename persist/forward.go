@@ -294,6 +294,14 @@ func (s *Store) DialForward() (*ForwardClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s.DialForwardAddr(addr)
+}
+
+// DialForwardAddr opens a forward connection to addr using this store's TLS.
+func (s *Store) DialForwardAddr(addr string) (*ForwardClient, error) {
+	if s.cluster == nil {
+		return nil, fmt.Errorf("persist: store is not replicating")
+	}
 	timeout := forwardDialTimeout
 	if s.ApplyTimeout() < timeout {
 		timeout = s.ApplyTimeout()

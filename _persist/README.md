@@ -115,13 +115,14 @@ _persist/stress/run.sh single
 _persist/stress/run.sh cluster
 _persist/stress/run.sh mysql
 _persist/stress/run.sh tidb
+_persist/stress/run.sh partitioned
 _persist/stress/run.sh compare
 _persist/stress/run.sh failover
 ```
 
 `failover` is not part of `compare`. It runs the cluster for 60 seconds with writes aimed at a follower, kills the leader, waits for a new leader, and starts the killed node again. The report splits errors during that election from errors after the new leader is serving. A row inserted before the kill must be readable on every node afterward.
 
-`compare` runs single, cluster, MySQL, and TiDB one after another so they do not share the CPU. Each run also prints a text report and stores JSON, CPU samples, and disk usage under `_persist/stress/results/`.
+`compare` runs single, cluster, MySQL, TiDB, and the partitioned cluster one after another so they do not share the CPU. Each run also prints a text report and stores JSON, CPU samples, and disk usage under `_persist/stress/results/`.
 
 Flags after `--` go to the client:
 
@@ -146,6 +147,7 @@ The default workload is 8 clients for 20 seconds, 80% reads, after seeding 5000 
 | cluster | `127.0.0.1:3326`, `3327`, `3328`. Writes go to the current leader. |
 | mysql | `127.0.0.1:3336` |
 | tidb | `127.0.0.1:3346` |
+| partitioned | `127.0.0.1:3356`–`3361`. Two shard groups. Writes for an account go to that group's leader. |
 
 The account is `root` / `stress`, database `stress`. Every target requires TLS. The script creates the CA and server certificate on first use.
 
@@ -215,5 +217,17 @@ Set `GMS_METRICS_ADDR` (for example `127.0.0.1:9090`) to serve `GET /healthz`, `
 | `GMS_SHUTDOWN_TIMEOUT` | How long `SIGTERM` waits for sessions before closing the store. Default `15s`. |
 | `GMS_METRICS_ADDR` | Optional `host:port` for `/healthz`, `/readyz`, and `/metrics`. Unset means those routes are not served. |
 | `GMS_SEED_EXAMPLE` | `1` creates `mydb.mytable` and the example rows when they are missing. Default is off. |
+| `GMS_META_ADDR` | Turns partitioned mode on. Raft address of this node's meta group. The `GMS_RAFT_*` variables are the shard this process stores. |
+| `GMS_META_PEERS` | Meta voters, `id=host:port`, comma-separated. |
+| `GMS_META_NONVOTERS` | Meta replicas that copy the catalog and do not vote. |
+| `GMS_META_BOOTSTRAP` | `1` on one meta voter, the first time the group starts. |
+| `GMS_META_DATA` | Badger directory for the catalog. Default `data/meta`. |
+| `GMS_META_DIR` | Raft directory for the catalog. Default `data/meta-raft`. |
+| `GMS_META_FORWARD` | Meta write-forward address. Required when the shard forward port would otherwise collide with it. |
+| `GMS_SHARD_INDEX` | Shard stored by this process, starting at 0. |
+| `GMS_SHARD_COUNT` | Number of shard groups. |
+| `GMS_SHARD_FORWARD` | `index=host:port` for one member of each shard. |
+
+`SHARD TABLE db.table BY column [CHECK column]` records placement in meta. A sharded insert includes the shard column. One statement stays on one shard. A read that does not name the shard column is sent to every shard.
 
 `CHANGE REPLICATION SOURCE TO`, `START REPLICA`, and `STOP REPLICA` configure that upstream job. The primary is the only node that connects. After a failover the new primary continues from the GTID stored with the applied rows. Replication filters are unsupported.
