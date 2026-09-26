@@ -78,6 +78,11 @@ func (h *forwardHandler) ComMultiQuery(ctx context.Context, c *mysql.Conn, query
 }
 
 func (h *forwardHandler) ComStmtExecute(ctx context.Context, c *mysql.Conn, prepare *mysql.PrepareData, callback func(*sqltypes.Result) error) error {
+	// A leader executes the prepared statement it already has. Copying the
+	// binds is only needed when the statement is forwarded.
+	if !h.store.Replicating() || h.store.IsLeader() {
+		return h.execLocal(ctx, c, prepare, callback)
+	}
 	var binds []persist.ForwardBind
 	for name, bind := range prepare.BindVars {
 		binds = append(binds, persist.ForwardBind{
@@ -91,12 +96,29 @@ func (h *forwardHandler) ComStmtExecute(ctx context.Context, c *mysql.Conn, prep
 	})
 }
 
-func (h *forwardHandler) dispatch(ctx context.Context, c *mysql.Conn, query string, binds []persist.ForwardBind, callback mysql.ResultSpoolFn) error {
-	if queryTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, queryTimeout)
-		defer cancel()
+// execLocal runs a prepared statement on this node. A transaction that was
+// forwarded to the previous leader cannot continue here.
+func (h *forwardHandler) execLocal(ctx context.Context, c *mysql.Conn, prepare *mysql.PrepareData, callback func(*sqltypes.Result) error) error {
+	ctx, cancel := withQueryTimeout(ctx)
+	defer cancel()
+	if cmd, ok := parseAdmin(prepare.PrepareStmt); ok {
+		return h.handleAdmin(c, prepare.PrepareStmt, cmd, func(res *sqltypes.Result, _ bool) error {
+			return callback(res)
+		})
 	}
+	if h.store.Replicating() {
+		st := h.state(c)
+		if st.pinned {
+			h.dropState(c)
+			return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: leader changed during transaction")
+		}
+	}
+	return h.Handler.ComStmtExecute(ctx, c, prepare, callback)
+}
+
+func (h *forwardHandler) dispatch(ctx context.Context, c *mysql.Conn, query string, binds []persist.ForwardBind, callback mysql.ResultSpoolFn) error {
+	ctx, cancel := withQueryTimeout(ctx)
+	defer cancel()
 	if cmd, ok := parseAdmin(query); ok {
 		return h.handleAdmin(c, query, cmd, callback)
 	}
@@ -123,7 +145,7 @@ func (h *forwardHandler) dispatch(ctx context.Context, c *mysql.Conn, query stri
 			return err
 		}
 		st.pinned = true
-		return h.spool(reply, callback)
+		return spoolReply(reply, callback)
 	case actEnd:
 		if !st.pinned {
 			return h.local(ctx, c, query, binds, callback)
@@ -135,7 +157,7 @@ func (h *forwardHandler) dispatch(ctx context.Context, c *mysql.Conn, query stri
 		}
 		st.wait = reply.Index
 		h.applyReply(c, reply)
-		return h.spool(reply, callback)
+		return spoolReply(reply, callback)
 	default:
 		hold := st.pinned
 		reply, err := h.forward(c, query, binds, hold, false)
@@ -149,26 +171,19 @@ func (h *forwardHandler) dispatch(ctx context.Context, c *mysql.Conn, query stri
 			st.wait = reply.Index
 		}
 		h.applyReply(c, reply)
-		return h.spool(reply, callback)
+		return spoolReply(reply, callback)
 	}
 }
 
 func (h *forwardHandler) handleAdmin(c *mysql.Conn, query string, cmd adminCmd, callback mysql.ResultSpoolFn) error {
 	if cmd.kind == adminStatus || h.store.IsLeader() || !h.store.Replicating() {
-		if cmd.kind != adminStatus && !h.store.Replicating() {
-			return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: store is not replicating")
-		}
-		reply, err := runAdmin(h.store, cmd)
-		if err != nil {
-			return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "%s", err.Error())
-		}
-		return h.spool(reply, callback)
+		return runAdminLocal(h.store, cmd, callback)
 	}
 	reply, err := h.forward(c, query, nil, false, false)
 	if err != nil {
 		return err
 	}
-	return h.spool(reply, callback)
+	return spoolReply(reply, callback)
 }
 
 func (h *forwardHandler) local(ctx context.Context, c *mysql.Conn, query string, binds []persist.ForwardBind, callback mysql.ResultSpoolFn) error {
@@ -251,7 +266,7 @@ func (h *forwardHandler) leaderAddr() (string, error) {
 	return h.store.LeaderForwardAddr()
 }
 
-func (h *forwardHandler) spool(reply persist.ForwardReply, callback mysql.ResultSpoolFn) error {
+func spoolReply(reply persist.ForwardReply, callback mysql.ResultSpoolFn) error {
 	res := &sqltypes.Result{
 		RowsAffected: reply.RowsAffected,
 		InsertID:     reply.InsertID,

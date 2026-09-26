@@ -22,6 +22,8 @@ func TestParseAdmin(t *testing.T) {
 
 	_, ok = parseAdmin("SELECT 1")
 	require.False(t, ok)
+	_, ok = parseAdmin("SHOW TABLES")
+	require.False(t, ok)
 	_, ok = parseAdmin("RAFT ADD VOTER 'only-one'")
 	require.False(t, ok)
 }
@@ -35,8 +37,8 @@ func TestLoadLimitsDefaults(t *testing.T) {
 	got, err := loadLimits()
 	require.NoError(t, err)
 	require.Equal(t, uint64(151), got.maxConns)
-	require.Equal(t, 30*time.Second, got.read)
-	require.Equal(t, 60*time.Second, got.write)
+	require.Equal(t, time.Duration(0), got.read)
+	require.Equal(t, time.Duration(0), got.write)
 	require.Equal(t, time.Duration(0), got.exec)
 	require.Equal(t, 15*time.Second, got.shutdown)
 }

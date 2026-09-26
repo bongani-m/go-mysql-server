@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/dolthub/vitess/go/mysql"
+	"github.com/dolthub/vitess/go/sqltypes"
 	querypb "github.com/dolthub/vitess/go/vt/proto/query"
 
 	"github.com/dolthub/go-mysql-server/persist"
+	"github.com/dolthub/go-mysql-server/server"
 )
 
 const (
@@ -23,11 +27,15 @@ type adminCmd struct {
 }
 
 // parseAdmin recognizes SHOW RAFT STATUS, RAFT ADD VOTER, and RAFT REMOVE SERVER.
-// The SQL parser does not know these statements.
+// The SQL parser does not know these statements. Other statements return
+// before the tokenizer runs.
 func parseAdmin(query string) (adminCmd, bool) {
 	q := strings.TrimSpace(query)
 	if strings.HasSuffix(q, ";") {
 		q = strings.TrimSpace(strings.TrimSuffix(q, ";"))
+	}
+	if !adminPrefix(q) {
+		return adminCmd{}, false
 	}
 	if strings.EqualFold(q, "SHOW RAFT STATUS") {
 		return adminCmd{kind: adminStatus}, true
@@ -49,6 +57,29 @@ func parseAdmin(query string) (adminCmd, bool) {
 		return adminCmd{kind: adminRemove, id: fields[3]}, true
 	}
 	return adminCmd{}, false
+}
+
+// adminPrefix reports whether q can be a Raft admin statement.
+func adminPrefix(q string) bool {
+	if hasWordPrefix(q, "RAFT") {
+		return true
+	}
+	return hasWordPrefix(q, "SHOW RAFT")
+}
+
+func hasWordPrefix(q, prefix string) bool {
+	if len(q) < len(prefix) || !strings.EqualFold(q[:len(prefix)], prefix) {
+		return false
+	}
+	if len(q) == len(prefix) {
+		return true
+	}
+	switch q[len(prefix)] {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
 }
 
 func splitAdmin(q string) ([]string, error) {
@@ -85,6 +116,62 @@ func splitAdmin(q string) ([]string, error) {
 		out = append(out, b.String())
 	}
 	return out, nil
+}
+
+// adminHandler serves Raft admin statements on a standalone process.
+// Ordinary statements go to the engine. A replicating node uses forwardHandler.
+type adminHandler struct {
+	*server.Handler
+	store *persist.Store
+}
+
+func newAdminHandler(inner *server.Handler, store *persist.Store) mysql.Handler {
+	return &adminHandler{Handler: inner, store: store}
+}
+
+func (h *adminHandler) ComQuery(ctx context.Context, c *mysql.Conn, query string, callback mysql.ResultSpoolFn) error {
+	ctx, cancel := withQueryTimeout(ctx)
+	defer cancel()
+	if cmd, ok := parseAdmin(query); ok {
+		return runAdminLocal(h.store, cmd, callback)
+	}
+	return h.Handler.ComQuery(ctx, c, query, callback)
+}
+
+func (h *adminHandler) ComMultiQuery(ctx context.Context, c *mysql.Conn, query string, callback mysql.ResultSpoolFn) (string, error) {
+	ctx, cancel := withQueryTimeout(ctx)
+	defer cancel()
+	first, rest := splitFirst(query)
+	if cmd, ok := parseAdmin(first); ok {
+		if err := runAdminLocal(h.store, cmd, callback); err != nil {
+			return "", err
+		}
+		return rest, nil
+	}
+	return h.Handler.ComMultiQuery(ctx, c, query, callback)
+}
+
+func (h *adminHandler) ComStmtExecute(ctx context.Context, c *mysql.Conn, prepare *mysql.PrepareData, callback func(*sqltypes.Result) error) error {
+	ctx, cancel := withQueryTimeout(ctx)
+	defer cancel()
+	if cmd, ok := parseAdmin(prepare.PrepareStmt); ok {
+		return runAdminLocal(h.store, cmd, func(res *sqltypes.Result, _ bool) error {
+			return callback(res)
+		})
+	}
+	return h.Handler.ComStmtExecute(ctx, c, prepare, callback)
+}
+
+// runAdminLocal runs a Raft admin statement on this process.
+func runAdminLocal(store *persist.Store, cmd adminCmd, callback mysql.ResultSpoolFn) error {
+	if cmd.kind != adminStatus && !store.Replicating() {
+		return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: store is not replicating")
+	}
+	reply, err := runAdmin(store, cmd)
+	if err != nil {
+		return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "%s", err.Error())
+	}
+	return spoolReply(reply, callback)
 }
 
 func runAdmin(store *persist.Store, cmd adminCmd) (persist.ForwardReply, error) {

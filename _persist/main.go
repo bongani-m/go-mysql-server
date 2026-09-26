@@ -163,7 +163,13 @@ func main() {
 		if !ok {
 			return nil, fmt.Errorf("persist: unexpected mysql handler %T", h)
 		}
-		return newForwardHandler(inner, store), nil
+		// Followers forward writes. A standalone process only intercepts
+		// Raft admin statements, and leaves every other statement on the
+		// engine handler.
+		if store.Replicating() {
+			return newForwardHandler(inner, store), nil
+		}
+		return newAdminHandler(inner, store), nil
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -191,6 +197,13 @@ func main() {
 
 // queryTimeout is the per-statement deadline. Zero means no deadline.
 var queryTimeout time.Duration
+
+func withQueryTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if queryTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, queryTimeout)
+}
 
 // waitSessions blocks until the process list is empty or the timeout passes.
 func waitSessions(engine *sqle.Engine, timeout time.Duration) {

@@ -209,8 +209,8 @@ Set `GMS_METRICS_ADDR` (for example `127.0.0.1:9090`) to serve `GET /healthz`, `
 | `GMS_TLS_CERT` | PEM certificate for the MySQL listener. Set together with `GMS_TLS_KEY` to require TLS. |
 | `GMS_TLS_KEY` | PEM private key for the MySQL listener. |
 | `GMS_MAX_CONNECTIONS` | Listener connection cap. Default `151`. |
-| `GMS_NET_READ_TIMEOUT` | Connection read timeout. Default `30s`. A bare number is seconds. |
-| `GMS_NET_WRITE_TIMEOUT` | Connection write timeout. Default `60s`. A bare number is seconds. |
+| `GMS_NET_READ_TIMEOUT` | Connection read timeout. Unset means no socket deadline. A bare number is seconds. |
+| `GMS_NET_WRITE_TIMEOUT` | Connection write timeout. Unset means no socket deadline. A bare number is seconds. |
 | `GMS_MAX_EXECUTION_TIME` | Per-statement deadline in milliseconds. Default `0`, which sets no deadline. |
 | `GMS_SHUTDOWN_TIMEOUT` | How long `SIGTERM` waits for sessions before closing the store. Default `15s`. |
 | `GMS_METRICS_ADDR` | Optional `host:port` for `/healthz`, `/readyz`, and `/metrics`. Unset means those routes are not served. |

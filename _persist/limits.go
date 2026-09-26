@@ -24,11 +24,13 @@ func loadLimits() (serverLimits, error) {
 	if err != nil {
 		return serverLimits{}, err
 	}
-	read, err := parseSecondsEnv("GMS_NET_READ_TIMEOUT", 30*time.Second)
+	// Unset means no socket deadline. A deadline re-armed on every read and
+	// write costs a syscall per packet.
+	read, err := parseOptionalSecondsEnv("GMS_NET_READ_TIMEOUT")
 	if err != nil {
 		return serverLimits{}, err
 	}
-	write, err := parseSecondsEnv("GMS_NET_WRITE_TIMEOUT", 60*time.Second)
+	write, err := parseOptionalSecondsEnv("GMS_NET_WRITE_TIMEOUT")
 	if err != nil {
 		return serverLimits{}, err
 	}
@@ -59,6 +61,16 @@ func parseUintEnv(key string, fallback, min, max uint64) (uint64, error) {
 		return 0, fmt.Errorf("%s: %q", key, raw)
 	}
 	return n, nil
+}
+
+// parseOptionalSecondsEnv is parseSecondsEnv with no default. Empty and 0
+// both mean the timeout is off.
+func parseOptionalSecondsEnv(key string) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" || raw == "0" {
+		return 0, nil
+	}
+	return parseSecondsEnv(key, 0)
 }
 
 // parseSecondsEnv accepts a bare number of seconds or a Go duration.
