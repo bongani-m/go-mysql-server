@@ -1,5 +1,8 @@
 # Three-node Raft cluster for the persistent MySQL server.
 #
+# Create _persist/certs before the first up (see README.md). Without ca.crt
+# each node exits with: open /certs/ca.crt: no such file or directory
+#
 #	docker compose -f _persist/compose.yaml up --build
 #
 # Same address plan as droplets/README.md. Each node binds Raft and MySQL to

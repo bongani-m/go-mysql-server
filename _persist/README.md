@@ -41,7 +41,7 @@ docker run --rm -p 3306:3306 -v gms-data:/data \
 
 ## Local testing
 
-Create a test certificate before the first `up`. It is not committed. The names are the ones clients dial: `127.0.0.1` from the host, the node names, and the private addresses Compose assigns.
+Create the test CA and server certificate before the first `up`. They are not committed. Compose mounts `_persist/certs` at `/certs`, and Raft reads `ca.crt`, `server.crt`, and `server.key` from there. Without `ca.crt` each node logs `open /certs/ca.crt: no such file or directory` and exits, and Compose restarts it. The server certificate is signed by that CA, carries `serverAuth` and `clientAuth`, and names the addresses clients dial: `127.0.0.1` from the host, the node names, and the private addresses Compose assigns. A stack that is already restarting picks the files up after `docker compose -f _persist/compose.yaml restart`.
 
 ```bash
 mkdir -p _persist/certs
