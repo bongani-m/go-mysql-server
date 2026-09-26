@@ -854,7 +854,28 @@ func (e *editor) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
 
 func (e *editor) PreciseMatch() bool { return true }
 
+// autoIncrementStep is how many ids one durable counter update reserves.
+// The rest are handed out from memory. A crash or a new leader continues
+// from the stored high-water mark, so unused ids in the span are skipped.
+const autoIncrementStep = 1000
+
+// autoRange is a span of auto-increment ids reserved by one durable commit.
+// next is the next id to hand out. end is the stored high-water mark.
+type autoRange struct {
+	next uint64
+	end  uint64
+}
+
 func (s *Store) autoIncrement(t *Table) (uint64, error) {
+	s.autoMu.Lock()
+	defer s.autoMu.Unlock()
+	if next, _, ok := s.openAutoRange(t.ref()); ok {
+		return next, nil
+	}
+	return s.storedAutoIncrement(t)
+}
+
+func (s *Store) storedAutoIncrement(t *Table) (uint64, error) {
 	current := uint64(1)
 	err := s.view(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
@@ -871,6 +892,92 @@ func (s *Store) autoIncrement(t *Table) (uint64, error) {
 }
 
 func (s *Store) setAutoIncrement(t *Table, val uint64) error {
+	s.autoMu.Lock()
+	defer s.autoMu.Unlock()
+	if err := s.writeAutoIncrement(t, val); err != nil {
+		return err
+	}
+	s.deleteAutoRange(t.ref())
+	return nil
+}
+
+// allocAutoIncrement claims the next id. The mutex is held across a refill
+// commit so two sessions cannot reserve the same span. A span is installed
+// only when leadership has not changed since the commit started.
+func (s *Store) allocAutoIncrement(ctx *sql.Context, t *Table) (uint64, error) {
+	s.autoMu.Lock()
+	defer s.autoMu.Unlock()
+	ref := t.ref()
+	if r, ok := s.autoRanges[ref]; ok && r.next < r.end {
+		issued := r.next
+		r.next++
+		if r.next < r.end {
+			s.autoRanges[ref] = r
+		} else {
+			delete(s.autoRanges, ref)
+		}
+		return issued, nil
+	}
+	epoch := s.autoEpoch
+	col := autoIncrementColumn(t.meta.schema)
+	var issued, end uint64
+	err := s.update(func(tx *kvTx) error {
+		bucket, current, err := autoIncrementIn(tx, t)
+		if err != nil {
+			return err
+		}
+		issued = current
+		end = advanceAutoIncrement(ctx, col, current, autoIncrementStep)
+		if end == current {
+			return nil
+		}
+		return putAutoIncrement(bucket, end)
+	})
+	if err != nil {
+		return 0, err
+	}
+	if end > issued && s.autoEpoch == epoch {
+		next := issued
+		bumpAutoIncrement(ctx, col, &next)
+		if next < end {
+			s.setAutoRange(ref, autoRange{next: next, end: end})
+		}
+	}
+	return issued, nil
+}
+
+// raiseAutoIncrement stores explicit when it is greater than the counter.
+// The stored value is the explicit value itself. Insert then steps past it.
+// An explicit id inside an open span only moves the in-memory cursor.
+func (s *Store) raiseAutoIncrement(t *Table, explicit uint64) (uint64, error) {
+	s.autoMu.Lock()
+	defer s.autoMu.Unlock()
+	ref := t.ref()
+	if next, end, ok := s.openAutoRange(ref); ok {
+		if explicit <= next {
+			return next, nil
+		}
+		if explicit < end {
+			s.setAutoRange(ref, autoRange{next: explicit, end: end})
+			return explicit, nil
+		}
+	} else {
+		current, err := s.storedAutoIncrement(t)
+		if err != nil {
+			return 0, err
+		}
+		if explicit <= current {
+			return current, nil
+		}
+	}
+	if err := s.writeAutoIncrement(t, explicit); err != nil {
+		return 0, err
+	}
+	s.deleteAutoRange(ref)
+	return explicit, nil
+}
+
+func (s *Store) writeAutoIncrement(t *Table, val uint64) error {
 	return s.update(func(tx *kvTx) error {
 		bucket := tableBucket(tx, t.dbName, t.name)
 		if bucket == nil {
@@ -878,44 +985,6 @@ func (s *Store) setAutoIncrement(t *Table, val uint64) error {
 		}
 		return putAutoIncrement(bucket, val)
 	})
-}
-
-// allocAutoIncrement claims the current counter and stores the next value.
-func (s *Store) allocAutoIncrement(ctx *sql.Context, t *Table) (uint64, error) {
-	var issued uint64
-	err := s.update(func(tx *kvTx) error {
-		bucket, current, err := autoIncrementIn(tx, t)
-		if err != nil {
-			return err
-		}
-		issued = current
-		next := current
-		bumpAutoIncrement(ctx, autoIncrementColumn(t.meta.schema), &next)
-		if next == current {
-			return nil
-		}
-		return putAutoIncrement(bucket, next)
-	})
-	return issued, err
-}
-
-// raiseAutoIncrement stores explicit when it is greater than the counter.
-// The stored value is the explicit value itself. Insert then steps past it.
-func (s *Store) raiseAutoIncrement(t *Table, explicit uint64) (uint64, error) {
-	var issued uint64
-	err := s.update(func(tx *kvTx) error {
-		bucket, current, err := autoIncrementIn(tx, t)
-		if err != nil {
-			return err
-		}
-		issued = current
-		if explicit <= current {
-			return nil
-		}
-		issued = explicit
-		return putAutoIncrement(bucket, explicit)
-	})
-	return issued, err
 }
 
 func autoIncrementIn(tx *kvTx, t *Table) (*kvBucket, uint64, error) {
@@ -962,7 +1031,35 @@ func (e *editor) noteAutoIncrement(ctx *sql.Context, row sql.Row) error {
 
 // observeAutoIncrement steps the counter past value when value has reached it.
 // A generated value already claimed by allocAutoIncrement is left alone.
+// A step that stays inside an open span is memory only.
 func (s *Store) observeAutoIncrement(ctx *sql.Context, t *Table, value uint64) error {
+	s.autoMu.Lock()
+	defer s.autoMu.Unlock()
+	ref := t.ref()
+	col := autoIncrementColumn(t.meta.schema)
+	if next, end, ok := s.openAutoRange(ref); ok {
+		if value < next {
+			return nil
+		}
+		current := next
+		if value > current {
+			current = value
+		}
+		bumpAutoIncrement(ctx, col, &current)
+		if current <= end {
+			if current < end {
+				s.setAutoRange(ref, autoRange{next: current, end: end})
+			} else {
+				s.deleteAutoRange(ref)
+			}
+			return nil
+		}
+		if err := s.writeAutoIncrement(t, current); err != nil {
+			return err
+		}
+		s.deleteAutoRange(ref)
+		return nil
+	}
 	return s.update(func(tx *kvTx) error {
 		bucket, current, err := autoIncrementIn(tx, t)
 		if err != nil {
@@ -974,9 +1071,67 @@ func (s *Store) observeAutoIncrement(ctx *sql.Context, t *Table, value uint64) e
 		if value > current {
 			current = value
 		}
-		bumpAutoIncrement(ctx, autoIncrementColumn(t.meta.schema), &current)
+		bumpAutoIncrement(ctx, col, &current)
 		return putAutoIncrement(bucket, current)
 	})
+}
+
+// clearAutoRanges drops every span and bumps the epoch so a refill that
+// committed across the change cannot install the old span.
+func (s *Store) clearAutoRanges() {
+	s.autoMu.Lock()
+	s.autoEpoch++
+	s.autoRanges = nil
+	s.autoMu.Unlock()
+}
+
+func (s *Store) forgetAutoIncrement(ref tableRef) {
+	s.autoMu.Lock()
+	delete(s.autoRanges, ref)
+	s.autoMu.Unlock()
+}
+
+func (s *Store) forgetAutoDatabase(db string) {
+	db = strings.ToLower(db)
+	s.autoMu.Lock()
+	for ref := range s.autoRanges {
+		if ref.db == db {
+			delete(s.autoRanges, ref)
+		}
+	}
+	s.autoMu.Unlock()
+}
+
+func (s *Store) openAutoRange(ref tableRef) (next, end uint64, ok bool) {
+	r, found := s.autoRanges[ref]
+	if !found || r.next >= r.end {
+		return 0, 0, false
+	}
+	return r.next, r.end, true
+}
+
+func (s *Store) setAutoRange(ref tableRef, r autoRange) {
+	if s.autoRanges == nil {
+		s.autoRanges = make(map[tableRef]autoRange)
+	}
+	s.autoRanges[ref] = r
+}
+
+func (s *Store) deleteAutoRange(ref tableRef) {
+	delete(s.autoRanges, ref)
+}
+
+func advanceAutoIncrement(ctx *sql.Context, col *sql.Column, current uint64, steps int) uint64 {
+	end := current
+	for i := 0; i < steps; i++ {
+		next := end
+		bumpAutoIncrement(ctx, col, &next)
+		if next == end {
+			break
+		}
+		end = next
+	}
+	return end
 }
 
 func bumpAutoIncrement(ctx *sql.Context, col *sql.Column, value *uint64) {

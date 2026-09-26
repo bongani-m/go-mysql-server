@@ -86,6 +86,125 @@ func TestConcurrentAutoIncrement(t *testing.T) {
 	require.Len(t, seen, n)
 }
 
+func TestAutoIncrementRange(t *testing.T) {
+	store, base, table := openPeopleTable(t)
+	ctx := sql.NewContext(context.Background())
+
+	id, err := table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), id)
+	require.Equal(t, uint64(1+autoIncrementStep), storedAutoInc(t, store, table))
+
+	for want := uint64(2); want <= 5; want++ {
+		id, err = table.GetNextAutoIncrementValue(ctx, nil)
+		require.NoError(t, err)
+		require.Equal(t, want, id)
+	}
+	require.Equal(t, uint64(1+autoIncrementStep), storedAutoInc(t, store, table))
+
+	for want := uint64(6); want <= autoIncrementStep; want++ {
+		id, err = table.GetNextAutoIncrementValue(ctx, nil)
+		require.NoError(t, err)
+		require.Equal(t, want, id)
+	}
+	require.Equal(t, uint64(1+autoIncrementStep), storedAutoInc(t, store, table))
+
+	id, err = table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(autoIncrementStep+1), id)
+	require.Equal(t, uint64(1+2*autoIncrementStep), storedAutoInc(t, store, table))
+
+	peek, err := table.PeekNextAutoIncrementValue(base)
+	require.NoError(t, err)
+	require.Equal(t, uint64(autoIncrementStep+2), peek)
+}
+
+func TestAutoIncrementExplicitInsideRange(t *testing.T) {
+	store, _, table := openPeopleTable(t)
+	ctx := sql.NewContext(context.Background())
+
+	_, err := table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	_, err = table.GetNextAutoIncrementValue(ctx, int64(50))
+	require.NoError(t, err)
+	require.NoError(t, store.observeAutoIncrement(ctx, table, 50))
+
+	id, err := table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(51), id)
+	require.Equal(t, uint64(1+autoIncrementStep), storedAutoInc(t, store, table))
+	id, err = table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(52), id)
+}
+
+func TestAutoIncrementExplicitPastRange(t *testing.T) {
+	store, _, table := openPeopleTable(t)
+	ctx := sql.NewContext(context.Background())
+
+	_, err := table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	_, err = table.GetNextAutoIncrementValue(ctx, int64(5000))
+	require.NoError(t, err)
+	require.NoError(t, store.observeAutoIncrement(ctx, table, 5000))
+
+	id, err := table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5001), id)
+}
+
+func TestAutoIncrementLeadershipDropsRange(t *testing.T) {
+	store, _, table := openPeopleTable(t)
+	ctx := sql.NewContext(context.Background())
+
+	_, err := table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1+autoIncrementStep), storedAutoInc(t, store, table))
+
+	store.onLeadership(false)
+	store.onLeadership(true)
+
+	id, err := table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1+autoIncrementStep), id)
+}
+
+func TestAutoIncrementRecreateStartsOver(t *testing.T) {
+	store, base, table := openPeopleTable(t)
+	ctx := sql.NewContext(context.Background())
+	db, err := store.Database(base, "mydb")
+	require.NoError(t, err)
+
+	_, err = table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+
+	pk := table.PrimaryKeySchema(base)
+	collation := table.Collation()
+	require.NoError(t, db.(sql.TableDropper).DropTable(base, "mytable"))
+	require.NoError(t, db.(sql.TableCreator).CreateTable(base, "mytable", pk, collation, ""))
+	table = mustTable(t, base, db)
+
+	id, err := table.GetNextAutoIncrementValue(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), id)
+}
+
+func openPeopleTable(t *testing.T) (*Store, *sql.Context, *Table) {
+	t.Helper()
+	store := openAt(t, filepath.Join(t.TempDir(), "gms.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	base := sql.NewContext(context.Background())
+	db := createPeopleTable(t, base, store)
+	return store, base, mustTable(t, base, db)
+}
+
+func storedAutoInc(t *testing.T, store *Store, table *Table) uint64 {
+	t.Helper()
+	stored, err := store.storedAutoIncrement(table)
+	require.NoError(t, err)
+	return stored
+}
+
 func TestSavepoints(t *testing.T) {
 	store := openAt(t, filepath.Join(t.TempDir(), "gms.db"))
 	t.Cleanup(func() { _ = store.Close() })

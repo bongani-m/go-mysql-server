@@ -72,6 +72,11 @@ type Store struct {
 	// fsmApplied is the newest Raft index the FSM has finished. It lags
 	// Raft's AppliedIndex, which moves when a batch is queued.
 	fsmApplied uint64
+	// autoMu guards autoRanges and autoEpoch. A refill holds it across the
+	// commit so two sessions cannot reserve the same span.
+	autoMu     sync.Mutex
+	autoRanges map[tableRef]autoRange
+	autoEpoch  uint64
 }
 
 var _ sql.DatabaseProvider = (*Store)(nil)
@@ -262,13 +267,18 @@ func (s *Store) CreateDatabase(ctx *sql.Context, name string) error {
 
 // DropDatabase implements sql.MutableDatabaseProvider.
 func (s *Store) DropDatabase(ctx *sql.Context, name string) error {
-	return s.updateQuery(ctx, func(tx *kvTx) error {
+	err := s.updateQuery(ctx, func(tx *kvTx) error {
 		root := tx.Bucket(bucketDatabases)
 		if root == nil || root.Bucket(bucketKey(name)) == nil {
 			return sql.ErrDatabaseNotFound.New(name)
 		}
 		return root.DeleteBucket(bucketKey(name))
 	})
+	if err != nil {
+		return err
+	}
+	s.forgetAutoDatabase(name)
+	return nil
 }
 
 func (s *Store) loadDatabase(name string) (*Database, bool, error) {
@@ -427,6 +437,7 @@ func (d *Database) RenameTable(ctx *sql.Context, oldName, newName string) error 
 	if err != nil {
 		return err
 	}
+	d.store.forgetAutoIncrement(tableRef{db: strings.ToLower(d.name), name: strings.ToLower(oldName)})
 	if sess, ok := sessionFrom(ctx); ok {
 		sess.rename(tableRef{db: strings.ToLower(d.name), name: strings.ToLower(oldName)}, tableRef{db: strings.ToLower(d.name), name: strings.ToLower(newName)})
 	}
@@ -458,7 +469,7 @@ func copyBucket(src, dst *kvBucket) error {
 
 // DropTable implements sql.TableDropper.
 func (d *Database) DropTable(ctx *sql.Context, name string) error {
-	return d.store.updateQuery(ctx, func(tx *kvTx) error {
+	err := d.store.updateQuery(ctx, func(tx *kvTx) error {
 		tables := tablesBucket(tx, d.name)
 		if tables == nil {
 			return sql.ErrDatabaseNotFound.New(d.name)
@@ -468,6 +479,11 @@ func (d *Database) DropTable(ctx *sql.Context, name string) error {
 		}
 		return tables.DeleteBucket(bucketKey(name))
 	})
+	if err != nil {
+		return err
+	}
+	d.store.forgetAutoIncrement(tableRef{db: strings.ToLower(d.name), name: strings.ToLower(name)})
+	return nil
 }
 
 func (s *Store) loadTable(dbName, tableName string) (tableMeta, string, bool, error) {

@@ -105,6 +105,7 @@ func (s *Store) replica() *replicaState {
 }
 
 func (s *Store) onLeadership(isLeader bool) {
+	s.clearAutoRanges()
 	if !isLeader {
 		s.haltReplica(false)
 		return
