@@ -56,6 +56,7 @@ func main() {
 		failoverMark = flag.String("failover-mark", "", "file with kill and ready timestamps, in unix milliseconds")
 		shardWrite   = flag.String("shard-write", "", "comma-separated leader host:port, one per shard")
 		shardRead    = flag.String("shard-read", "", "per shard, follower host:ports separated by '|', shards separated by ','")
+		rangeMode    = flag.Bool("range", false, "place the two shard groups as key ranges split at half the seed ids")
 	)
 	flag.Parse()
 
@@ -117,12 +118,22 @@ func main() {
 
 	ctx := context.Background()
 	if len(shardWrites) > 1 {
+		split := 0
+		if *rangeMode {
+			if len(shardWrites) != 2 {
+				fatalf("-range needs two -shard-write addresses")
+			}
+			if *seedN < 2 {
+				fatalf("-range needs -seed of at least 2")
+			}
+			split = *seedN/2 + 1
+		}
 		runSharded(ctx, shardedRun{
 			label: *label, dbName: *dbName, user: *user, password: *password,
 			tls: *tlsCA != "", ready: *readyWait, writes: shardWrites, reads: shardReads,
 			concurrency: *concurrency, duration: *duration, warmup: *warmup,
 			seedN: *seedN, batch: *batch, readPct: *readPct,
-			jsonPath: *jsonPath, phaseFile: *phaseFile,
+			jsonPath: *jsonPath, phaseFile: *phaseFile, rangeSplit: split,
 		})
 		return
 	}
@@ -456,6 +467,7 @@ type shardedRun struct {
 	readPct     int
 	jsonPath    string
 	phaseFile   string
+	rangeSplit  int
 }
 
 func parseShardReads(raw string, n int) ([][]string, error) {
@@ -497,9 +509,15 @@ func runSharded(ctx context.Context, r shardedRun) {
 		admin.Close()
 		fatalf("schema: %v", err)
 	}
-	if err := placeShards(ctx, admin, r.dbName); err != nil {
+	var errPlace error
+	if r.rangeSplit > 0 {
+		errPlace = placeRanges(ctx, admin, r.dbName, r.rangeSplit)
+	} else {
+		errPlace = placeShards(ctx, admin, r.dbName)
+	}
+	if errPlace != nil {
 		admin.Close()
-		fatalf("placement: %v", err)
+		fatalf("placement: %v", errPlace)
 	}
 	admin.Close()
 
@@ -514,7 +532,7 @@ func runSharded(ctx context.Context, r shardedRun) {
 	}
 	fmt.Printf("seeding %d accounts across %d shards\n", r.seedN, len(r.writes))
 	seedStart := time.Now()
-	if err := seedSharded(ctx, writeDBs, r.seedN, r.batch); err != nil {
+	if err := seedSharded(ctx, writeDBs, r.seedN, r.batch, r.rangeSplit); err != nil {
 		fatalf("seed: %v", err)
 	}
 	seedTook := time.Since(seedStart)
@@ -539,7 +557,7 @@ func runSharded(ctx context.Context, r shardedRun) {
 		}
 	}
 	for s, dbs := range readDBs {
-		id := shardSample(r.seedN, len(r.writes), s)
+		id := shardSample(r.seedN, len(r.writes), s, r.rangeSplit)
 		fmt.Printf("waiting until shard %d reads have account %d\n", s, id)
 		if err := waitForSeed(ctx, dbs, id, r.ready); err != nil {
 			fatalf("replicas: %v", err)
@@ -551,11 +569,12 @@ func runSharded(ctx context.Context, r shardedRun) {
 		scatter = readDBs[0][0]
 	}
 	work := &workload{
-		shardW:   writeDBs,
-		shardR:   readDBs,
-		scatter:  scatter,
-		accounts: r.seedN,
-		ops:      buildOps(r.readPct),
+		shardW:     writeDBs,
+		shardR:     readDBs,
+		scatter:    scatter,
+		accounts:   r.seedN,
+		ops:        buildOps(r.readPct),
+		rangeSplit: r.rangeSplit,
 	}
 	if r.warmup > 0 {
 		fmt.Printf("warmup %s with %d clients\n", r.warmup.Round(time.Millisecond), r.concurrency)
@@ -577,6 +596,31 @@ func runSharded(ctx context.Context, r shardedRun) {
 	}
 }
 
+// The ranged stress cluster is two Raft groups on 10.119.0.0/24. Group ids
+// are the servers' GMS_SERVER_UUID values. ids below split stay on the first
+// group; split itself is the first id of the second group.
+const (
+	rangeLeftGroup  = "33333333-3333-3333-3333-333333333331"
+	rangeRightGroup = "44444444-4444-4444-4444-444444444441"
+)
+
+func placeRanges(ctx context.Context, db *sql.DB, name string, split int) error {
+	left := fmt.Sprintf("GROUP %s PEER r1 10.119.0.2:7101 10.119.0.2:7102 PEER r2 10.119.0.3:7101 10.119.0.3:7102 PEER r3 10.119.0.4:7101 10.119.0.4:7102", rangeLeftGroup)
+	right := fmt.Sprintf("GROUP %s PEER r4 10.119.0.5:7101 10.119.0.5:7102 PEER r5 10.119.0.6:7101 10.119.0.6:7102 PEER r6 10.119.0.7:7101 10.119.0.7:7102", rangeRightGroup)
+	statements := []string{
+		fmt.Sprintf("SHARD TABLE %s.accounts BY id CHECK email RANGE END %d %s", name, split, left),
+		fmt.Sprintf("SHARD TABLE %s.accounts BY id CHECK email RANGE START %d %s", name, split, right),
+		fmt.Sprintf("SHARD TABLE %s.notes BY account_id RANGE END %d %s", name, split, left),
+		fmt.Sprintf("SHARD TABLE %s.notes BY account_id RANGE START %d %s", name, split, right),
+	}
+	for _, q := range statements {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func placeShards(ctx context.Context, db *sql.DB, name string) error {
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("SHARD TABLE %s.accounts BY id CHECK email", name)); err != nil {
 		return err
@@ -585,10 +629,10 @@ func placeShards(ctx context.Context, db *sql.DB, name string) error {
 	return err
 }
 
-func seedSharded(ctx context.Context, dbs []*sql.DB, n, batch int) error {
+func seedSharded(ctx context.Context, dbs []*sql.DB, n, batch, split int) error {
 	ids := make([][]int, len(dbs))
 	for id := 1; id <= n; id++ {
-		shard := persist.ShardIndex(int64(id), len(dbs))
+		shard := shardOf(id, len(dbs), split)
 		ids[shard] = append(ids[shard], id)
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
@@ -667,9 +711,22 @@ func insertNotesSharded(ctx context.Context, db *sql.DB, ids []int, batch int, n
 	return nil
 }
 
-func shardSample(n, shards, shard int) int {
+func shardOf(id, n, split int) int {
+	if split > 0 {
+		if id < split {
+			return 0
+		}
+		if n <= 1 {
+			return 0
+		}
+		return 1
+	}
+	return persist.ShardIndex(int64(id), n)
+}
+
+func shardSample(n, shards, shard, split int) int {
 	for id := n; id >= 1; id-- {
-		if persist.ShardIndex(int64(id), shards) == shard {
+		if shardOf(id, shards, split) == shard {
 			return id
 		}
 	}
@@ -762,13 +819,14 @@ func buildOps(readPct int) []weightedOp {
 }
 
 type workload struct {
-	writeDB  *sql.DB
-	readDBs  []*sql.DB
-	shardW   []*sql.DB
-	shardR   [][]*sql.DB
-	scatter  *sql.DB
-	accounts int
-	ops      []weightedOp
+	writeDB    *sql.DB
+	readDBs    []*sql.DB
+	shardW     []*sql.DB
+	shardR     [][]*sql.DB
+	scatter    *sql.DB
+	accounts   int
+	ops        []weightedOp
+	rangeSplit int
 }
 
 func (w *workload) readDB(worker int) *sql.DB {
@@ -785,7 +843,7 @@ func (w *workload) readFor(id, worker int) *sql.DB {
 	if len(w.shardR) == 0 {
 		return w.readDB(worker)
 	}
-	dbs := w.shardR[persist.ShardIndex(int64(id), len(w.shardR))]
+	dbs := w.shardR[shardOf(id, len(w.shardR), w.rangeSplit)]
 	return dbs[worker%len(dbs)]
 }
 
@@ -793,7 +851,7 @@ func (w *workload) writeFor(id int) *sql.DB {
 	if len(w.shardW) == 0 {
 		return w.writeDB
 	}
-	return w.shardW[persist.ShardIndex(int64(id), len(w.shardW))]
+	return w.shardW[shardOf(id, len(w.shardW), w.rangeSplit)]
 }
 
 func (w *workload) do(ctx context.Context, worker int, kind opKind, rng uint64) error {

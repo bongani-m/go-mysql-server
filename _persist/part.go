@@ -71,8 +71,10 @@ func parseShardContacts(raw string, count int) ([]string, error) {
 }
 
 type partPin struct {
-	inTx  bool
-	shard int
+	inTx   bool
+	shard  int
+	groups []string
+	begun  map[string]bool
 }
 
 // partHandler routes a statement to the shard that owns its key.
@@ -80,10 +82,12 @@ type partPin struct {
 // gate stays off: this node can lead its shard and follow meta.
 type partHandler struct {
 	*forwardHandler
-	meta *persist.Store
-	cfg  *partConfig
-	mu   sync.Mutex
-	pins map[uint32]*partPin
+	meta    *persist.Store
+	cfg     *partConfig
+	groups  *groupHost
+	splitMu sync.Mutex
+	mu      sync.Mutex
+	pins    map[uint32]*partPin
 	// clients is one forward connection per MySQL session per remote address.
 	// A process-wide client would queue every session on one socket.
 	clients map[uint32]map[string]*fwdConn
@@ -103,14 +107,27 @@ type placeCache struct {
 	ok    bool
 }
 
-func newPartHandler(inner *forwardHandler, meta *persist.Store, cfg *partConfig) mysql.Handler {
-	return &partHandler{
+func newPartHandler(inner *forwardHandler, meta *persist.Store, cfg *partConfig, groups *groupHost) mysql.Handler {
+	h := &partHandler{
 		forwardHandler: inner,
 		meta:           meta,
 		cfg:            cfg,
+		groups:         groups,
 		pins:           make(map[uint32]*partPin),
 		clients:        make(map[uint32]map[string]*fwdConn),
 	}
+	if groups != nil {
+		groups.split = h.doSplit
+		groups.move = h.movePeer
+		go h.resumeSplits()
+		if raw := strings.TrimSpace(os.Getenv("GMS_RANGE_SPLIT_BYTES")); raw != "" {
+			n, err := strconv.ParseInt(raw, 10, 64)
+			if err == nil && n > 0 {
+				go h.watchSplits(n)
+			}
+		}
+	}
+	return h
 }
 
 func (h *partHandler) ConnectionClosed(c *mysql.Conn) {
@@ -173,13 +190,29 @@ func (h *partHandler) dispatch(ctx context.Context, c *mysql.Conn, query string,
 	if pin.inTx && pin.shard >= 0 {
 		pinned = pin.shard
 	}
-	route, err := RouteQuery(query, currentDB(h.Handler, c), binds, places, h.cfg.Count, pinned)
+	ranges, err := h.meta.Ranges()
+	if err != nil {
+		return err
+	}
+	if dbName, table, at, ok := parseSplitRange(query); ok {
+		if err := h.handleSplit(c, dbName, table, at); err != nil {
+			return err
+		}
+		return callback(&sqltypes.Result{}, false)
+	}
+	if add, group, id, raft, forward, ok := parseRangeMove(query); ok {
+		if err := h.handleMove(c, add, group, id, raft, forward); err != nil {
+			return err
+		}
+		return callback(&sqltypes.Result{}, false)
+	}
+	route, err := RouteQuery(query, currentDB(h.Handler, c), binds, places, ranges, h.cfg.Count, pinned)
 	if err != nil {
 		return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "%s", err.Error())
 	}
 	switch route.Kind {
 	case RoutePlace:
-		if err := h.savePlacement(c, route.Place); err != nil {
+		if err := h.savePlacement(c, query, route); err != nil {
 			return err
 		}
 		return callback(&sqltypes.Result{}, false)
@@ -189,12 +222,30 @@ func (h *partHandler) dispatch(ctx context.Context, c *mysql.Conn, query string,
 		}
 		return callback(&sqltypes.Result{}, false)
 	case RouteScatter:
-		reply, err := h.scatter(c, query, binds)
+		var reply persist.ForwardReply
+		var err error
+		if route.Ranged {
+			reply, err = h.scatterGroups(c, route.Groups, query, binds)
+		} else {
+			reply, err = h.scatter(c, query, binds)
+		}
 		if err != nil {
 			return err
 		}
 		return spoolReply(reply, callback)
 	case RouteShard:
+		if route.Ranged {
+			if len(route.Groups) == 1 && route.Groups[0] == h.store.GroupID() && len(pin.groups) == 0 && pin.shard < 0 {
+				if err := h.rejectDups(c, route); err != nil {
+					return err
+				}
+				return h.forwardHandler.dispatch(ctx, c, query, binds, callback)
+			}
+			return h.execRanged(c, pin, route, query, binds, callback)
+		}
+		if pin.inTx && len(pin.groups) > 0 {
+			return mysql.NewSQLError(mysql.ERUnknownError, "HY000", "persist: transaction spans shards")
+		}
 		if err := h.rejectDups(c, route); err != nil {
 			return err
 		}
@@ -214,9 +265,19 @@ func (h *partHandler) dispatch(ctx context.Context, c *mysql.Conn, query string,
 		case txBegin:
 			pin.inTx = true
 			pin.shard = -1
+			pin.groups = nil
+			pin.begun = map[string]bool{}
 		case txEnd:
+			groups := append([]string(nil), pin.groups...)
 			pin.inTx = false
 			pin.shard = -1
+			pin.groups = nil
+			pin.begun = map[string]bool{}
+			if len(groups) > 0 {
+				if err := h.finishRanges(c, query, groups); err != nil {
+					return err
+				}
+			}
 		}
 		return h.forwardHandler.dispatch(ctx, c, query, binds, callback)
 	}
@@ -227,7 +288,7 @@ func (h *partHandler) pin(c *mysql.Conn) *partPin {
 	defer h.mu.Unlock()
 	pin := h.pins[c.ConnectionID]
 	if pin == nil {
-		pin = &partPin{shard: -1}
+		pin = &partPin{shard: -1, begun: map[string]bool{}}
 		h.pins[c.ConnectionID] = pin
 	}
 	return pin
@@ -259,7 +320,11 @@ func (h *partHandler) placements() ([]persist.TablePlacement, error) {
 	return list, nil
 }
 
-func (h *partHandler) savePlacement(c *mysql.Conn, p persist.TablePlacement) error {
+func (h *partHandler) savePlacement(c *mysql.Conn, query string, route Route) error {
+	if route.Ranged {
+		return h.saveRange(c, query, route.Place, route.Span, route.SpanSet)
+	}
+	p := route.Place
 	if h.meta.IsLeader() {
 		return h.meta.SavePlacement(p)
 	}
@@ -426,7 +491,14 @@ func (h *partHandler) rejectDups(c *mysql.Conn, route Route) error {
 		return dupEntry(dup.Text, dup.Column)
 	}
 	for _, q := range queries {
-		reply, err := h.scatter(c, q.SQL, nil)
+		var reply persist.ForwardReply
+		var err error
+		if route.Ranged {
+			ids := groupsOf(h.rangeList(), route.Place)
+			reply, err = h.scatterGroups(c, ids, q.SQL, nil)
+		} else {
+			reply, err = h.scatter(c, q.SQL, nil)
+		}
 		if err != nil {
 			return err
 		}

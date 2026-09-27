@@ -8,6 +8,7 @@
 #   _persist/stress/run.sh mysql
 #   _persist/stress/run.sh tidb
 #   _persist/stress/run.sh partitioned
+#   _persist/stress/run.sh ranged
 #   _persist/stress/run.sh compare
 #   _persist/stress/run.sh failover
 #
@@ -22,7 +23,7 @@
 #
 #   docker compose -f _persist/stress/compose.yaml -p gms-stress down -v
 #
-# Ports: single 3316, cluster 3326 3327 3328, MySQL 3336, TiDB 3346, partitioned 3356-3361.
+# Ports: single 3316, cluster 3326 3327 3328, MySQL 3336, TiDB 3346, partitioned 3356-3361, ranged 3376-3381.
 # The cluster client writes to whichever node is the Raft leader.
 # User root, password stress, database stress.
 # Every target serves TLS. The script creates _persist/stress/certs on first use.
@@ -41,8 +42,8 @@ mkdir -p "$results"
 
 # caching_sha2_password is refused without TLS, so every target uses this cert.
 # The CA also authenticates Raft between the cluster nodes.
-# An existing certificate without the partitioned addresses cannot authenticate Raft.
-if [[ -f "$dir/certs/server.crt" ]] && ! openssl x509 -in "$dir/certs/server.crt" -noout -ext subjectAltName 2>/dev/null | grep -q '10.118.0.2'; then
+# An existing certificate without the partitioned and ranged addresses cannot authenticate Raft.
+if [[ -f "$dir/certs/server.crt" ]] && ! openssl x509 -in "$dir/certs/server.crt" -noout -ext subjectAltName 2>/dev/null | grep -q '10.119.0.2'; then
 	rm -f "$dir/certs/server.crt" "$dir/certs/server.key" "$dir/certs/server.csr"
 fi
 if [[ ! -f "$tls_ca" || ! -f "$dir/certs/server.crt" || ! -f "$dir/certs/server.key" ]]; then
@@ -58,7 +59,7 @@ if [[ ! -f "$tls_ca" || ! -f "$dir/certs/server.crt" || ! -f "$dir/certs/server.
 		-keyout "$dir/certs/server.key" \
 		-out "$dir/certs/server.csr" \
 		-subj "/CN=gms-stress" \
-		-addext "subjectAltName=DNS:localhost,DNS:p1,DNS:p2,DNS:p3,DNS:p4,DNS:p5,DNS:p6,IP:127.0.0.1,IP:10.117.0.2,IP:10.117.0.3,IP:10.117.0.4,IP:10.118.0.2,IP:10.118.0.3,IP:10.118.0.4,IP:10.118.0.5,IP:10.118.0.6,IP:10.118.0.7" \
+		-addext "subjectAltName=DNS:localhost,DNS:p1,DNS:p2,DNS:p3,DNS:p4,DNS:p5,DNS:p6,DNS:r1,DNS:r2,DNS:r3,DNS:r4,DNS:r5,DNS:r6,IP:127.0.0.1,IP:10.117.0.2,IP:10.117.0.3,IP:10.117.0.4,IP:10.118.0.2,IP:10.118.0.3,IP:10.118.0.4,IP:10.118.0.5,IP:10.118.0.6,IP:10.118.0.7,IP:10.119.0.2,IP:10.119.0.3,IP:10.119.0.4,IP:10.119.0.5,IP:10.119.0.6,IP:10.119.0.7" \
 		-addext "extendedKeyUsage=serverAuth,clientAuth"
 	openssl x509 -req -in "$dir/certs/server.csr" \
 		-CA "$tls_ca" -CAkey "$dir/certs/ca.key" -CAcreateserial \
@@ -75,12 +76,12 @@ fi
 extra=("$@")
 
 usage() {
-	echo "usage: $0 single|cluster|mysql|tidb|partitioned|compare|failover [-- stress flags]" >&2
+	echo "usage: $0 single|cluster|mysql|tidb|partitioned|ranged|compare|failover [-- stress flags]" >&2
 	exit 2
 }
 
 case "$target" in
-single | cluster | mysql | tidb | partitioned | compare | failover) ;;
+single | cluster | mysql | tidb | partitioned | ranged | compare | failover) ;;
 *) usage ;;
 esac
 
@@ -173,6 +174,7 @@ containers_for() {
 	single) echo gms-stress-single-1 ;;
 	cluster | failover) echo gms-stress-n1-1 gms-stress-n2-1 gms-stress-n3-1 ;;
 	partitioned) echo gms-stress-p1-1 gms-stress-p2-1 gms-stress-p3-1 gms-stress-p4-1 gms-stress-p5-1 gms-stress-p6-1 ;;
+	ranged) echo gms-stress-r1-1 gms-stress-r2-1 gms-stress-r3-1 gms-stress-r4-1 gms-stress-r5-1 gms-stress-r6-1 ;;
 	mysql) echo gms-stress-mysql-1 ;;
 	tidb) echo gms-stress-pd-1 gms-stress-tikv1-1 gms-stress-tikv2-1 gms-stress-tikv3-1 gms-stress-tidb-1 ;;
 	*) return 1 ;;
@@ -273,6 +275,18 @@ run_target() {
 		r0=$(shard_read_addrs "$w0" 3356 3357 3358)
 		r1=$(shard_read_addrs "$w1" 3359 3360 3361)
 		run_client gms-partitioned \
+			-shard-write "127.0.0.1:$w0,127.0.0.1:$w1" \
+			-shard-read "$r0,$r1" \
+			-tls-ca "$tls_ca" -json "$json" | tee -a "$log"
+		;;
+	ranged)
+		local w0 w1 r0 r1
+		w0=$(shard_leader_port 3376 3377 3378)
+		w1=$(shard_leader_port 3379 3380 3381)
+		r0=$(shard_read_addrs "$w0" 3376 3377 3378)
+		r1=$(shard_read_addrs "$w1" 3379 3380 3381)
+		run_client gms-ranged \
+			-range \
 			-shard-write "127.0.0.1:$w0,127.0.0.1:$w1" \
 			-shard-read "$r0,$r1" \
 			-tls-ca "$tls_ca" -json "$json" | tee -a "$log"
@@ -402,6 +416,12 @@ node_for() {
 	10.118.0.5:7101) echo gms-stress-p4-1 3359 ;;
 	10.118.0.6:7101) echo gms-stress-p5-1 3360 ;;
 	10.118.0.7:7101) echo gms-stress-p6-1 3361 ;;
+	10.119.0.2:7101) echo gms-stress-r1-1 3376 ;;
+	10.119.0.3:7101) echo gms-stress-r2-1 3377 ;;
+	10.119.0.4:7101) echo gms-stress-r3-1 3378 ;;
+	10.119.0.5:7101) echo gms-stress-r4-1 3379 ;;
+	10.119.0.6:7101) echo gms-stress-r5-1 3380 ;;
+	10.119.0.7:7101) echo gms-stress-r6-1 3381 ;;
 	*) return 1 ;;
 	esac
 }
@@ -548,7 +568,7 @@ run_failover() {
 if [[ "$target" == compare ]]; then
 	summary=$dir/last-compare.txt
 	: >"$summary"
-	for name in single cluster mysql tidb partitioned; do
+	for name in single cluster mysql tidb partitioned ranged; do
 		echo "======== $name ========" | tee -a "$summary"
 		run_target "$name"
 	done

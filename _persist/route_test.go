@@ -34,7 +34,7 @@ func TestRoutePointReadAndTransaction(t *testing.T) {
 
 	one, err := RouteQuery("SELECT email, status FROM accounts WHERE id = ?", "stress", []persist.ForwardBind{
 		{Name: "v1", Type: int32(query.Type_INT64), Value: []byte(itoa(left))},
-	}, places, 2, -1)
+	}, places, nil, 2, -1)
 	require.NoError(t, err)
 	require.Equal(t, RouteShard, one.Kind)
 	require.Equal(t, 0, one.Shard)
@@ -42,14 +42,14 @@ func TestRoutePointReadAndTransaction(t *testing.T) {
 	tx, err := RouteQuery("UPDATE accounts SET status = ? WHERE id = ?", "stress", []persist.ForwardBind{
 		{Name: "v1", Type: int32(query.Type_INT64), Value: []byte("1")},
 		{Name: "v2", Type: int32(query.Type_INT64), Value: []byte(itoa(left))},
-	}, places, 2, -1)
+	}, places, nil, 2, -1)
 	require.NoError(t, err)
 	require.Equal(t, 0, tx.Shard)
 
 	_, err = RouteQuery("UPDATE accounts SET status = ? WHERE id = ?", "stress", []persist.ForwardBind{
 		{Name: "v1", Type: int32(query.Type_INT64), Value: []byte("1")},
 		{Name: "v2", Type: int32(query.Type_INT64), Value: []byte(itoa(right))},
-	}, places, 2, tx.Shard)
+	}, places, nil, 2, tx.Shard)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "transaction spans shards")
 
@@ -57,7 +57,7 @@ func TestRoutePointReadAndTransaction(t *testing.T) {
 		{Name: "v1", Type: int32(query.Type_INT64), Value: []byte(itoa(left))},
 		{Name: "v2", Type: int32(query.Type_VARCHAR), Value: []byte("tx")},
 		{Name: "v3", Type: int32(query.Type_DATETIME), Value: []byte("2026-01-01 00:00:00")},
-	}, places, 2, tx.Shard)
+	}, places, nil, 2, tx.Shard)
 	require.NoError(t, err)
 	require.Equal(t, RouteShard, note.Kind)
 	require.Equal(t, 0, note.Shard)
@@ -67,13 +67,13 @@ func TestRouteScatterEmailAndDuplicateCheck(t *testing.T) {
 	places := testPlaces()
 	email, err := RouteQuery("SELECT id FROM accounts WHERE email = ?", "stress", []persist.ForwardBind{
 		{Name: "v1", Type: int32(query.Type_VARCHAR), Value: []byte("user1@example.com")},
-	}, places, 2, -1)
+	}, places, nil, 2, -1)
 	require.NoError(t, err)
 	require.Equal(t, RouteScatter, email.Kind)
 
 	ins, err := RouteQuery(
 		"INSERT INTO accounts (id, email, name, status, created_at) VALUES (1, 'user1@example.com', 'User 1', 1, '2026-01-01')",
-		"stress", nil, places, 2, -1)
+		"stress", nil, places, nil, 2, -1)
 	require.NoError(t, err)
 	require.Equal(t, RouteShard, ins.Kind)
 	require.Equal(t, persist.ShardIndex(1, 2), ins.Shard)
@@ -81,7 +81,7 @@ func TestRouteScatterEmailAndDuplicateCheck(t *testing.T) {
 
 	_, err = RouteQuery(
 		"INSERT INTO accounts (id, email) VALUES (1, 'a@b.c'), (2, 'c@d.e')",
-		"stress", nil, places, 2, -1)
+		"stress", nil, places, nil, 2, -1)
 	if persist.ShardIndex(1, 2) != persist.ShardIndex(2, 2) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "spans shards")
@@ -89,11 +89,11 @@ func TestRouteScatterEmailAndDuplicateCheck(t *testing.T) {
 }
 
 func TestRouteDDLAndPlacement(t *testing.T) {
-	ddl, err := RouteQuery("CREATE TABLE accounts (id BIGINT NOT NULL, PRIMARY KEY (id))", "stress", nil, nil, 2, -1)
+	ddl, err := RouteQuery("CREATE TABLE accounts (id BIGINT NOT NULL, PRIMARY KEY (id))", "stress", nil, nil, nil, 2, -1)
 	require.NoError(t, err)
 	require.Equal(t, RouteDDL, ddl.Kind)
 
-	place, err := RouteQuery("SHARD TABLE stress.accounts BY id CHECK email", "stress", nil, nil, 2, -1)
+	place, err := RouteQuery("SHARD TABLE stress.accounts BY id CHECK email", "stress", nil, nil, nil, 2, -1)
 	require.NoError(t, err)
 	require.Equal(t, RoutePlace, place.Kind)
 	require.Equal(t, "id", place.Place.Column)
@@ -133,4 +133,74 @@ func TestCheckQueriesGroupsQuotesAndChunks(t *testing.T) {
 
 func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
+}
+
+func testRanges() ([]persist.TablePlacement, []persist.KeyRange) {
+	places := []persist.TablePlacement{{DB: "stress", Table: "accounts", Column: "id", Check: []string{"email"}}}
+	mid := persist.KeySuccessor(persist.EncodeIntKey(100))
+	ranges := []persist.KeyRange{
+		{ID: "lo", DB: "stress", Table: "accounts", End: mid, Group: "g0", State: persist.RangeActive},
+		{ID: "hi", DB: "stress", Table: "accounts", Start: mid, Group: "g1", State: persist.RangeActive},
+	}
+	return places, ranges
+}
+
+func TestRouteRangeEqualityBetweenAndScatter(t *testing.T) {
+	places, ranges := testRanges()
+	one, err := RouteQuery("SELECT email FROM accounts WHERE id = 40", "stress", nil, places, ranges, 2, -1)
+	require.NoError(t, err)
+	require.Equal(t, RouteShard, one.Kind)
+	require.Equal(t, []string{"g0"}, one.Groups)
+	require.True(t, one.Ranged)
+
+	hi, err := RouteQuery("SELECT email FROM accounts WHERE id = 140", "stress", nil, places, ranges, 2, -1)
+	require.NoError(t, err)
+	require.Equal(t, []string{"g1"}, hi.Groups)
+
+	span, err := RouteQuery("SELECT email FROM accounts WHERE id >= 90 AND id < 110", "stress", nil, places, ranges, 2, -1)
+	require.NoError(t, err)
+	require.Equal(t, RouteScatter, span.Kind)
+	require.Equal(t, []string{"g0", "g1"}, span.Groups)
+
+	between, err := RouteQuery("SELECT email FROM accounts WHERE id BETWEEN 1 AND 50", "stress", nil, places, ranges, 2, -1)
+	require.NoError(t, err)
+	require.Equal(t, RouteShard, between.Kind)
+	require.Equal(t, []string{"g0"}, between.Groups)
+
+	all, err := RouteQuery("SELECT email FROM accounts WHERE email = 'a@b.c'", "stress", nil, places, ranges, 2, -1)
+	require.NoError(t, err)
+	require.Equal(t, RouteScatter, all.Kind)
+	require.Equal(t, []string{"g0", "g1"}, all.Groups)
+
+	_, err = RouteQuery("UPDATE accounts SET status = 1 WHERE id >= 90 AND id < 110", "stress", nil, places, ranges, 2, -1)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "spans shards")
+
+	_, err = RouteQuery("INSERT INTO accounts (id, email) VALUES (1, 'a@b.c'), (140, 'c@d.e')", "stress", nil, places, ranges, 2, -1)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "spans shards")
+
+	// A second statement in the same transaction is allowed. Commit uses two phases.
+	left, err := RouteQuery("UPDATE accounts SET status = 1 WHERE id = 40", "stress", nil, places, ranges, 2, -1)
+	require.NoError(t, err)
+	right, err := RouteQuery("UPDATE accounts SET status = 1 WHERE id = 140", "stress", nil, places, ranges, 2, -1)
+	require.NoError(t, err)
+	require.Equal(t, []string{"g0"}, left.Groups)
+	require.Equal(t, []string{"g1"}, right.Groups)
+
+	created, err := RouteQuery("SHARD TABLE stress.accounts BY id RANGE", "stress", nil, nil, nil, 2, -1)
+	require.NoError(t, err)
+	require.Equal(t, RoutePlace, created.Kind)
+	require.True(t, created.Ranged)
+	require.Equal(t, "id", created.Place.Column)
+	require.False(t, created.SpanSet)
+
+	bounded, err := RouteQuery("SHARD TABLE stress.accounts BY id CHECK email RANGE END 2501 GROUP g0 PEER n1 10.0.0.1:7101 10.0.0.1:7102", "stress", nil, nil, nil, 2, -1)
+	require.NoError(t, err)
+	require.True(t, bounded.SpanSet)
+	require.Equal(t, "g0", bounded.Span.Group)
+	require.Equal(t, persist.EncodeIntKey(2501), bounded.Span.End)
+	require.Empty(t, bounded.Span.Start)
+	require.Equal(t, []string{"email"}, bounded.Place.Check)
+	require.Equal(t, "10.0.0.1:7102", bounded.Span.Peers[0].Forward)
 }

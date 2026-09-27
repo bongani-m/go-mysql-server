@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -524,6 +527,9 @@ type leaderExec struct {
 	engine   *sqle.Engine
 	store    *persist.Store
 	sessions map[string]*heldSession
+	// command handles group open, split, and replica moves. It runs on
+	// followers as well as the leader. PREPARE stays on the held session.
+	command func(string) (persist.ForwardReply, bool)
 }
 
 type heldSession struct {
@@ -543,6 +549,11 @@ func (l *leaderExec) Exec(req persist.ForwardRequest) persist.ForwardReply {
 	if req.Close {
 		l.drop(req)
 		return persist.ForwardReply{}
+	}
+	if l.command != nil {
+		if reply, ok := l.command(req.Query); ok {
+			return reply
+		}
 	}
 	// Status and plain reads are served from the local copy. A follower has
 	// the log. Writes still require the leader.
@@ -583,6 +594,12 @@ func (l *leaderExec) Exec(req persist.ForwardRequest) persist.ForwardReply {
 }
 
 func (l *leaderExec) run(held *heldSession, req persist.ForwardRequest) persist.ForwardReply {
+	if reply, ok := l.metaCmd(req.Query); ok {
+		return reply
+	}
+	if kind, id, n, ok := parseTxCmd(req.Query); ok {
+		return l.txCmd(held, kind, id, n)
+	}
 	if req.Database != "" {
 		held.sess.SetCurrentDatabase(req.Database)
 	}
@@ -597,6 +614,15 @@ func (l *leaderExec) run(held *heldSession, req persist.ForwardRequest) persist.
 			return persist.ForwardReply{Err: err.Error()}
 		}
 		return reply
+	}
+	if p, kr, ok := parseRangeRecord(req.Query); ok {
+		if err := l.store.SavePlacement(p); err != nil {
+			return persist.ForwardReply{Err: err.Error()}
+		}
+		if err := l.store.PutRange(kr); err != nil {
+			return persist.ForwardReply{Err: err.Error()}
+		}
+		return persist.ForwardReply{}
 	}
 	if p, ok := parseShardStmt(req.Query); ok {
 		if err := l.store.SavePlacement(p); err != nil {
@@ -665,6 +691,97 @@ func (l *leaderExec) drop(req persist.ForwardRequest) {
 	l.mu.Lock()
 	delete(l.sessions, key)
 	l.mu.Unlock()
+}
+
+func (l *leaderExec) metaCmd(query string) (persist.ForwardReply, bool) {
+	q := strings.TrimSpace(query)
+	if strings.EqualFold(q, "NEXT COMMIT") {
+		n, err := l.store.NextCommit()
+		if err != nil {
+			return persist.ForwardReply{Err: err.Error()}, true
+		}
+		return persist.ForwardReply{InsertID: n}, true
+	}
+	fields, err := splitAdmin(q)
+	if err == nil && len(fields) == 3 && strings.EqualFold(fields[0], "RANGE") && strings.EqualFold(fields[1], "OP") {
+		raw, err := base64.RawURLEncoding.DecodeString(fields[2])
+		if err != nil {
+			return persist.ForwardReply{Err: "persist: range op is malformed"}, true
+		}
+		var op persist.RangeOp
+		if err := json.Unmarshal(raw, &op); err != nil {
+			return persist.ForwardReply{Err: err.Error()}, true
+		}
+		if err := l.store.ApplyRangeOp(op); err != nil {
+			return persist.ForwardReply{Err: err.Error()}, true
+		}
+		return persist.ForwardReply{}, true
+	}
+	if err != nil || len(fields) != 4 || !strings.EqualFold(fields[0], "SAVE") || !strings.EqualFold(fields[1], "DECISION") {
+		return persist.ForwardReply{}, false
+	}
+	n, err := strconv.ParseUint(fields[3], 10, 64)
+	if err != nil || fields[2] == "" {
+		return persist.ForwardReply{Err: "persist: decision is malformed"}, true
+	}
+	if err := l.store.SaveDecision(persist.TxnDecision{ID: fields[2], Commit: n}); err != nil {
+		return persist.ForwardReply{Err: err.Error()}, true
+	}
+	return persist.ForwardReply{}, true
+}
+
+func (l *leaderExec) txCmd(held *heldSession, kind, id string, commitNo uint64) persist.ForwardReply {
+	var err error
+	switch kind {
+	case "prepare":
+		err = held.sess.PrepareTransaction(held.ctx, id)
+	case "commit":
+		err = l.store.CommitPrepared(id, commitNo)
+	case "abort":
+		err = held.sess.AbortPrepared(id)
+	default:
+		err = fmt.Errorf("persist: unknown transaction command %s", kind)
+	}
+	if err != nil {
+		return persist.ForwardReply{Err: err.Error()}
+	}
+	return persist.ForwardReply{}
+}
+
+// parseTxCmd recognizes PREPARE TX, COMMIT TX, and ABORT TX.
+func parseTxCmd(q string) (kind, id string, commitNo uint64, ok bool) {
+	fields, err := splitAdmin(q)
+	if err != nil || len(fields) < 3 || !strings.EqualFold(fields[1], "TX") {
+		return "", "", 0, false
+	}
+	switch strings.ToUpper(fields[0]) {
+	case "PREPARE", "ABORT":
+		if len(fields) != 3 || fields[2] == "" {
+			return "", "", 0, false
+		}
+		return strings.ToLower(fields[0]), fields[2], 0, true
+	case "COMMIT":
+		if len(fields) != 4 {
+			return "", "", 0, false
+		}
+		n, err := strconv.ParseUint(fields[3], 10, 64)
+		if err != nil || fields[2] == "" {
+			return "", "", 0, false
+		}
+		return "commit", fields[2], n, true
+	default:
+		return "", "", 0, false
+	}
+}
+
+// parseRangeRecord recognizes SHARD TABLE ... RANGE GROUP ... PEER, including
+// optional CHECK, START, and END. The meta leader stores that record.
+func parseRangeRecord(query string) (persist.TablePlacement, persist.KeyRange, bool) {
+	p, kr, ranged, ok := parseShardDetail(query)
+	if !ok || !ranged || kr.Group == "" {
+		return persist.TablePlacement{}, persist.KeyRange{}, false
+	}
+	return p, kr, true
 }
 
 func (l *leaderExec) dropAll() {

@@ -63,6 +63,9 @@ type ClusterOptions struct {
 	// ForwardAddr is this node's write-forward listener. Empty uses port 7002
 	// on the advertise host when this process opens its own TCP transport.
 	ForwardAddr string
+	// GroupID names the range group stored in this directory. Empty uses
+	// ServerUUID, which every member of the primary group already shares.
+	GroupID string
 	// ForwardDir publishes ephemeral forward addresses. Production leaves it
 	// nil and derives the leader's address from the Raft host and port 7002.
 	ForwardDir *ForwardDir
@@ -124,6 +127,10 @@ func OpenCluster(path string, opts ClusterOptions) (*Store, error) {
 	}
 	store.bin = bin
 	store.raftDir = opts.RaftDir
+	store.groupID = opts.GroupID
+	if store.groupID == "" {
+		store.groupID = opts.ServerUUID
+	}
 
 	c, err := startCluster(store, opts)
 	if err != nil {
@@ -188,6 +195,7 @@ type cluster struct {
 	forwardLn   net.Listener
 	forwardPort string
 	forwardDir  *ForwardDir
+	advertise   string
 	execMu      sync.RWMutex
 	exec        ForwardExec
 
@@ -308,6 +316,7 @@ func startCluster(store *Store, opts ClusterOptions) (*cluster, error) {
 		timeout:      opts.ApplyTimeout,
 		tls:          opts.TLS,
 		forwardDir:   opts.ForwardDir,
+		advertise:    opts.Advertise,
 		exited:       make(chan struct{}),
 		nextID:       newBatchEpoch(),
 		bootstrapped: bootstrapped,
@@ -470,10 +479,16 @@ func (c *cluster) beginRecord() ([]kvOp, error) {
 func snapshotOps(pending []*queuedCommit) []kvOp {
 	n := 0
 	for _, q := range pending {
+		if q.batch.Phase != phaseApply {
+			continue
+		}
 		n += len(q.batch.Ops)
 	}
 	ops := make([]kvOp, 0, n)
 	for _, q := range pending {
+		if q.batch.Phase != phaseApply {
+			continue
+		}
 		ops = append(ops, q.batch.Ops...)
 	}
 	return ops
@@ -727,6 +742,41 @@ func (c *cluster) shutdown() error {
 		}
 	}
 	return err
+}
+
+// GroupID is the range group stored in this directory.
+func (s *Store) GroupID() string {
+	if s.groupID != "" {
+		return s.groupID
+	}
+	return s.NodeID()
+}
+
+// RaftAddr is the address other nodes dial for this process.
+func (s *Store) RaftAddr() string {
+	if s.cluster == nil {
+		return ""
+	}
+	return s.cluster.advertise
+}
+
+// Voters returns the voting members of this Raft group.
+func (s *Store) Voters() ([]Peer, error) {
+	if s.cluster == nil {
+		return nil, fmt.Errorf("persist: store is not replicating")
+	}
+	fut := s.cluster.raft.GetConfiguration()
+	if err := fut.Error(); err != nil {
+		return nil, err
+	}
+	var out []Peer
+	for _, srv := range fut.Configuration().Servers {
+		if srv.Suffrage != raft.Voter {
+			continue
+		}
+		out = append(out, Peer{ID: string(srv.ID), Address: string(srv.Address)})
+	}
+	return out, nil
 }
 
 // IsLeader reports whether this process currently accepts SQL writes.

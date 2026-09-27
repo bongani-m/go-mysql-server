@@ -54,7 +54,8 @@ func summaryMarkdown(reps []rendered) string {
 	b.WriteString("Cluster writes go to the leader and reads go to the followers. ")
 	b.WriteString("MySQL flushes the redo log and the binlog on commit. The single node fsyncs each commit. The cluster also waits for a Raft quorum. ")
 	b.WriteString("TiDB reads and writes go through one SQL server to a three-node TiKV group. A commit waits for two Raft quorums. ")
-	b.WriteString("The partitioned target keeps the catalog on a meta group replicated to every node and hashes each account, with its notes, onto one of two shard groups. A commit waits for that group's quorum. Each node stores the catalog plus one shard, so the rows are three copies spread over six nodes, with two write leaders.\n\n")
+	b.WriteString("The partitioned target keeps the catalog on a meta group replicated to every node and hashes each account, with its notes, onto one of two shard groups. A commit waits for that group's quorum. Each node stores the catalog plus one shard, so the rows are three copies spread over six nodes, with two write leaders. ")
+	b.WriteString("The ranged target uses that same layout, and places each account by key range: ids below the midpoint stay on the first group and the rest stay on the second.\n\n")
 	if anyUsage(reps) {
 		b.WriteString("CPU and memory are sampled about once a second while the client runs, including seed and warmup. ")
 		b.WriteString("100% CPU is one core. A cluster figure is the sum of its nodes. ")

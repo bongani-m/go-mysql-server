@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,6 +92,7 @@ func main() {
 	var leader *leaderExec
 	var metaExec *leaderExec
 	var meta *persist.Store
+	var groups *groupHost
 	if part != nil {
 		metaPath := os.Getenv("GMS_META_DATA")
 		if metaPath == "" {
@@ -105,6 +107,15 @@ func main() {
 			log.Fatalf("open meta %s: %v", metaPath, err)
 		}
 		defer meta.Close()
+		nodeID := os.Getenv("GMS_NODE_ID")
+		if nodeID == "" {
+			nodeID = os.Getenv("GMS_RAFT_ADDR")
+		}
+		raftTLS, err := raftTLSFromEnv()
+		if err != nil {
+			log.Fatalf("raft tls: %v", err)
+		}
+		groups = newGroupHost(nodeID, filepath.Dir(path), raftTLS)
 	}
 	store, err := openStore(path, func(isLeader bool) {
 		if part != nil {
@@ -122,6 +133,9 @@ func main() {
 		log.Fatalf("open %s: %v", path, err)
 	}
 	defer store.Close()
+	if groups != nil {
+		defer groups.close(store)
+	}
 
 	ctx := sql.NewContext(context.Background())
 	if seedExample() && (!store.Replicating() || store.IsLeader()) {
@@ -155,6 +169,15 @@ func main() {
 	if store.Replicating() {
 		leader = newLeaderExec(engine, store)
 		store.SetForwardExec(leader.Exec)
+	}
+	if groups != nil && leader != nil {
+		groups.add(store.GroupID(), store, engine, leader)
+		if err := groups.adopt(meta); err != nil {
+			log.Fatalf("groups: %v", err)
+		}
+		if err := groups.recover(meta); err != nil {
+			log.Fatalf("recover: %v", err)
+		}
 	}
 	authStore := store
 	if meta != nil {
@@ -204,7 +227,7 @@ func main() {
 		// Raft admin statements, and leaves every other statement on the
 		// engine handler.
 		if part != nil {
-			return newPartHandler(newForwardHandler(inner, store), meta, part), nil
+			return newPartHandler(newForwardHandler(inner, store), meta, part, groups), nil
 		}
 		if store.Replicating() {
 			return newForwardHandler(inner, store), nil

@@ -205,6 +205,42 @@ func (s *Session) CommitTransaction(ctx *sql.Context, tx sql.Transaction) error 
 	return nil
 }
 
+// PrepareTransaction records the buffered edits as a hidden Raft batch.
+// Other sessions do not see them until CommitPrepared applies that batch.
+func (s *Session) PrepareTransaction(ctx *sql.Context, id string) error {
+	s.mu.Lock()
+	pending := s.pending
+	reads := s.reads
+	s.pending = make(map[tableRef][]edit)
+	s.reads = nil
+	s.savepoints = nil
+	s.mu.Unlock()
+	if len(pending) == 0 && len(reads) == 0 {
+		s.finishTx()
+		return nil
+	}
+	if err := s.store.PrepareEdits(id, pending, reads); err != nil {
+		s.mu.Lock()
+		s.restore(pending)
+		s.reads = append(reads, s.reads...)
+		s.mu.Unlock()
+		return err
+	}
+	s.finishTx()
+	return nil
+}
+
+// AbortPrepared drops a prepared batch, if one exists, and the buffered edits.
+func (s *Session) AbortPrepared(id string) error {
+	if s.store.Replicating() {
+		if err := s.store.AbortPrepared(id); err != nil {
+			return err
+		}
+	}
+	s.abort()
+	return nil
+}
+
 // Rollback drops edits buffered since BEGIN. Writes that already committed
 // (autocommit statements and TRUNCATE) stay on disk.
 func (s *Session) Rollback(ctx *sql.Context, transaction sql.Transaction) error {
