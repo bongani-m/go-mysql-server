@@ -56,6 +56,15 @@ type BaseSession struct {
 	ignoreAutocommit bool
 }
 
+// UserVariableSnapshot returns a copy of this session's user variables.
+func (s *BaseSession) UserVariableSnapshot() map[string]TypedValue {
+	vars, ok := s.userVars.(*UserVars)
+	if !ok || vars == nil {
+		return nil
+	}
+	return vars.Snapshot()
+}
+
 func (s *BaseSession) GetLogger() *logrus.Entry {
 
 	if s.logger == nil {

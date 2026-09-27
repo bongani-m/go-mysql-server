@@ -35,7 +35,7 @@ import (
 // what auth protocol it prefers, as part of the auth handshake, it is controlled
 // by this constant. When a new user is created, if no auth plugin is specified, this
 // auth method will be used.
-const DefaultAuthMethod = mysql.MysqlNativePassword
+const DefaultAuthMethod = mysql.CachingSha2Password
 
 // authServer implements the mysql.AuthServer interface. It exposes configured AuthMethod implementations
 // that the auth framework in Vitess uses to negotiate authentication with a client. By default, authServer

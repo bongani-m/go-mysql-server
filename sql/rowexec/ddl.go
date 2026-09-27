@@ -696,7 +696,26 @@ func (b *BaseBuilder) buildCreateUser(ctx *sql.Context, n *plan.CreateUser, _ sq
 
 		plugin := string(mysql_db.DefaultAuthMethod)
 		authString := ""
-		if user.Auth1 != nil {
+		password, useDefault := "", user.Auth1 == nil
+		if !useDefault {
+			password, useDefault = plan.PasswordIfDefault(user.Auth1)
+		}
+		if useDefault {
+			if val, err := ctx.GetSessionVariable(ctx, "default_authentication_plugin"); err == nil {
+				if text, ok := val.(string); ok && text != "" {
+					plugin = text
+				}
+			}
+			resolved, err := plan.ResolveDefaultAuthentication(plugin, password)
+			if err != nil {
+				return nil, err
+			}
+			plugin = resolved.Plugin()
+			authString, err = resolved.AuthString()
+			if err != nil {
+				return nil, err
+			}
+		} else if user.Auth1 != nil {
 			plugin = user.Auth1.Plugin()
 			var err error
 			authString, err = user.Auth1.AuthString()

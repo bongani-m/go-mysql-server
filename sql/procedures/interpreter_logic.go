@@ -687,8 +687,16 @@ func execOp(ctx *sql.Context, runner sql.StatementRunner, stack *InterpreterStac
 		if err != nil {
 			return 0, nil, nil, nil, err
 		}
+		rows, err := sql.RowIterToRows(ctx, rowIter)
+		if err != nil {
+			return 0, nil, nil, nil, err
+		}
+		stable := make([]sql.Row, len(rows))
+		for i, row := range rows {
+			stable[i] = append(sql.Row(nil), row...)
+		}
 		cursor.Schema = schema
-		cursor.RowIter = rowIter
+		cursor.RowIter = sql.RowsToRowIter(stable...)
 
 	case OpCode_Fetch:
 		fetchCur := operation.PrimaryData.(*ast.FetchCursor)

@@ -147,15 +147,19 @@ type ReplicaStatus struct {
 	ReplicaSqlRunning         string
 	ReplicateDoTables         []string
 	ReplicateIgnoreTables     []string
+	ReplicateDoDBs            []string
+	ReplicateIgnoreDBs        []string
 	ReplicateWildDoTables     []string
 	ReplicateWildIgnoreTables []string
 	SourceRetryCount          uint64
-	SourcePort                uint
-	LastIoErrNumber           uint
-	LastSqlErrNumber          uint // Alias for LastErrNumber
-	ConnectRetry              uint32
-	AutoPosition              bool
-	SourceSsl                 bool
+	// SecondsBehindSource is the replica lag. Nil when the SQL thread is not running.
+	SecondsBehindSource *int64
+	SourcePort          uint
+	LastIoErrNumber     uint
+	LastSqlErrNumber    uint // Alias for LastErrNumber
+	ConnectRetry        uint32
+	AutoPosition        bool
+	SourceSsl           bool
 }
 
 // BinlogConsumerProvider provides methods for accessing a BinlogConsumer for BINLOG statement execution and other binlog

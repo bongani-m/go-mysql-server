@@ -62,6 +62,15 @@ type dbLocks map[string]tableLocks
 
 type sessionLocks map[uint32]dbLocks
 
+func statsProviderFor(provider sql.DatabaseProvider) sql.StatsProvider {
+	if provider != nil {
+		if stats, ok := provider.(sql.StatsProvider); ok {
+			return stats
+		}
+	}
+	return memory.NewStatsProv()
+}
+
 // NewCatalog returns a new empty Catalog with the given provider
 func NewCatalog(provider sql.DatabaseProvider, overrides sql.EngineOverrides) *Catalog {
 	c := &Catalog{
@@ -70,7 +79,7 @@ func NewCatalog(provider sql.DatabaseProvider, overrides sql.EngineOverrides) *C
 		DbProvider:       provider,
 		builtInFunctions: function.NewRegistry(),
 		overrides:        overrides,
-		StatsProvider:    memory.NewStatsProv(),
+		StatsProvider:    statsProviderFor(provider),
 		locks:            make(sessionLocks),
 	}
 	c.AuthHandler = sql.GetAuthorizationHandlerFactory().CreateHandler(c)
