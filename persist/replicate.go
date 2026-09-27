@@ -59,6 +59,25 @@ type replBatch struct {
 	ID        uint64
 	// Rotate rolls the binlog on every node after this batch is applied.
 	Rotate bool
+	// Phase is phaseApply for a normal commit. A prepared transaction stores
+	// its writes under Phase prepare and applies them only at phaseCommit.
+	Phase     byte
+	PrepareID string
+	CommitNo  uint64
+}
+
+const (
+	phaseApply   byte = 0
+	phasePrepare byte = 1
+	phaseCommit  byte = 2
+	phaseAbort   byte = 3
+)
+
+// marked is how a Raft batch should be applied. The zero value is a normal commit.
+type marked struct {
+	phase     byte
+	prepareID string
+	commitNo  uint64
 }
 
 // recordingTxn copies every Set and Delete while the real transaction still
@@ -184,6 +203,10 @@ func putSourceGTID(tx *kvTx, gtid string) error {
 // quorum wait or across the Badger transaction, so an apply can land and the
 // next statement can record while this one is still in flight.
 func (c *cluster) commitGTID(statement, gtid string, fn func(tx *kvTx) error) error {
+	return c.commitMarked(statement, gtid, marked{}, fn)
+}
+
+func (c *cluster) commitMarked(statement, gtid string, mode marked, fn func(tx *kvTx) error) error {
 	c.recordMu.Lock()
 	snap, err := c.beginRecord()
 	if err != nil {
@@ -205,7 +228,7 @@ func (c *cluster) commitGTID(statement, gtid string, fn func(tx *kvTx) error) er
 			return err
 		}
 		rotate = tx.rotate
-		if len(rec.ops) == 0 && !rotate {
+		if len(rec.ops) == 0 && !rotate && mode.phase == phaseApply {
 			return nil
 		}
 		return errReplicate
@@ -223,6 +246,9 @@ func (c *cluster) commitGTID(statement, gtid string, fn func(tx *kvTx) error) er
 		Statement: statement,
 		Unix:      uint32(time.Now().Unix()),
 		Rotate:    rotate,
+		Phase:     mode.phase,
+		PrepareID: mode.prepareID,
+		CommitNo:  mode.commitNo,
 	})
 	c.recordMu.Unlock()
 	if err != nil {

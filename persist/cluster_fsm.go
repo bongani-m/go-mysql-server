@@ -53,7 +53,39 @@ func (f *storeFSM) applyOne(log *raft.Log) interface{} {
 	}
 	// Decide before noteApplied drops this batch from the leader's in-flight list.
 	local := f.store.privilegeProposed(batch.ID)
-	err = f.store.applyOpsAt(log.Index, batch.Ops)
+	switch batch.Phase {
+	case phasePrepare:
+		err = f.store.savePrepared(log.Index, batch)
+		f.store.noteApplied(batch.ID)
+		if err != nil {
+			return err
+		}
+		return nil
+	case phaseAbort:
+		err = f.store.dropPrepared(log.Index, batch.PrepareID)
+		f.store.noteApplied(batch.ID)
+		if err != nil {
+			return err
+		}
+		return nil
+	case phaseCommit:
+		stored, err := f.store.takePrepared(log.Index, batch.PrepareID)
+		f.store.noteApplied(batch.ID)
+		if err != nil {
+			return err
+		}
+		if err := f.store.reloadPrivileges(stored, local); err != nil {
+			return err
+		}
+		if len(stored.Ops) > 0 {
+			if err := f.store.appendBinlog(log.Index, stored); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		err = f.store.applyOpsAt(log.Index, batch.Ops)
+	}
 	f.store.noteApplied(batch.ID)
 	if err != nil {
 		return err
