@@ -16,6 +16,7 @@ package planbuilder
 
 import (
 	"fmt"
+	"strings"
 
 	ast "github.com/dolthub/vitess/go/vt/sqlparser"
 
@@ -189,6 +190,22 @@ func (b *Builder) buildOffset(inScope *scope, limit *ast.Limit) sql.Expression {
 	return nil
 }
 
+func (b *Builder) setLockingRead(on bool) {
+	if b.ctx == nil || b.ctx.Session == nil {
+		return
+	}
+	locking, ok := b.ctx.Session.(sql.LockingReadSession)
+	if !ok {
+		return
+	}
+	locking.SetLockingRead(on)
+	if !on {
+		if mode, ok := b.ctx.Session.(sql.LockingReadModeSession); ok {
+			mode.SetLockingReadMode(false, false)
+		}
+	}
+}
+
 // buildLimitVal resolves a literal numeric type or a numeric
 // procedure parameter
 func (b *Builder) buildLimitVal(inScope *scope, e ast.Expr) sql.Expression {
@@ -305,12 +322,17 @@ func (b *Builder) renameSource(scope *scope, table string, cols []string) {
 }
 
 // buildForUpdateOf builds the `FOR UPDATE OF` clause, ensuring that all tables listed are
-// present in the clause. `FOR UPDATE` in general is a no-op, so `FOR UPDATE OF` is
-// also a no-op: https://www.dolthub.com/blog/2023-10-23-hold-my-beer/
-// TODO: implement actual row-level locking for `FOR UPDATE` clauses in general.
+// present in the clause. Sessions that implement LockingReadSession lock the rows this
+// statement reads until the transaction ends.
 func (b *Builder) buildForUpdateOf(lock *ast.Lock, fromScope *scope) {
+	b.setLockingRead(lock != nil)
 	if lock == nil {
 		return
+	}
+	if mode, ok := b.ctx.Session.(sql.LockingReadModeSession); ok {
+		nowait := strings.Contains(lock.Type, "nowait")
+		skip := strings.Contains(lock.Type, "skip locked")
+		mode.SetLockingReadMode(nowait, skip)
 	}
 
 	for _, tableName := range lock.Tables {

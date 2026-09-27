@@ -166,10 +166,44 @@ func (a AuthenticationMysqlNativePassword) AuthString() (string, error) {
 	return "*" + strings.ToUpper(hex.EncodeToString(s2)), nil
 }
 
-// NewDefaultAuthentication returns the given password with the default
-// authentication method.
+// authenticationDefault keeps the plaintext password until execution reads
+// default_authentication_plugin.
+type authenticationDefault string
+
+func (a authenticationDefault) Plugin() string { return "" }
+
+func (a authenticationDefault) AuthString() (string, error) {
+	return NewCachingSha2PasswordAuthentication(string(a)).AuthString()
+}
+
+func (a authenticationDefault) Password() string { return string(a) }
+
+// PasswordIfDefault reports the plaintext password when the account did not
+// name an authentication plugin.
+func PasswordIfDefault(a Authentication) (string, bool) {
+	d, ok := a.(authenticationDefault)
+	if !ok {
+		return "", false
+	}
+	return string(d), true
+}
+
+// ResolveDefaultAuthentication builds the authentication value for plugin.
+func ResolveDefaultAuthentication(plugin, password string) (Authentication, error) {
+	switch strings.ToLower(plugin) {
+	case "", string(mysql.CachingSha2Password):
+		return NewCachingSha2PasswordAuthentication(password), nil
+	case string(mysql.MysqlNativePassword):
+		return AuthenticationMysqlNativePassword(password), nil
+	default:
+		return NewOtherAuthentication(password, plugin, ""), nil
+	}
+}
+
+// NewDefaultAuthentication returns the given password with the session's
+// default authentication plugin, resolved when the user is created.
 func NewDefaultAuthentication(password string) Authentication {
-	return AuthenticationMysqlNativePassword(password)
+	return authenticationDefault(password)
 }
 
 // AuthenticationOther is an authentication type that represents plugin types

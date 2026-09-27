@@ -633,6 +633,12 @@ var (
 	// are automatically rolled back. Clients receiving this error must retry the transaction.
 	ErrLockDeadlock = errors.NewKind("serialization failure: %s, try restarting transaction.")
 
+	// ErrLockWaitTimeout is ER_LOCK_WAIT_TIMEOUT. The statement failed because a row lock was not granted in time.
+	ErrLockWaitTimeout = errors.NewKind("Lock wait timeout exceeded; try restarting transaction")
+
+	// ErrLockNowait is ER_LOCK_NOWAIT. NOWAIT was set and the row lock was already held.
+	ErrLockNowait = errors.NewKind("Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.")
+
 	// ErrViewCreateStatementInvalid is returned when a ViewDatabase returns a CREATE VIEW statement that is invalid
 	ErrViewCreateStatementInvalid = errors.NewKind(`Invalid CREATE VIEW statement: %s`)
 
@@ -1136,6 +1142,10 @@ func CastSQLError(err error) *mysql.SQLError {
 		// 	https://en.wikipedia.org/wiki/SQLSTATE
 		code = mysql.ERLockDeadlock
 		sqlState = mysql.SSLockDeadlock
+	case ErrLockWaitTimeout.Is(err):
+		code = mysql.ERLockWaitTimeout
+	case ErrLockNowait.Is(err):
+		code = 3572 // ER_LOCK_NOWAIT
 	case ErrBase64DecodeError.Is(err):
 		code = mysql.ERBase64DecodeError
 	case ErrNoFormatDescriptionEventBeforeBinlogStatement.Is(err):

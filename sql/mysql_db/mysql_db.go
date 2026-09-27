@@ -15,8 +15,6 @@
 package mysql_db
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -540,14 +538,8 @@ func (db *MySQLDb) AddRootAccount() {
 func (db *MySQLDb) AddEphemeralSuperUser(ed *Editor, username string, host string, password string) {
 	db.SetEnabled(true)
 
-	if len(password) > 0 {
-		hash := sha1.New()
-		hash.Write([]byte(password))
-		s1 := hash.Sum(nil)
-		hash.Reset()
-		hash.Write(s1)
-		s2 := hash.Sum(nil)
-		password = "*" + strings.ToUpper(hex.EncodeToString(s2))
+	if hashed, err := hashCachingSha2Password(password); err == nil {
+		password = hashed
 	}
 
 	if _, ok := ed.GetUser(UserPrimaryKey{
@@ -558,20 +550,29 @@ func (db *MySQLDb) AddEphemeralSuperUser(ed *Editor, username string, host strin
 	}
 }
 
+func hashCachingSha2Password(password string) (string, error) {
+	if len(password) == 0 {
+		return "", nil
+	}
+	salt, err := mysql.NewSalt()
+	if err != nil {
+		return "", err
+	}
+	raw, err := mysql.SerializeCachingSha2PasswordAuthString(password, salt, mysql.DefaultCachingSha2PasswordHashIterations)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
 // AddSuperUser adds the given username and password to the list of accounts. This is a temporary function, which is
 // meant to replace the "auth.New..." functions while the remaining functions are added.
 func (db *MySQLDb) AddSuperUser(ed *Editor, username string, host string, password string) {
 	//TODO: remove this function and the called function
 	db.SetEnabled(true)
 
-	if len(password) > 0 {
-		hash := sha1.New()
-		hash.Write([]byte(password))
-		s1 := hash.Sum(nil)
-		hash.Reset()
-		hash.Write(s1)
-		s2 := hash.Sum(nil)
-		password = "*" + strings.ToUpper(hex.EncodeToString(s2))
+	if hashed, err := hashCachingSha2Password(password); err == nil {
+		password = hashed
 	}
 
 	if _, ok := ed.GetUser(UserPrimaryKey{

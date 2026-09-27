@@ -23,6 +23,7 @@ import (
 	ast "github.com/dolthub/vitess/go/vt/sqlparser"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/binlogreplication"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 )
 
@@ -423,7 +424,14 @@ func (b *Builder) buildFlush(inScope *scope, f *ast.Flush) (outScope *scope) {
 	case "privileges":
 		node, _ := plan.NewFlushPrivileges(writesToBinlog).WithDatabase(b.resolveDb("mysql"))
 		outScope.node = node
-	case "binary logs", "engine logs", "table", "tables":
+	case "binary logs":
+		outScope.node = plan.Nothing{}
+		if primary, ok := b.cat.(binlogreplication.BinlogPrimaryProvider); ok && primary.HasBinlogPrimaryController() {
+			if rot, ok := primary.GetBinlogPrimaryController().(plan.BinaryLogRotator); ok {
+				outScope.node = plan.NewFlushBinaryLogs(rot)
+			}
+		}
+	case "engine logs", "table", "tables":
 		node := plan.Nothing{}
 		outScope.node = node
 	case "error logs", "relay logs", "general logs", "slow logs", "status":

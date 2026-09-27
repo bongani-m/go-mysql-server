@@ -273,6 +273,7 @@ func (b *Builder) handleErr(err error) {
 }
 
 func (b *Builder) build(inScope *scope, stmt ast.Statement, query string) (outScope *scope) {
+	b.setLockingRead(false)
 	return b.buildSubquery(inScope, stmt, query, query)
 }
 

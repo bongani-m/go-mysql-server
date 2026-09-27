@@ -337,6 +337,10 @@ func (b *Builder) buildCreateTable(inScope *scope, c *ast.DDL) (outScope *scope)
 		return outScope
 	}
 
+	if c.PartitionSpec != nil || (c.TableSpec != nil && c.TableSpec.PartitionOpt != nil) {
+		b.handleErr(sql.ErrUnsupportedFeature.New("PARTITION BY"))
+	}
+
 	idxDefs := b.buildIndexDefs(inScope, c.TableSpec)
 
 	schema, collation, tblOpts := b.tableSpecToSchema(inScope, outScope, database, strings.ToLower(c.Table.Name.String()), c.TableSpec, false)
@@ -596,6 +600,9 @@ func (b *Builder) isUniqueColumn(tableSpec *ast.TableSpec, columnName string) bo
 func (b *Builder) buildAlterTableClause(inScope *scope, ddl *ast.DDL) []*scope {
 	if err := b.cat.AuthorizationHandler().HandleAuth(b.ctx, b.authQueryState, ddl.Auth); err != nil && b.authEnabled {
 		b.handleErr(err)
+	}
+	if ddl.PartitionSpec != nil || (ddl.TableSpec != nil && ddl.TableSpec.PartitionOpt != nil) {
+		b.handleErr(sql.ErrUnsupportedFeature.New("PARTITION BY"))
 	}
 	outScopes := make([]*scope, 0, 1)
 

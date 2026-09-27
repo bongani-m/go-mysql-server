@@ -102,6 +102,7 @@ func (i *topRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 	if err != nil {
 		return nil, err
 	}
+	i.numFoundRows = 1
 	sorter := sorters.NewRowSorter(ctx, i.sortConditions)
 	// Sort keys are evaluated exactly once per row: re-evaluating a non-deterministic sort expression
 	// (e.g. ORDER BY RAND()) on every comparison would bias which row is returned.

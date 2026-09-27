@@ -59,3 +59,14 @@ func (u *UserVars) GetUserVariable(ctx *Context, varName string) (Type, interfac
 
 	return val.Typ, val.Value, nil
 }
+
+// Snapshot returns a copy of the user variables.
+func (u *UserVars) Snapshot() map[string]TypedValue {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	out := make(map[string]TypedValue, len(u.userVars))
+	for name, val := range u.userVars {
+		out[name] = val
+	}
+	return out
+}

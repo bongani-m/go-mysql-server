@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dolthub/vitess/go/mysql"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/in_mem_table"
@@ -220,7 +222,7 @@ func addSuperUser(ed *Editor, username string, host string, authString string, e
 		User:                username,
 		Host:                host,
 		PrivilegeSet:        NewPrivilegeSetWithAllPrivileges(),
-		Plugin:              "mysql_native_password",
+		Plugin:              string(mysql.CachingSha2Password),
 		AuthString:          authString,
 		PasswordLastChanged: time.Unix(1, 0).UTC(),
 		Locked:              false,
