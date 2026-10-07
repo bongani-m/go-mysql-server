@@ -49,6 +49,8 @@ type MatchAgainst struct {
 	Columns            []sql.Expression
 	KeyCols            fulltext.KeyColumns
 	parser             fulltext.DefaultParser
+	booleanQuery       fulltext.BooleanQuery
+	colPositions       []int
 	expectedRowLen     int
 	tableColOffset     int
 	parentRowCount     uint64
@@ -458,9 +460,57 @@ func (expr *MatchAgainst) inNaturalLanguageModeWithQueryExpansion(ctx *sql.Conte
 	return 0, fmt.Errorf("'IN NATURAL LANGUAGE MODE WITH QUERY EXPANSION' has not yet been implemented")
 }
 
-// inBooleanMode calculates the result using "IN BOOLEAN MODE".
+// inBooleanMode calculates the relevancy using "IN BOOLEAN MODE". Unlike the natural language mode, this does not read
+// the Full-Text tables. Each row's matched columns are parsed and checked against the search string directly, since
+// exclusions, prefixes and phrases cannot be answered from the per-word document counts. The analyzer does not use the
+// Full-Text index for this mode, so every row of the parent table is passed in.
 func (expr *MatchAgainst) inBooleanMode(ctx *sql.Context, row sql.Row) (float32, error) {
-	return 0, fmt.Errorf("'IN BOOLEAN MODE' has not yet been implemented")
+	var err error
+	expr.once.Do(func() {
+		words, nErr := expr.Expr.Eval(ctx, nil)
+		if nErr != nil {
+			err = nErr
+			return
+		}
+		wordsStr, ok := words.(string)
+		if !ok && words != nil {
+			err = fmt.Errorf("expected WORD to be a string, but had type `%T`", words)
+			return
+		}
+		expr.evaluatedString = wordsStr
+		collation := fulltext.GetCollationFromSchema(ctx, expr.DocCountTable.Schema(ctx))
+		expr.booleanQuery, nErr = fulltext.ParseBooleanQuery(ctx, collation, wordsStr)
+		if nErr != nil {
+			err = nErr
+			return
+		}
+		// Columns index into the joined row, but Eval has already sliced the row to the parent table's columns.
+		parentSch := expr.ParentTable.Schema(ctx)
+		expr.colPositions = make([]int, len(expr.Columns))
+		for i, col := range expr.ColumnsAsGetFields() {
+			expr.colPositions[i] = parentSch.IndexOfColName(col.Name())
+			if expr.colPositions[i] < 0 {
+				err = fmt.Errorf("cannot find the column `%s` on the table `%s`", col.Name(), expr.ParentTable.Name())
+				return
+			}
+		}
+		if len(expr.colPositions) != len(expr.Columns) || len(expr.Columns) == 0 {
+			err = fmt.Errorf("MATCH ... AGAINST ... IN BOOLEAN MODE requires column names")
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	colVals := make([]interface{}, len(expr.colPositions))
+	for i, pos := range expr.colPositions {
+		colVals[i] = row[pos]
+	}
+	doc, err := fulltext.NewDefaultParser(ctx, fulltext.GetCollationFromSchema(ctx, expr.DocCountTable.Schema(ctx)), colVals...)
+	if err != nil {
+		return 0, err
+	}
+	return expr.booleanQuery.Relevancy(ctx, &doc)
 }
 
 // withQueryExpansion calculates the result using "WITH QUERY EXPANSION".

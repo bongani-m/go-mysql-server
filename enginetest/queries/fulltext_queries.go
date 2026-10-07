@@ -1232,4 +1232,102 @@ var FulltextTests = []ScriptTest{
 			},
 		},
 	},
+	{
+		Name: "IN BOOLEAN MODE",
+		SetUpScript: []string{
+			"CREATE TABLE test (pk BIGINT UNSIGNED PRIMARY KEY, v1 VARCHAR(200), v2 VARCHAR(200), FULLTEXT idx (v1, v2));",
+			"INSERT INTO test VALUES (1, 'quick brown fox', 'lazy dog'), (2, 'brown bear', 'honey'), (3, 'fox hunt', 'red fox'), (4, 'username', 'password'), (5, 'users', NULL);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('fox' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{{uint64(1)}, {uint64(3)}},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('fox bear' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{{uint64(1)}, {uint64(2)}, {uint64(3)}},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('+brown +fox' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{{uint64(1)}},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('+brown -fox' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{{uint64(2)}},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('-fox' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('user*' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{{uint64(4)}, {uint64(5)}},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('+user' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('\"red fox\"' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{{uint64(3)}},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('\"fox red\"' IN BOOLEAN MODE) ORDER BY pk;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT pk, MATCH(v1, v2) AGAINST ('+fox red' IN BOOLEAN MODE) FROM test ORDER BY pk;",
+				Expected: []sql.Row{{uint64(1), float32(1)}, {uint64(2), float32(0)}, {uint64(3), float32(2)}, {uint64(4), float32(0)}, {uint64(5), float32(0)}},
+			},
+			{
+				Query:    "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('fox' IN BOOLEAN MODE) AND pk > 1;",
+				Expected: []sql.Row{{uint64(3)}},
+			},
+			{
+				Query:          "SELECT pk FROM test WHERE MATCH(v1, v2) AGAINST ('>fox' IN BOOLEAN MODE);",
+				ExpectedErrStr: `the ">" operator is not supported in "IN BOOLEAN MODE"`,
+			},
+		},
+	},
+	{
+		Name: "IN BOOLEAN MODE without keys",
+		SetUpScript: []string{
+			"CREATE TABLE test (v1 VARCHAR(200), FULLTEXT idx (v1));",
+			"INSERT INTO test VALUES ('quick brown fox'), ('brown bear'), ('fox hunt');",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT v1 FROM test WHERE MATCH(v1) AGAINST ('+brown -fox' IN BOOLEAN MODE);",
+				Expected: []sql.Row{{"brown bear"}},
+			},
+			{
+				Query:    "SELECT v1 FROM test WHERE MATCH(v1) AGAINST ('hun*' IN BOOLEAN MODE);",
+				Expected: []sql.Row{{"fox hunt"}},
+			},
+		},
+	},
+	{
+		// The search query that MediaWiki's SearchMySQL sends.
+		Name: "IN BOOLEAN MODE in a join with a natural language ORDER BY",
+		SetUpScript: []string{
+			"CREATE TABLE page (page_id INT UNSIGNED PRIMARY KEY, page_namespace INT NOT NULL, page_title VARBINARY(255) NOT NULL);",
+			"CREATE TABLE searchindex (si_page INT UNSIGNED NOT NULL, si_title VARCHAR(255) NOT NULL DEFAULT '', si_text MEDIUMTEXT NOT NULL, UNIQUE KEY si_page (si_page), FULLTEXT KEY si_title (si_title), FULLTEXT KEY si_text (si_text));",
+			"INSERT INTO page VALUES (1, 0, 'Main_Page'), (2, 0, 'Help'), (3, 2, 'Admin'), (4, 0, 'Users');",
+			"INSERT INTO searchindex VALUES (1, 'main page', 'welcome user to the wiki'), (2, 'help', 'help for every user and user group'), (3, 'admin', 'user page of the admin'), (4, 'users', 'list of users');",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT page_id, page_namespace, page_title FROM `page` JOIN `searchindex` ON ((page_id=si_page)) WHERE ( MATCH(si_text) AGAINST('+user ' IN BOOLEAN MODE) ) AND page_namespace = 0 ORDER BY MATCH(si_text) AGAINST('+user ' IN NATURAL LANGUAGE MODE) DESC, page_id LIMIT 11;",
+				Expected: []sql.Row{{uint32(2), int32(0), []byte("Help")}, {uint32(1), int32(0), []byte("Main_Page")}},
+			},
+			{
+				Query:    "SELECT page_id FROM `page` JOIN `searchindex` ON ((page_id=si_page)) WHERE ( MATCH(si_title) AGAINST('+use* ' IN BOOLEAN MODE) ) ORDER BY page_id;",
+				Expected: []sql.Row{{uint32(4)}},
+			},
+			{
+				Query:    "SELECT page_id FROM `page` JOIN `searchindex` ON ((page_id=si_page)) WHERE ( MATCH(si_text) AGAINST('+user -admin ' IN BOOLEAN MODE) ) ORDER BY page_id;",
+				Expected: []sql.Row{{uint32(1)}, {uint32(2)}},
+			},
+		},
+	},
 }

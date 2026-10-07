@@ -2065,6 +2065,11 @@ func IndexLeafChildren(e sql.Expression) (sql.IndexScanOp, sql.Expression, sql.E
 		left = children[0]
 		right = children[1]
 	case *expression.MatchAgainst:
+		// The Full-Text filter returns every row that contains any searched word, which is only correct for the
+		// natural language mode. Boolean mode can exclude words and match prefixes, so it is evaluated on each row.
+		if e.SearchModifier != fulltext.SearchModifier_NaturalLanguage {
+			return 0, nil, nil, false
+		}
 		op = sql.IndexScanOpFulltextEq
 	case sql.IndexComparisonExpression:
 		ok := false
